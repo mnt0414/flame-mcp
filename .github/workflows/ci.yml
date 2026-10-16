@@ -1,0 +1,53 @@
+# Lint, type checks and unit tests. No Flame is needed: the real-Flame regression tests are not
+# collected by pytest (see docs/testing.md).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macOS runners cost ten times the free minutes of a private repository; run only where the
+    # repository is public.
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Install shellcheck
+        # The shell script tests fail, not skip, when shellcheck is missing (GitHub Actions sets
+        # CI=true). Homebrew installs its current version; it has no way to pin an old one.
+        run: |
+          brew install shellcheck
+          shellcheck --version
+      - name: Lint
+        run: |
+          python -m ruff check
+          python -m ruff format --check
+      - name: Type check
+        run: python -m mypy
+      - name: Unit tests
+        run: python -m pytest -q

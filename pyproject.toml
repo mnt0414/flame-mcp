@@ -1,0 +1,73 @@
+[project]
+name = "flame-mcp"
+version = "0.1.0"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "mnt0414" }]
+dependencies = [
+    "mcp>=2.2,<3",
+    "pydantic>=2.13,<3",
+]
+
+[project.optional-dependencies]
+# Pinned so that a new release of a checker cannot fail CI on code that has not changed.
+dev = [
+    "pytest==9.1.1",
+    "mypy==2.3.1",
+    "ruff==0.16.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+files = ["src", "tests", "stub"]
+
+[[tool.mypy.overrides]]
+# The stub is loaded inside Flame, where `flame` is a real built-in module
+# with no type stubs of our own; it is always imported locally (never at
+# module level) so a fake can be substituted in tests.
+module = "flame"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# impl.py's `_default_make_timer()` imports the real
+# PySide6 QTimer lazily (inside the function, never at module level) so the
+# module stays importable — and testable via an injected `make_timer` — in
+# this .venv, where PySide6 is not a dependency (it ships with Flame).
+module = "PySide6.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Self-test that only runs under Flame's bundled 3.11.5 + PySide6 (not a
+# .venv dependency here, and not collected by pytest — see its docstring).
+module = "bridge_qt_selftest"
+ignore_errors = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+# Markdown (ruff would format the code blocks in it) and exploratory capture scripts are not held
+# to the lint and format rules.
+exclude = ["*.md", "scripts/phase0*", "scripts/modes", "scripts/decode_*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# stub/flame_mcp_bridge.py must stay parseable by Python 3.9.7 (older Flame versions load it):
+# no `match`, no runtime `X | Y`. UP006/UP007/UP045 would rewrite typing.Dict/
+# Optional to 3.10+ builtin-generic syntax, so they're off for this one file.
+"stub/flame_mcp_bridge.py" = ["UP006", "UP007", "UP035", "UP045"]
