@@ -335,6 +335,18 @@ OLD_CONFIGS: list[OldConfig] = [
         "(setup, stages a, n, b, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
+        "p3_6_edit",
+        "scripts/p3_6_edit_e2e.py",
+        "p3",
+        "p3_6_edit_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages d, m, a, s, q, c, y, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
         "w3_timewarp",
         "scripts/w3_timewarp_e2e.py",
         "p3",
@@ -463,12 +475,12 @@ def test_only_the_two_p2_4_e2es_take_extra_args_and_crash_check() -> None:
     assert names == {c.name for c in OLD_CONFIGS if c.crash_check == "yes"}
 
 
-def test_list_names_the_25_folded_e2es_and_the_3_dedicated_ones(tmp_path: Path) -> None:
+def test_list_names_the_26_folded_e2es_and_the_3_dedicated_ones(tmp_path: Path) -> None:
     proc = bash([str(RUN_E2E), "--list"], base_env(tmp_path))
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.split()
     assert sorted(names) == sorted(ALL_NAMES)
-    assert len(names) == 28
+    assert len(names) == 29
 
 
 @pytest.mark.parametrize("name", DEDICATED)
@@ -975,6 +987,7 @@ ENGLISH_ONLY_SCRIPTS = [
         "flame_mcp_server.sh",
         "install_bridge.sh",
         "make_clip_media.sh",
+        "make_p2_av_media.sh",
         "make_p2_media.sh",
         "make_p2_tc_media.sh",
         "regress.sh",

@@ -81,7 +81,10 @@ NOT_RESTORED: Final[tuple[str, ...]] = (
     "its place in the reel: the restored thing is at the end of its reel (position)",
     "what the fingerprint does not see (markers, transitions, audio, an effect's parameters that "
     "are not attributes, the names and attributes of segments and of the sequence): these come "
-    "back only as far as media_panel.copy copies them, and are not verified",
+    "back only as far as media_panel.copy copies them (audio: the revert check compares the "
+    "video fingerprint only; the revert of timeline.shorten and of timeline.move_track brought "
+    "the audio rows back, measured on Flame 2025.2.4 and 2026.2.3, and in the "
+    "timeline.move_track measurements the audio did not change)",
 )
 """What a restore does not bring back, worded once for every result and description."""
 
@@ -231,8 +234,11 @@ def restore_timeline_checkpoint(
     force: bool = False,
     reverts: str | None = None,
     reverts_intent: str | None = None,
+    forced_note: Mapping[str, Any] | None = None,
 ) -> ServerResult:
     """Put the sequence / clip of the timeline checkpoint `record` back, as described above.
+    `forced_note`: what the caller overrode with `force` on its own check; it is journaled in the
+    restore's intent (`forced`) beside the fingerprint override, if there is one.
     `uid` is the thing to replace (default: the checkpoint's source). With `check_current` its
     fingerprint must now be `expected_current` (a revert: what the run left), else CONFLICT unless
     `force`. Raises `ServerOpError` on every refusal and failure; a failure after the edited thing
@@ -273,6 +279,7 @@ def restore_timeline_checkpoint(
             force=force,
             reverts=reverts,
             reverts_intent=reverts_intent,
+            forced_note=forced_note,
         )
 
 
@@ -326,6 +333,7 @@ def _restore_locked(
     force: bool,
     reverts: str | None,
     reverts_intent: str | None,
+    forced_note: Mapping[str, Any] | None = None,
 ) -> ServerResult:
     checkpoint_id = str(record.get("id"))
     read_env = _run(
@@ -346,6 +354,8 @@ def _restore_locked(
         forced, refusal = _conflict(checkpoint_id, expected_current, current_fp, force)
         if refusal is not None:
             raise refusal
+    if forced_note is not None:
+        forced = {"used": True, **(forced or {}), **forced_note}
     target = _selector_row(pre.get("target"))
     group_id = new_id("g")
     intent_id = new_id("i")

@@ -261,6 +261,7 @@ def test_the_description_carries_the_warnings_the_decision_requires(rig: Rig) ->
     assert "accident prevention, not a defence" in text
     assert "stop waiting" in text and "does not stop the code" in text
     assert "checkpoint covers the target group only" in text
+    assert "smart_replace_media on one crashed Flame" in text and "turned it into a Gap" in text
     assert op.effect == "read" and op.thread == "main"
 
 

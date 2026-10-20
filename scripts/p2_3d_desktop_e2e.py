@@ -899,7 +899,7 @@ async def stage_c(ctx: Ctx) -> None:
             rec(ctx, "c8_skipped_no_wiretap_for_the_reel_group", False)
 
 
-# stage d: copy
+# copy
 async def make_reel(session: Any, ctx: Ctx, tail: str) -> Any:
     """The selector of a new Desktop reel (in the reel group of stage b)."""
     env = await wdo(

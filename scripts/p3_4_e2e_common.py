@@ -101,6 +101,7 @@ declare("i_insert", "timeline.insert", {"sequence": _SEQ, "source": _CLIP, "at":
 declare("i_insert_refused", "timeline.insert", {"sequence": _SEQ, "source": _CLIP, "at": 0})
 declare("k_cut", "timeline.cut", {"sequence": _SEQ, "at": 10, "track": 0})
 declare("k_cut_all", "timeline.cut", {"sequence": _SEQ, "at": 40, "scope": "all"})
+declare("k_cut_gap", "timeline.cut", {"sequence": _SEQ, "at": 25, "track": 0})
 declare("k_cut_refused", "timeline.cut", {"sequence": _SEQ, "at": 0, "track": 0})
 declare("v_create_version", "timeline.create_version", {"sequence": _SEQ})
 declare("v_create_track", "timeline.create_track", {"sequence": _SEQ})

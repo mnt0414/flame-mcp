@@ -277,8 +277,9 @@ def test_segment_replace_is_declared_as_a_timeline_checkpointed_write(rig: Rig) 
     assert (op.effect, op.undo, op.thread) == ("reversible", "checkpoint", "main")
     assert [p.name for p in op.params] == ["target", "source", "mode"]
     for word in (
-        "It keeps the offset from the start of the clip",
-        "it does not match the source timecode",
+        "keeps the offset from the start of the clip",
+        "does not match the source timecode",
+        "Invalid source_clip",
         "segment.slip",
         "slip(n) takes source_in down by n",
         "SILENT_NOOP",

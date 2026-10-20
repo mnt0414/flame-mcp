@@ -144,14 +144,66 @@ def test_marks_put_only_the_marked_range_and_an_empty_overwrite_moves_start_fram
     assert seq.start_frame == 1
 
 
-def test_create_track_goes_to_the_end_with_no_index_and_before_index_minus_one_with_one() -> None:
-    one = sequence(media("clip1", 0, 23))
-    ver = one.versions[0]
-    made = ver.create_track()
-    assert type(made).__name__ == "PyTrack" and len(one.versions[0].tracks) == 2
-    assert layout(one, 1) == [["Gap", 0, 23]]
-    first = one.versions[0].create_track(track_index=1)
-    assert one.versions[0].tracks[0] is first
+def test_create_track_index_is_one_based_and_minus_one_appends() -> None:
+    seq = sequence(media("clip1", 0, 23))
+    ver = seq.versions[0]
+    top = ver.create_track()
+    assert type(top).__name__ == "PyTrack" and len(seq.versions[0].tracks) == 2
+    assert layout(seq, 1) == [["Gap", 0, 23]]
+    bottom = ver.create_track(track_index=1)  # k=1: the bottom, list index 0
+    assert seq.versions[0].tracks[0] is bottom and seq.versions[0].tracks[2] is top
+    middle = ver.create_track(track_index=2)  # k=2: list index 1, the ones above move up
+    tracks = seq.versions[0].tracks
+    assert tracks[0] is bottom and tracks[1] is middle and tracks[3] is top and len(tracks) == 4
+    last = ver.create_track(track_index=-1)  # -1: appended at the top
+    assert seq.versions[0].tracks[-1] is last
+    with pytest.raises(RuntimeError, match=r"Invalid track index\."):
+        ver.create_track(track_index=0)
+
+
+def test_a_track_copy_holds_first_to_last_media_and_overwrite_puts_it_in_a_new_track() -> None:
+    seq = sequence(
+        gap(0, 9), media("clip1", 10, 19), gap(20, 24), media("clip2", 25, 34), gap(35, 59)
+    )
+    reel = PyReel("R", "uid-r", "/wt/R")
+    adopt(reel, [seq])
+    reel._children.append(seq)
+    track = seq.versions[0].tracks[0]
+    made = track.copy_to_media_panel(reel)
+    assert made in reel._children and made.duration.frame == 25
+    assert [r[:3] for r in rows(made, 0)] == [
+        ["Video Segment", 0, 9],
+        ["Gap", 10, 14],
+        ["Video Segment", 15, 24],
+    ]
+    new = seq.versions[0].create_track(track_index=1)
+    assert seq.overwrite(made, PyTime(10, FPS), new) is True
+    assert [r[:3] for r in rows(seq, 0)] == [r[:3] for r in rows(seq, 1)]  # the new track is 0
+    assert layout(seq, 0)[0] == ["Gap", 0, 9]
+
+
+def test_a_copy_keeps_its_connections_and_the_invented_delete_of_a_track_leaves_the_groups() -> (
+    None
+):
+    from fake_selection_connections import connect
+
+    seq = sequence(media("clip1", 0, 23))
+    reel = PyReel("R", "uid-r", "/wt/R")
+    adopt(reel, [seq])
+    reel._children.append(seq)
+    track = seq.versions[0].tracks[0]
+    other = media("clip1", 0, 23)
+    other_track = PyTrack([other])
+    seq.versions[0]._tracks.append(other_track)
+    adopt(seq.versions[0], [other_track])
+    connect(track.segments[0], other)
+    made = track.copy_to_media_panel(reel)
+    new = seq.versions[0].create_track()
+    seq.overwrite(made, PyTime(0, FPS), new)
+    placed = seq.versions[0].tracks[-1].segments[0]
+    assert len(placed.connected_segments()) == 3  # each member lists itself too
+    assert FakeFlame().delete(track, confirm=False) is True
+    assert len(placed.connected_segments()) == 2 and len(seq.versions[0].tracks) == 2
 
 
 def test_create_version_adds_one_track_of_gap_as_long_as_the_sequence() -> None:

@@ -312,6 +312,43 @@ def test_record_in_works_with_a_selection_parent_and_with_a_clip_parent() -> Non
     assert run_op(registry, "segment.info", {"target": in_clip}, flame)["value"]["name"] == "inner"
 
 
+def test_the_catalog_says_a_reel_clip_can_hold_the_segment_and_that_trim_works_on_it() -> None:
+    """An AI reads only the catalog: a text that names the sequence alone made one conclude that
+    a clip cannot be trimmed. Both texts must name the clip."""
+    from flame_mcp.selectors import describe_kind
+
+    parent = describe_kind("segment")["fields"]["parent"]["description"]
+    assert "reel clip" in parent
+    registry = make_registry()
+    trim = registry.get("segment.trim")
+    assert trim is not None
+    assert "reel clip" in trim.description and "trims the clip itself" in trim.description
+    measured = (
+        "info",
+        "list_effects",
+        "shared_sources",
+        "slip",
+        "create_effect",
+        "delete_effect",
+        "set_effect",
+        "effect_load_setup",
+        "effect_save_setup",
+        "copy_to_media_panel",
+        "match",
+    )
+    for name in measured:
+        op = registry.get(f"segment.{name}")
+        assert op is not None and "reel clip" in op.description, name
+    for name in ("get_attributes", "set_attributes"):
+        op = registry.get(f"segment.{name}")
+        assert op is not None
+        assert "reel clip" in " ".join(p.description for p in op.params), name
+    replace = registry.get("segment.replace")
+    assert replace is not None
+    assert "Invalid source_clip" in replace.description
+    assert "contains" in replace.description and "1-frame clip" in replace.description
+
+
 def test_a_selector_with_both_index_and_record_in_or_neither_is_invalid() -> None:
     registry = make_registry()
     op = registry.get("segment.info")

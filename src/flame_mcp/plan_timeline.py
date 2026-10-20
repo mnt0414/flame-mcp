@@ -2,8 +2,8 @@
 
 A plan that holds a step of a Timeline-checkpointed op (`CheckpointSpec(target_kind="timeline")`:
 `segment.trim`, `slip`, `replace` and the effect ops, `timeline.overwrite`, `insert`, `cut`,
-`create_version` and `create_track`) is not run as separate writes each with its own
-checkpoint. It is one checkpointed write on one sequence / clip
+`create_version`, `create_track`, `delete_segments`, `move_track` and `shorten`) is not run as
+separate writes each with its own checkpoint. It is one checkpointed write on one sequence / clip
 (`checkpointed.run_checkpointed`, the engine behind every checkpointed write):
 
     resolve every write step's selector in one Flame read (nothing found / CONFLICT: nothing runs,

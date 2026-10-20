@@ -17,13 +17,13 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 
 | Action | Examples |
 | --- | --- |
-| Read | List libraries, reels, clips, and sequences. Read segments, Batch nodes, and their attributes. |
+| Read | List libraries, reels, clips, and sequences. Read segments (video and audio), Batch nodes, and their attributes. Compare two sequences. |
 | Organize | Create, duplicate, move, and rename reels, clips, and sequences. Delete clips and sequences. |
-| Edit | Trim, slip, and replace segments. Add and set up TimelineFX. |
+| Edit | Trim, slip, replace, and delete segments (closing the gap or leaving it). Cut, insert, and overwrite. Move video tracks. Shorten a sequence. Read and set segment connections. Add and set up TimelineFX. |
 | Batch | Create, connect, and set up nodes. Save and load setups. Render. |
-| Multi-step plans | Run several operations in order in one call, and undo them together (`plan.run`). |
+| Multi-step plans | Run several operations as one procedure (`plan.run`). |
 
-There are 84 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
+There are 93 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
 
 ## Before you start
 
@@ -43,7 +43,7 @@ There are 84 operations in 13 categories. For the full list, see [docs/ops.md](d
 | Python | 3.11 or later (for the server) |
 | MCP client | A client that can run a local stdio server. Tested with Claude Code. |
 
-flame-mcp sends only ASCII characters to Flame. Use ASCII characters in the names and file paths that you ask the assistant to use. You can talk to the assistant in any language.
+flame-mcp sends only ASCII characters to Flame. Use ASCII characters in the names and file paths that you ask the assistant to use. You can ask the assistant in any language.
 
 **1. Get the code and install the server.**
 
@@ -58,7 +58,7 @@ Replace `python3.12` with any installed Python 3.11 or later. The `/usr/bin/pyth
 
 **2. Quit Flame, then install the bridge into Flame.**
 
-The installer copies two files:
+The installer copies two real files:
 
 - `flame_mcp_bridge.py`: the entry point that Flame loads when it starts. It's installed in `/opt/Autodesk/shared/python/`.
 - `impl.py`: the main part of the bridge. It's installed in `~/Library/Application Support/flame-mcp/bridge/`.
@@ -116,7 +116,7 @@ Start with requests that only read. Then try a change whose result you can check
 
 > "Extract each segment of this sequence to a reel, with 10-frame handles."
 
-> "Load this setup into the current Batch group, and tell me the frame range before you render."
+> "Load this setup into the current Batch group, and tell me the range before you render."
 
 Requests that name the target, the action, and how to check the result usually work better than vague requests such as "make it better."
 
@@ -131,7 +131,7 @@ scripts/uninstall_bridge.sh
 
 The script removes two files, `flame_mcp_bridge.py` and `impl.py`. It backs them up before it removes them.
 
-The change records, the files saved for undo, and the logs stay. For file locations and retention periods, see [Files that flame-mcp keeps](#files-that-flame-mcp-keeps). You can delete these files manually if you no longer need them.
+The change records, the files saved for undo, and the logs stay. For what stays and where it is stored, see [Stored files and retention periods](#stored-files-and-retention-periods). You can delete these files manually if you no longer need them.
 
 The server's registration in your MCP client also stays. In Claude Code, remove it with this command:
 
@@ -153,7 +153,7 @@ What the assistant receives from flame-mcp becomes part of the conversation, and
 - Metadata such as timecode
 - Lines from Flame's logs
 
-No flame-mcp operation reads images, except `eval.run`. When `eval.run` is turned on, the assistant can read any file, including images.
+No flame-mcp operation reads images, except `eval.run`. When `eval.run` is turned on, any file, including images, can be read.
 
 If your client uses a model that runs on your computer, the conversation can stay on your computer. Whether the client sends anything else depends on the client and its settings.
 
@@ -171,7 +171,7 @@ Clip names, metadata, the contents of setups, and Flame's logs are passed to the
 - Operations that overwrite files (`overwrite=true`, or a render onto existing frames) are treated as destructive. If `destructive` isn't in `FLAME_MCP_ALLOW_EFFECTS`, flame-mcp refuses them. flame-mcp also tells the assistant to ask you before it runs an operation that overwrites or can't be undone. flame-mcp can't check that you agreed, so this depends on the assistant and your client.
 - `journal.purge_checkpoints` deletes the copies saved for undo. It first runs as a dry run, and it deletes only when it receives the token that the dry run showed.
 - If a call ends without an answer (`TIMEOUT`, `BRIDGE_LOST`), flame-mcp refuses changes until the assistant has checked the actual state.
-- flame-mcp sends only ASCII characters to Flame. If a name, path, or piece of code contains any other character, flame-mcp refuses the call and sends nothing.
+- flame-mcp sends only ASCII characters to Flame. If a name, path, or piece of code contains a non-ASCII character, flame-mcp refuses the call and sends nothing.
 - `eval.run`, which runs arbitrary Python code, is turned off by default (see [Running arbitrary Python code](#running-arbitrary-python-code-evalrun)).
 
 ### Other programs running as the same user
@@ -182,7 +182,7 @@ The bridge accepts connections only from the user who started Flame, and it runs
 
 `flame_mcp_bridge.py` is installed in `/opt/Autodesk/shared/python/`, and every user and every Flame version on the computer loads it. If other users can write to this folder, they can replace `flame_mcp_bridge.py`. Check the folder's permissions. `flame_mcp_bridge.py` doesn't load the main part of the bridge, `impl.py`, if other users can change `impl.py` or its folder.
 
-### Files that flame-mcp keeps
+### Stored files and retention periods
 
 flame-mcp creates its files on disk so that only the user who started Flame can read them (files 0600, folders 0700). It doesn't change the permissions of folders that already exist.
 
@@ -190,18 +190,18 @@ flame-mcp creates its files on disk so that only the user who started Flame can 
 | --- | --- | --- |
 | Records of the changes that the assistant made | `~/Library/Application Support/flame-mcp/journal/` | 30 days |
 | Batch setup files saved for undo | `journal/checkpoints/` | Not deleted automatically |
-| Copies saved for undo, made before the assistant deletes or edits a clip or sequence | The `flame_mcp_checkpoints` library in each project | Until you delete them with `journal.purge_checkpoints` |
+| Copies saved for undo, made before the assistant deletes or edits a clip or sequence | The `flame_mcp_checkpoints` library in each project | Until they are deleted with `journal.purge_checkpoints` |
 | Operation results too large to return to the assistant directly (over about 60 KB; the assistant receives only the location of the file) | `~/Library/Application Support/flame-mcp/spill/` | 7 days (when the server starts, it deletes files older than 7 days) |
 | Bridge logs | `~/Library/Application Support/flame-mcp/logs/` | Up to 4 files (when a file reaches 2 MB, the bridge starts a new file and deletes the oldest one) |
 
 ## Undo
 
-To undo a change, ask the assistant ("Undo the last change"). The assistant runs `journal.revert`, which uses the change record to put things back. If a change can't be undone one value at a time, `journal.revert` uses the setup file or the copy saved for undo. If the target changed after the assistant's change, `journal.revert` stops and doesn't overwrite it.
+To undo a change, ask the assistant ("Undo the last change"). The assistant runs `journal.revert`, which uses the change record to put things back. If a change can't be undone one value at a time, `journal.revert` uses the setup files or the copies saved for undo. If the target changed after the assistant's change, `journal.revert` stops and doesn't overwrite it.
 
 Changes made in one `plan.run` are undone together.
 
 > [!WARNING]
-> **After the assistant changes something, don't press Ctrl+Z.** Flame's undo history doesn't always record changes such as renames and attribute changes. If you press Ctrl+Z, Flame might undo an earlier, unrelated action instead.
+> **After the assistant changes something, don't press Ctrl+Z.** Flame's undo history doesn't always record changes such as renames and attribute changes. If you press Ctrl+Z, Flame might undo an earlier, different action instead.
 
 The following can't be undone. The description of each operation in [docs/ops.md](docs/ops.md) says whether it can be undone.
 
@@ -222,8 +222,8 @@ Usually, you don't need to configure anything. To change a setting, pass an envi
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FLAME_MCP_READONLY` | Off | `1`: use only operations that don't change or write anything |
-| `FLAME_MCP_ALLOW_CATEGORIES` | All | The categories that the assistant can use, separated by commas (for example, `library,desktop,timeline,segment,journal`) |
-| `FLAME_MCP_ALLOW_EFFECTS` | All | The operation effects that the assistant can use, separated by commas (`read`, `reversible`, `create`, `destructive`). An effect is what an operation does to the project, not a visual effect. |
+| `FLAME_MCP_ALLOW_CATEGORIES` | All | The categories that can be used, separated by commas (for example, `library,desktop,timeline,segment,journal`) |
+| `FLAME_MCP_ALLOW_EFFECTS` | All | The effects that can be used, separated by commas (`read`, `reversible`, `create`, `destructive`) |
 | `FLAME_MCP_ENABLE_EVAL` | Off | `1`: turn on `eval.run` |
 | `FLAME_MCP_CHECKPOINT_LIBRARY` | `flame_mcp_checkpoints` | The library where copies saved for undo are kept |
 
@@ -253,7 +253,7 @@ Only operations that change nothing are listed, and only they can run. `eval.run
 `eval.run` is the last resort, for tasks that no operation can do. It's available only when `FLAME_MCP_ENABLE_EVAL=1` is set, and it's never available in read-only mode.
 
 > [!CAUTION]
-> **`eval.run` runs arbitrary Python code inside Flame, with the permissions of the user who started Flame.** The code can read, write, and delete files, use the network, and start processes. A static check stops common mistakes, but it isn't a sandbox or a security boundary, and deliberately written code can get past it. A timeout only stops waiting for the code to finish. It doesn't stop the code. Code that never finishes can leave Flame not responding. Turn on `eval.run` only when you trust both the assistant and the project.
+> **`eval.run` runs arbitrary Python code inside Flame, with the permissions of the user who started Flame.** The code can read, write, and delete files, use the network, and start processes. A static check stops common mistakes, but it isn't a sandbox, and deliberately written code can get past it. A timeout only stops waiting for the code to finish. It doesn't stop the code. Code that never finishes can leave Flame not responding. Turn on `eval.run` only when you trust both the assistant and the project.
 
 ## Troubleshooting
 
@@ -287,7 +287,7 @@ Check whether a dialog is open in Flame. While a dialog is open, some changes to
 
 ### A call is refused with `non-ASCII character`
 
-flame-mcp can send only ASCII characters to Flame. You can still talk to the assistant in any language. Use ASCII characters in the names of clips and nodes, and in file paths.
+flame-mcp can send only ASCII characters to Flame. You can still ask the assistant in any language. Use ASCII characters in the names of clips and nodes, and in file paths.
 
 ### The server doesn't start and shows `non-ASCII character` for `the journal directory`
 
@@ -313,7 +313,7 @@ Report security vulnerabilities as described in [SECURITY.md](.github/SECURITY.m
 ## Limitations
 
 - Not supported: transitions, markers, audio, connected segments, deleting reels or folders, and Linux.
-- You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays in the library).
+- You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays).
 - A sequence or clip that's restored by an undo goes to the end of its reel. Flame's API has no way to set the order of items in a reel. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
 - The `flame_context` tool lists known pitfalls in its `pitfalls` field.
 
@@ -358,7 +358,7 @@ Ask questions, make requests, and report bugs in GitHub Issues. To propose a cod
 
 ## Acknowledgments
 
-- flame-mcp adapts the design of [mcp-aftereffects](https://github.com/kumoproductions/mcp-aftereffects) by kumo.productions (MIT), including the split between a tool that finds operations and a tool that runs them. The operation registry, argument validation, and policy are ported from it. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- The design that splits tools into catalog and do, and the registry, argument validation, and policy, are ported from [mcp-aftereffects](https://github.com/kumoproductions/mcp-aftereffects) by kumo.productions (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - [abrahamADSK/flame-mcp](https://github.com/abrahamADSK/flame-mcp) and [dgirondi/FlameMCP](https://github.com/dgirondi/FlameMCP) were references during research.
 - flame-mcp was developed with [Claude Code](https://claude.com/claude-code). The author made the design decisions, reviewed the code, and tested it in Flame.
 

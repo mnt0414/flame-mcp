@@ -5,7 +5,7 @@ Like `desktop_media_prelude` (it uses its `_dm_*` helpers, `desktop_prelude`'s `
 `_tl_*` fingerprint of `timeline_prelude`): real Python source that `execution.build_exec_code`
 places ahead of an op's own code. It runs inside Flame (3.11).
 
-What it encodes (measured on Flame 2025.2.4, twice):
+What it encodes (measured on Flame 2025.2.4):
   - both calls take a segment out of a sequence as a new clip in a reel / folder / library. A
     segment with a Timewarp (used range 52 frames, head 10, tail 10, record 112-163, in a
     72-frame media):

@@ -357,8 +357,9 @@ def register(registry: Registry) -> None:
             description=(
                 "Delete the stashed copies of Timeline checkpoints from the checkpoint library "
                 "(flame.delete): the checkpoints of timeline.checkpoint, of the segment edits "
-                "behind them, of a restore's pre-restore copy and of desktop.delete. Only what "
-                "the journal records is deleted, and only a checkpoint recorded MORE than "
+                "behind them, of a restore's pre-restore copy, of desktop.delete and of an "
+                "in-place desktop.reformat. Only what the journal records is deleted, and only a "
+                "checkpoint recorded MORE than "
                 "`older_than_days` days ago (0 = every one) whose copy is still in the library "
                 "(`dry_run`, the default, deletes nothing and reads Flame only). Flame checks "
                 "again, copy by copy, that it is inside the checkpoint library with the uid AND "

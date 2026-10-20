@@ -70,6 +70,11 @@ def probe_project_name() -> str:
     )
 
 
+def is_probe_project_name(name: str | None) -> bool:
+    """True for any name `probe_project_name()` may return, whatever $FLAME_MCP_E2E_PROJECT says."""
+    return name is not None and _PROJECT_NAME_PATTERN.fullmatch(name) is not None
+
+
 def e2e_flame_version() -> str:
     """The Flame version the e2e scripts start: $FLAME_MCP_E2E_FLAME_VERSION or the default."""
     return _env_value(

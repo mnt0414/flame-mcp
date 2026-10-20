@@ -710,9 +710,54 @@ def test_static_context_has_a_pitfall_about_the_bit_depth_resize() -> None:
 
 def test_static_context_smart_replace_pitfall_says_the_automatic_resize_stays() -> None:
     pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
-    (text,) = [t for t in pitfalls if "smart_replace" in t]
+    (text,) = [t for t in pitfalls if "smart_replace (segment.replace" in t]
     assert "drops the segment's effects" in text and "mode=media" in text
     assert "Resize" in text and "stays" in text and "Flame 2026.2.3" in text
+
+
+def test_static_context_has_the_measured_audio_pitfalls() -> None:
+    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    (reach,) = [t for t in pitfalls if "audio_tracks[].channels[].segments" in t]
+    assert "PyAudioTrack has no .segments" in reach and "video tracks only" in reach
+    assert "timeline.list_segments with media='audio'" in reach
+    (crash,) = [t for t in pitfalls if "smart_replace_media on an audio segment" in t]
+    assert "crashed Flame" in crash and "signal 11" in crash and "2025.2.4" in crash
+    assert "timeline.overwrite" in crash and "clip that has audio" in crash
+    (gap,) = [t for t in pitfalls if "trim_tail on an audio segment" in t]
+    assert "into a Gap" in gap and "ripple True" in gap and "ripple False" in gap
+    assert "cut the audio and Gap tracks at the end frame and extract the tail pieces" in gap
+    assert "timeline.shorten does that" in gap
+    (silent,) = [t for t in pitfalls if "replaced the audio of the sequence" in t]
+    assert "same source" in silent and "result.audio" in silent and "SILENT_NOOP" in silent
+    assert "journal.changed" in silent
+
+
+def test_static_context_has_a_pitfall_about_moving_tracks() -> None:
+    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    (text,) = [t for t in pitfalls if "reorders a track" in t]
+    assert "timeline.move_track" in text and "rebuilds" in text and "2025.2.4" in text
+    assert "measured by listing them" in text
+    assert "No method to move or reorder audio tracks was found" in text
+    assert "left the audio rows as they were" in text
+
+
+def test_static_context_has_the_pitfall_about_the_length_an_extract_leaves() -> None:
+    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    (text,) = [t for t in pitfalls if "extract_selection_to_media_panel" in t]
+    assert "timeline.delete_segments" in text and "timeline.shorten" in text
+    assert "longest content of ANY video track or audio channel" in text
+    assert "also on tracks that were not selected" in text
+    assert "a track that ends in content at the new end has no Gap" in text
+    assert "keeps its length" not in text and "(Flame 2025.2.4). Deleting the last content" in text
+
+
+def test_the_checkpoint_sentence_lists_the_ops_without_a_doubled_and() -> None:
+    contract = server_mod._static_context(make_test_registry())["undoContract"]
+    assert (
+        "effect_load_setup, timeline.delete_segments, timeline.move_track and timeline.shorten)"
+        in contract
+    )
+    assert "effect_load_setup and timeline.delete_segments and" not in contract
 
 
 def test_static_context_has_no_depth_ladder() -> None:
@@ -760,6 +805,7 @@ def test_instructions_tell_the_model_to_ask_the_user_before_irreversible_operati
         "overwrite=true",
         "journal.purge_checkpoints",
         "desktop.delete",
+        "desktop.reformat",
         "force=true",
         "eval.run",
         "ask the user",

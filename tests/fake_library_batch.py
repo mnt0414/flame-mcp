@@ -2,7 +2,7 @@
 
 Adds to the fake Flame tree (`fake_media_tree`) what 2025.2.4 does for `workspace.create_library`
 and for `flame.media_panel.copy` of a Batch group into a library / a library folder / a reel / the
-Desktop. Measured on Flame 2025.2.4 (54 steps, 2 runs, same values). Where
+Desktop. Measured on Flame 2025.2.4. Where
 nothing was measured the fake RAISES (`NOT_MEASURED`), never does something plain: the fake is not
 allowed to be more tolerant than Flame.
 
@@ -22,7 +22,7 @@ What it encodes
     name) on the Desktop whose nodes (names, types, sockets), schematic reels (clip names in order)
     and shelf reels equal the source's; the current Batch group does not move. It is not renamed
     even though the group it was copied from is still on the Desktop.
-  - closed libraries (measured in 2 runs): `PyLibrary.opened` is True by default; `close()` answers
+  - closed libraries (measured): `PyLibrary.opened` is True by default; `close()` answers
     True and the library reads `opened` False and lists NO children (`children`, `reels`, `clips`,
     `sequences`, `batch_groups` all empty; so does a folder in it); reading its name / uid in the
     list of libraries does not open it; `flame.find_by_wiretap_node_id` of the library or of

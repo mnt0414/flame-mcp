@@ -15,6 +15,7 @@ from flame_mcp.journal import (
     JOURNAL_MAX_AGE_S,
     Index,
     Journal,
+    attribute_values_equal,
     default_journal_dir,
     values_equal,
 )
@@ -181,6 +182,23 @@ def test_unwritable_directory_raises_oserror(tmp_path: Path) -> None:
 )
 def test_values_equal(a: Any, b: Any, expected: bool) -> None:
     assert values_equal(a, b) is expected
+
+
+@pytest.mark.parametrize(
+    ("key", "a", "b", "expected"),
+    [
+        ("colour_label", "Green", "green", True),
+        ("schematic_colour_label", "Light Grey", "light grey", True),
+        ("colour_label", "Light Grey", "lightgrey", False),
+        ("colour_label", "", "Green", False),
+        ("name", "Comp1", "comp1", False),
+        ("pos_x", 1.0, 1.0000000001, True),
+    ],
+)
+def test_attribute_values_equal_ignores_letter_case_only_for_colour_labels(
+    key: str, a: Any, b: Any, expected: bool
+) -> None:
+    assert attribute_values_equal(key, a, b) is expected
 
 
 def state_of(*records: dict[str, Any], group: str = "g1") -> str:

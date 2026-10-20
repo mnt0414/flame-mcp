@@ -3,7 +3,7 @@
 Like `desktop_prelude`: real Python source that `execution.build_exec_code` places ahead of an op's
 own code. It runs inside Flame (3.11) with `flame`, `_v`, `_ja`, `_try` and `_OpError` defined.
 
-What it encodes (measured on Flame 2025.2.4, twice, same values):
+What it encodes (measured on Flame 2025.2.4):
   - a library that is closed reads `opened` False and lists nothing (its `children` count 0 although
     it holds something): what it holds must never be judged from such a read.
   - reading the name and uid in the list of libraries (`workspace.libraries`) does not open it,

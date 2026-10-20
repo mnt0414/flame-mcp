@@ -32,17 +32,23 @@ from flame_mcp.desktop_batch_prelude import BATCH_COPY_HELPER
 from flame_mcp.desktop_delete_prelude import DELETE_HELPER, PURGE_HELPER
 from flame_mcp.desktop_media_prelude import MEDIA_HELPER
 from flame_mcp.desktop_prelude import DESKTOP_HELPER
+from flame_mcp.desktop_reformat_prelude import REFORMAT_HELPER
 from flame_mcp.library_open import has_refs, library_refs
 from flame_mcp.library_open_prelude import LIBRARY_OPEN_HELPER
 from flame_mcp.node_prelude import ACTION_HELPER, NODE_HELPER
 from flame_mcp.read_prelude import READ_HELPER
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_prelude import RENDER_HELPER
+from flame_mcp.segment_connection_prelude import CONNECTION_HELPER
 from flame_mcp.segment_extract_prelude import EXTRACT_HELPER
 from flame_mcp.timeline_build_prelude import BUILD_HELPER
+from flame_mcp.timeline_compare_prelude import COMPARE_HELPER
 from flame_mcp.timeline_create_prelude import CREATE_HELPER
+from flame_mcp.timeline_delete_prelude import DELETE_SEGMENTS_HELPER
 from flame_mcp.timeline_edit_prelude import EDIT_HELPER
+from flame_mcp.timeline_move_prelude import MOVE_TRACK_HELPER
 from flame_mcp.timeline_prelude import TIMELINE_HELPER
+from flame_mcp.timeline_shorten_prelude import SHORTEN_HELPER
 from flame_mcp.timeline_trim_prelude import TRIM_HELPER
 
 V_HELPER = "def _v(x):\n    return x.get_value() if type(x).__name__ == 'PyAttribute' else x"
@@ -501,9 +507,21 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         "",
         EXTRACT_HELPER.strip("\n"),
         "",
+        CONNECTION_HELPER.strip("\n"),
+        "",
+        DELETE_SEGMENTS_HELPER.strip("\n"),
+        "",
+        MOVE_TRACK_HELPER.strip("\n"),
+        "",
+        SHORTEN_HELPER.strip("\n"),
+        "",
+        COMPARE_HELPER.strip("\n"),
+        "",
         DELETE_HELPER.strip("\n"),
         "",
         PURGE_HELPER.strip("\n"),
+        "",
+        REFORMAT_HELPER.strip("\n"),
         "",
     ]
 

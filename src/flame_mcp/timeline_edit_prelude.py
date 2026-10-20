@@ -5,25 +5,27 @@ effect ops (`segment.create_effect` / `delete_effect` / `set_effect` / `effect_l
 Like `timeline_trim_prelude`: real Python source that `execution.build_exec_code` places ahead of an
 op's own code, so each op's `to_python` output is a few loop-free lines. It runs inside Flame (3.11)
 with `flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError`, `_attr_preflight` / `_set_attributes` /
-`_attr_equal`, `_dir_files` and the `_tl_*` helpers of `timeline_prelude` / `timeline_trim_prelude`
-already defined.
+`_attr_equal`, `_dir_files`, the `_tl_*` helpers of `timeline_prelude` / `timeline_trim_prelude` and
+the `_sc_*` helpers of `segment_connection_prelude` already defined.
 
-What it encodes (measured on Flame 2025.2.4, twice each):
+What it encodes (measured on Flame 2025.2.4):
   - `seg.slip(n)` moves source_in (and source_out) by -n: n > 0 takes the source toward its head.
     record is unchanged, head goes by -n and tail by +n. The return value False is not a failure,
     and an amount beyond the handle does not raise: it stops at the handle (+ at head, - at tail).
   - `seg.smart_replace_media(clip)` (TimelineFX kept) / `seg.smart_replace(clip)` (TimelineFX
     replaced too) answer None. They keep the same offset from the start of the clip, not the source
     timecode; record and head are unchanged, tail follows the new media's length. A clip too short
-    for the range changes nothing and raises nothing. source_name becomes the new clip's name.
+    for the range changes nothing and raises nothing. source_name becomes the new clip's name. The
+    segments connected to the segment (`connected_segments()`) get the new media too, in other
+    sequences, and a restore of this sequence does not put those back: the result says how many.
   - `seg.create_effect(type)` answers a PyTimelineFX; a type that is not in `seg.effect_types`
     raises RuntimeError('Could not create an effect of given effect type. ...'), a second effect
     of one type RuntimeError('An effect of this type already exists.'). `seg.effects` is not in the
     order the effects were created.
   - `flame.delete(fx, confirm=False)` answers True and the effect leaves `seg.effects`.
   - a sequence whose bit depth differs from a segment's `source_bit_depth` gets a Resize on that
-    segment from Flame itself (a sequence of the same depth gets none; 2025.2.4 and 2026.2.3,
-    2026-10-16). One put on by hand on a same-depth sequence is deleted with `flame.delete`; the
+    segment from Flame itself (a sequence of the same depth gets none; 2025.2.4 and 2026.2.3).
+    One put on by hand on a same-depth sequence is deleted with `flame.delete`; the
     automatic one raised "The Timeline FX cannot be deleted." on 2026.2.3 (after the checkpoint
     and the journal intent; not measured on 2025.2.4), so `segment.delete_effect` refuses a
     Resize in that situation first. Not judged when either depth cannot be read.
@@ -263,12 +265,15 @@ def _te_replace(seg, parent, version, track, source, mode):
     if out['error'] is not None:
         return out
     numbers = _tl_seg_numbers(seg)
+    connected, problem = _sc_others(seg, parent, version, track, {})
     out.update(
         mode=mode,
         after=None,
         position=None,
         returned=None,
         effects={'before': _te_fx_types(seg), 'after': None},
+        connected={'count': connected, 'error': problem},
+        notices=[_sc_replace_notice(connected)] if connected else [],
         warnings=[],
         ran=True,
     )

@@ -4,7 +4,7 @@ It names the sequence the Timeline shows (`flame.timeline.clip`). Run through th
 with a scripted `transport.exec` over the fake Flame tree (the fake's Timeline is
 `fake_media_tree.ACTIVE_TIMELINE`; showing nothing is its `clip = None`, which the real Flame
 cannot be put into on demand: measured on Flame 2025.2.4, after the shown sequence was deleted the
-Timeline was empty for under 3 s and then showed a sequence again, in 2 runs). Whether the real
+Timeline was empty for under 3 s and then showed a sequence again). Whether the real
 Flame does the same is what scripts/fix5_timeline_selector_e2e.py measures."""
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ INSERT = "timeline.insert"
 CUT = "timeline.cut"
 CREATE_VERSION = "timeline.create_version"
 CREATE_TRACK = "timeline.create_track"
+DELETE_SEGMENTS = "timeline.delete_segments"
+MOVE_TRACK = "timeline.move_track"
+SHORTEN = "timeline.shorten"
 
 ACCEPTING_OPS = [
     "desktop.info",
@@ -43,9 +46,12 @@ ACCEPTING_OPS = [
     CREATE_TRACK,
     CREATE_VERSION,
     CUT,
+    DELETE_SEGMENTS,
     FINGERPRINT,
     INSERT,
+    MOVE_TRACK,
     OVERWRITE,
+    SHORTEN,
     "timeline.info",
     "timeline.list_segments",
 ]
@@ -237,6 +243,9 @@ def test_nothing_shown_stops_a_plan_before_anything_runs(rig: Rig) -> None:
         (OVERWRITE, {"at": 30}),
         (INSERT, {"at": 20}),
         (CUT, {"at": 20, "track": 0}),
+        (DELETE_SEGMENTS, {"segments": [10], "track": 0}),
+        (MOVE_TRACK, {"track": 1, "to": 0}),
+        (SHORTEN, {"duration": 40}),
         (CREATE_VERSION, {}),
         (CREATE_TRACK, {}),
     ],

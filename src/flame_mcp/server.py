@@ -66,8 +66,8 @@ INSTRUCTIONS: Final[str] = "\n".join(
         "refused with INVALID_ARGS.",
         "flame_context lists known pitfalls. Read them before writing eval.run code.",
         "Before an operation that cannot be undone or that overwrites (render.batch, "
-        "overwrite=true, journal.purge_checkpoints, desktop.delete, journal.revert force=true, "
-        "eval.run), ask the user to confirm.",
+        "overwrite=true, journal.purge_checkpoints, desktop.delete, desktop.reformat (in place), "
+        "journal.revert force=true, eval.run), ask the user to confirm.",
     ]
 )
 
@@ -340,8 +340,11 @@ PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
         "applies and it differs per project.",
     },
     {
-        "text": "replace matches by offset from the clip start, not by source timecode. "
-        "To line up TC, replace then slip by the difference.",
+        "text": "replace on an Unlinked Video segment (from an EDL) matches by offset from the "
+        "clip start, not by source timecode: replace, then slip by the difference to line up "
+        "TC. On a linked 8K DPX segment (Flame 2025.2.4) it matched by source timecode, and "
+        "refused with 'Invalid source_clip' a clip whose range does not contain the segment's "
+        "source range (a 1-frame clip is always accepted); see segment.replace.",
     },
     {
         "text": "PyTime(int) is relative (the sequence start is frame 1). "
@@ -382,6 +385,47 @@ PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
     {
         "text": "cut outside the sequence and replace with a shorter clip raise nothing "
         "and change nothing.",
+    },
+    {
+        "text": "An audio segment is listed only through seq.audio_tracks[].channels[].segments "
+        "(PyAudioTrack has no .segments). timeline.list_segments with media='audio' lists them; "
+        "no op of this server selects one: the segment selector reads the video tracks only.",
+    },
+    {
+        "text": "PySegment.smart_replace_media on an audio segment crashed Flame (signal 11; "
+        "Flame 2025.2.4). To replace audio, use timeline.overwrite with a clip that has audio.",
+    },
+    {
+        "text": "PySegment.trim_tail on an audio segment turned the audio into a Gap, with ripple "
+        "True and with ripple False (Flame 2025.2.4). To shorten a sequence, cut the audio and "
+        "Gap tracks at the end frame and extract the tail pieces: timeline.shorten does that.",
+    },
+    {
+        "text": "timeline.overwrite of a clip that has audio replaced the audio of the sequence "
+        "even where the video segment already held the same source and did not change (Flame "
+        "2025.2.4). The fingerprint behind SILENT_NOOP and journal.changed does not see audio; "
+        "timeline.overwrite, insert, cut, delete_segments, move_track and shorten read the audio "
+        "tracks on their own and report them in result.audio, and a call that changed only the "
+        "audio is not a SILENT_NOOP.",
+    },
+    {
+        "text": "PySequence.extract_selection_to_media_panel (what timeline.delete_segments with "
+        "ripple and timeline.shorten call) sets the length of the sequence to the end of the "
+        "longest content of ANY video track or audio channel (a Gap is not content) and makes the "
+        "Gap at the end of every track follow it, also on tracks that were not selected (Flame "
+        "2025.2.4). Deleting the last content of the longest track can therefore make "
+        "the whole sequence shorter and shorten the Gap at the end of the other tracks and of the "
+        "audio; a track that ends in content at the new end has no Gap. The content of the other "
+        "tracks does not move.",
+    },
+    {
+        "text": "No method that moves or reorders a track was found on PySequence, PyVersion, "
+        "PyTrack or PyAudioTrack (Flame 2025.2.4, measured by listing them). To move a video "
+        "track use timeline.move_track, which rebuilds it. No method to move or reorder audio "
+        "tracks was found either. Moving a video track "
+        "of a sequence with sound (measured with 2 to 4 video tracks and one audio track of 2 "
+        "channels), also the track the audio clip was laid on, left the audio rows as they were "
+        "(Flame 2025.2.4).",
     },
     {
         "text": "Flame can crash on a 2-byte character. Every string sent to it (names, paths, "
@@ -437,7 +481,8 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "inside one (desktop.copy takes something out of a library); only the revert of "
             "its own write and journal.purge_checkpoints remove anything there. A write to a "
             "sequence's segments (segment.trim, slip, replace, "
-            "create_effect, delete_effect, set_effect and effect_load_setup) runs behind a "
+            "create_effect, delete_effect, set_effect, effect_load_setup, "
+            "timeline.delete_segments, timeline.move_track and timeline.shorten) runs behind a "
             "checkpoint of the whole sequence (timeline.checkpoint: a copy in the stash "
             "library flame_mcp_checkpoints) and hands back `journal` = {group, id, checkpoint, "
             "stash, display, revert}: journal.revert(group) restores the copy while the "
@@ -447,10 +492,19 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "that holds such a write is one checkpointed write on one sequence: one copy, one "
             "journal.revert for the whole plan. desktop.delete copies what it deletes into the "
             "same stash first and journal.revert(group) copies it back (new uid, end of the "
-            "reel). journal.purge_checkpoints deletes stashed copies the journal records "
+            "reel). desktop.reformat stashes each clip it reformats in place the same way, and "
+            "journal.revert(group) restores the stashed copy (new uid, end of the reel; with "
+            "duplicate=true it deletes the copy instead). "
+            "journal.purge_checkpoints deletes stashed copies the journal records "
             "(dry_run by default; a real run needs the token of the dry run just before); a "
             "purged copy cannot be restored. "
-            "segment.effect_save_setup only writes setup files (undo none: delete them by hand)."
+            "segment.effect_save_setup only writes setup files (undo none: delete them by hand). "
+            "segment.create_connection, remove_connection and sync_connections leave no journal "
+            "record (journal.revert does not undo them, and a checkpoint of the target's "
+            "sequence does not cover connected segments in other sequences); result.inverse "
+            "is a presumed inverse call. "
+            "segment.replace on a segment that has connected segments replaces theirs too, "
+            "and journal.revert does not put those back (result.notices says how many)."
         ),
         "threadContract": (
             "Every Flame API call happens on Flame's own main thread via "

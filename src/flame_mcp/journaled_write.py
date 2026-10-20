@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Final
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
 from flame_mcp.callargs import apply_param_defaults
-from flame_mcp.journal import new_id, now_iso, values_equal
+from flame_mcp.journal import attribute_values_equal, new_id, now_iso
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.types import ErrorCode
@@ -246,7 +246,7 @@ def run_journaled_write(
             conflicts = {
                 key: {"expected": expected, "current": before.get(key)}
                 for key, expected in precondition.items()
-                if not values_equal(before.get(key), expected)
+                if not attribute_values_equal(key, before.get(key), expected)
             }
             if conflicts:
                 detail = "; ".join(

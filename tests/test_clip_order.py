@@ -495,7 +495,7 @@ def test_a_setup_with_nested_or_attributed_node_elements_is_not_reordered(
     prep = prepare(batch, [record(R1, "a", "b")], work)
     assert prep.plan.needed is False and prep.copy is None and prep.plan.new_text is None
     [skip] = prep.plan.skipped
-    assert skip.reel is None and "structure" in skip.reason
+    assert skip.reel is None and "Node elements" in skip.reason
     assert not work.exists() or list(work.iterdir()) == []
 
 

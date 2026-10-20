@@ -109,7 +109,7 @@ class PyTimeline:
     def __init__(self) -> None:
         self.clip: Any = None
         self.copy_moves_display_until_open = False
-        """The behaviour of a production project (measured twice): until a sequence has
+        """The behaviour of a production project (measured): until a sequence has
         been opened through the API (`PySequence.open()`), every `media_panel.copy` of a sequence
         moves the Timeline to the new copy. Off by default (what the other projects do)."""
         self.duplicate_moves_display_until_open = False
@@ -123,6 +123,8 @@ class PyTimeline:
 
 ACTIVE_TIMELINE: list[PyTimeline] = []
 """The Timeline of the FakeFlame built last (`PySequence.open()` points it at the sequence)."""
+ACTIVE_FLAME: list[Any] = []
+"""The FakeFlame built last: a clip that gets a new wiretap id makes it forget the old one."""
 
 
 class PyLibrary:
@@ -457,11 +459,26 @@ class PySegment:
         self._shared: list[PySegment] = []
         self.trim_calls: list[tuple[str, int, bool]] = []
         self._slip_out_rounds = False
+        self._selected = FakeAttr(False)
+        self._link_group: list[PySegment] | None = None
         for fx in fx_list:
             fx.parent = self
 
     def shared_source_segments(self) -> list[PySegment]:
         return list(self._shared)
+
+    selected_is_attribute = True
+    """`selected` answers a PyAttribute (True) or a plain bool (False): not recorded which one
+    Flame's PySegment does, so both are covered. Either way it takes `seg.selected = x`, and the
+    attribute also takes `seg.selected.set_value(x)`."""
+
+    @property
+    def selected(self) -> Any:
+        return self._selected if self.selected_is_attribute else bool(self._selected.get_value())
+
+    @selected.setter
+    def selected(self, value: Any) -> None:
+        self._selected.set_value(bool(value))
 
     def speed(self) -> float | None:
         """Returns the speed of a Timewarp made in the UI, None when the segment is 1:1.
@@ -504,6 +521,19 @@ class PySegment:
         raise NotImplementedError
 
     def match(self, destination: Any, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    # the bodies are put on the class by fake_selection_connections (imported at the bottom)
+    def connected_segments(self) -> list[PySegment]:
+        raise NotImplementedError
+
+    def create_connection(self) -> Any:
+        raise NotImplementedError
+
+    def remove_connection(self) -> Any:
+        raise NotImplementedError
+
+    def sync_connected_segments(self) -> Any:
         raise NotImplementedError
 
     def trim_head(self, offset: int, ripple: bool = False, sync: bool = False) -> bool:
@@ -634,13 +664,46 @@ def share_sources(*segments: PySegment) -> None:
         seg._shared = group
 
 
+class PyTransition:
+    """A transition as PyTrack.transitions lists it. Measured: a Cut of duration 0,
+    in_offset 0, alignment 'Custom'. `type` is a PyAttribute here; a test can pass a plain value
+    for either field."""
+
+    def __init__(
+        self,
+        kind: Any = "Cut",
+        duration: Any = 0,
+        in_offset: int = 0,
+        alignment: str = "Custom",
+    ) -> None:
+        self.type = FakeAttr(kind)
+        self.duration = duration
+        self.in_offset = in_offset
+        self.alignment = alignment
+
+
 class PyTrack:
     def __init__(self, segments: Iterable[PySegment] = ()) -> None:
         self._segments = list(segments)
         self.attributes: list[str] = []
         self.name = FakeAttr("*")  # the name of a track Flame makes
+        # PyTrack attributes measured on Flame 2025.2.4: name, hidden, locked, stereo_linked,
+        # selected_segments, selected_transitions, selection. The defaults here are INVENTED.
+        self.hidden = FakeAttr(False)
+        self.locked = FakeAttr(False)
+        self.stereo_linked = FakeAttr(False)
+        self._transitions: list[Any] | None = None  # None: a Cut at every segment boundary
+        self._selected_transitions: list[Any] = []
         self.parent: Any = None
         adopt(self, self._segments)
+
+    @property
+    def selected_transitions(self) -> Any:
+        return selection_member(self._selected_transitions)
+
+    @property
+    def selected_segments(self) -> Any:
+        return selection_member([s for s in self._segments if s._selected.get_value()])
 
     @property
     def segments(self) -> list[PySegment]:
@@ -648,9 +711,111 @@ class PyTrack:
             seg.parent = self
         return list(self._segments)
 
+    @property
+    def transitions(self) -> list[Any]:
+        """Measured on Flame 2025.2.4: PyTrack.transitions lists a PyTransition at
+        EVERY segment boundary, type 'Cut', duration 0, in_offset 0, alignment 'Custom' (a track
+        of 13 segments lists 12, one of 4 lists 3). A test can set the list."""
+        if self._transitions is not None:
+            return list(self._transitions)
+        return [PyTransition() for _ in self._segments[1:]]
+
+    @transitions.setter
+    def transitions(self, value: list[Any]) -> None:
+        self._transitions = list(value)
+
+    # the bodies are put on the class by fake_timeline_build (imported at the bottom)
+    def cut(self, time: Any) -> Any:
+        raise NotImplementedError
+
+    def copy_to_media_panel(self, destination: Any) -> Any:
+        raise NotImplementedError
+
+
+SELECTION_MEMBERS_AS_ATTRIBUTES = True
+"""`selected_segments`, `selected_transitions` and `selected_markers` (PySequence, PyTrack,
+PyAudioTrack) are PyAttributes on Flame 2025.2.4: iterating one raises TypeError and `get_value()`
+holds the list (measured). False answers the plain list (a test switch only)."""
+
+
+def selection_member(values: list[Any]) -> Any:
+    return FakeAttr(list(values)) if SELECTION_MEMBERS_AS_ATTRIBUTES else list(values)
+
+
+class PyAudioChannel:
+    """A channel of an audio track: the only place an audio track's segments are listed
+    (`seq.audio_tracks[].channels[].segments`, measured on Flame 2025.2.4).
+
+    Measured on Flame 2025.2.4 (`seq.audio_tracks[0].channels[0]`): the type of a real
+    channel is named `PyTrack` (this class keeps the name PyAudioChannel; nothing reads the type
+    name), its public members are attributes, copy_to_media_panel, cut, insert_transition, parent,
+    segments and transitions, and `transitions` is a list (`[]` for a channel with one segment).
+    Modelled here: `segments`, `parent`, `transitions` and (in fake_timeline_build) `cut`; the other
+    members are not. INVENTED: what `transitions` lists for a channel with two or more segments
+    (a Cut of duration 0 at every boundary, as PyTrack.transitions does; not measured for audio)."""
+
+    def __init__(self, segments: list[PySegment] | None = None) -> None:
+        self._segments: list[PySegment] = segments if segments is not None else []
+        self._transitions: list[Any] | None = None  # None: a Cut at every segment boundary
+        self.parent: Any = None
+
+    @property
+    def segments(self) -> list[PySegment]:
+        for seg in self._segments:
+            seg.parent = self
+        return list(self._segments)
+
+    @property
+    def transitions(self) -> list[Any]:
+        """A list, as on Flame 2025.2.4 (measured: `[]` for a channel with one segment). INVENTED
+        for two or more segments: the same as PyTrack.transitions (a Cut of duration 0 at every
+        segment boundary). A test can set the list."""
+        if self._transitions is not None:
+            return list(self._transitions)
+        return [PyTransition() for _ in self._segments[1:]]
+
+    @transitions.setter
+    def transitions(self, value: list[Any]) -> None:
+        self._transitions = list(value)
+
     # the body is put on the class by fake_timeline_build (imported at the bottom)
     def cut(self, time: Any) -> Any:
         raise NotImplementedError
+
+
+class PyAudioTrack:
+    """An audio track. It has no `segments` of its own in the API: what it exposes of its segments
+    is `selected_segments` (and `selected_transitions`) and its `channels`, each with `segments`.
+    Given only `segments`, the track has one channel that holds that very list."""
+
+    def __init__(
+        self, segments: Iterable[PySegment] = (), channels: Iterable[PyAudioChannel] | None = None
+    ) -> None:
+        self._segments = list(segments)
+        self._channels = (
+            list(channels) if channels is not None else [PyAudioChannel(self._segments)]
+        )
+        self._selected_transitions: list[Any] = []
+        self.attributes: list[str] = []
+        self.parent: Any = None
+        adopt(self, self._segments)
+        adopt(self, self._channels)
+
+    @property
+    def channels(self) -> list[PyAudioChannel]:
+        return list(self._channels)
+
+    def _all_segments(self) -> list[PySegment]:
+        """The segments of every channel (the track lists them only through its channels)."""
+        return [seg for channel in self._channels for seg in channel._segments]
+
+    @property
+    def selected_segments(self) -> Any:
+        return selection_member([seg for seg in self._all_segments() if seg._selected.get_value()])
+
+    @property
+    def selected_transitions(self) -> Any:
+        return selection_member(self._selected_transitions)
 
 
 class PyVersion:
@@ -726,6 +891,8 @@ class PySequence:
         self.cached = cached
         self.unlinked = unlinked
         self.audio_tracks = list(audio_tracks)
+        self._selected_transitions: list[Any] = []  # what the API reports as selected
+        self._selected_markers: list[Any] = []
         self.in_mark: PyTime | None = None  # set by `match`
         self.out_mark: PyTime | None = None
         self._media: tuple[int, int] | None = None  # (first source frame, length), see
@@ -746,8 +913,26 @@ class PySequence:
         return tracks[0] if tracks else None
 
     @property
-    def selected_segments(self) -> list[PySegment]:
-        return [seg for ver in self.versions for trk in ver.tracks for seg in trk.segments][:2]
+    def selected_segments(self) -> Any:
+        """The segments whose `selected` is True, video and audio (a PyAttribute, see
+        `SELECTION_MEMBERS_AS_ATTRIBUTES`)."""
+        video = [s for ver in self.versions for trk in ver.tracks for s in trk.segments]
+        audio = [s for track in self.audio_tracks for s in track._all_segments()]
+        return selection_member([seg for seg in [*video, *audio] if seg._selected.get_value()])
+
+    @property
+    def selected_transitions(self) -> Any:
+        found = list(self._selected_transitions)
+        for ver in self.versions:
+            for trk in ver._tracks:
+                found += trk._selected_transitions
+        for track in self.audio_tracks:
+            found += track._selected_transitions
+        return selection_member(found)
+
+    @property
+    def selected_markers(self) -> Any:
+        return selection_member(self._selected_markers)
 
     def get_wiretap_node_id(self) -> str:
         return self._wiretap_id
@@ -775,9 +960,112 @@ class PySequence:
     def create_version(self) -> PyVersion:
         raise NotImplementedError
 
+    # the bodies are put on the class by fake_selection_connections (imported at the bottom)
+    def extract_selection_to_media_panel(
+        self, destination: Any = None, duplicate_action: str = "add"
+    ) -> Any:
+        raise NotImplementedError
+
+    def lift_selection_to_media_panel(
+        self, destination: Any = None, duplicate_action: str = "add"
+    ) -> Any:
+        raise NotImplementedError
+
+
+REFORMAT_RESIZE_MODES = ("Letterbox", "Crop Edges", "Fill", "Centre")
+REFORMAT_FRAME_RATES = ("23.976 fps", "24 fps", "25 fps", "29.97 fps NDF", "30 fps", "60 fps")
+
 
 class PyClip(PySequence):
+    """A clip. `reformat` and `change_start_frame` follow what was measured on Flame 2025.2.4
+    (the signature, the ranges, `None` as the answer, the change in place: no new clip, but the
+    clip gets a NEW uid and wiretap id when a reformat changes it -- `reformat_changes_uid`).
+    `reformat_behavior` scripts a failure: "apply" (default), "noop" (answers, changes
+    nothing), "raise", "wrong_size" (applies a width two wider). `start_frame_behavior` is "apply",
+    "noop" or "raise"."""
+
     open = None  # type: ignore[assignment]  # PyClip has no open() (PyClip.open_as_sequence does)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.reformat_calls: list[dict[str, Any]] = []
+        self.start_frame_calls: list[tuple[int, bool]] = []
+        self.reformat_behavior = "apply"
+        self.start_frame_behavior = "apply"
+        self.reformat_changes_uid = True
+        """Flame 2025.2.4: a reformat that changes the clip gives it a new uid and wiretap id."""
+        self.reformat_resets_start_frame: int | None = None
+        """When set, a reformat that applies also moves the start frame to this value."""
+        self.copy_overrides: dict[str, Any] = {}
+        """Attributes a copy of this clip gets instead of the clip's own (a copy that differs)."""
+
+    def reformat(
+        self,
+        width: int = 0,
+        height: int = 0,
+        ratio: float = 0.0,
+        bit_depth: int = 0,
+        scan_mode: str = "",
+        frame_rate: str = "",
+        resize_mode: str = "Letterbox",
+    ) -> None:
+        self.reformat_calls.append(
+            {
+                "width": width,
+                "height": height,
+                "ratio": ratio,
+                "bit_depth": bit_depth,
+                "scan_mode": scan_mode,
+                "frame_rate": frame_rate,
+                "resize_mode": resize_mode,
+            }
+        )
+        if self.reformat_behavior == "raise":
+            raise RuntimeError("scripted reformat failure")
+        if resize_mode not in REFORMAT_RESIZE_MODES:
+            raise RuntimeError(f"Invalid resize_mode {resize_mode!r}")
+        if (width and not 24 <= width <= 16384) or (height and not 24 <= height <= 16384):
+            raise RuntimeError("width and height must be 24 to 16384")
+        if bit_depth not in (0, 8, 10, 12, 16, 32):
+            raise RuntimeError(f"Invalid bit_depth {bit_depth!r}")
+        if scan_mode not in ("", "F1", "F2", "P"):
+            raise RuntimeError(f"Invalid scan_mode {scan_mode!r}")
+        if frame_rate and frame_rate not in REFORMAT_FRAME_RATES:
+            raise RuntimeError(f"Invalid frame_rate {frame_rate!r}")
+        if self.reformat_behavior == "noop":
+            return
+        if width:
+            self.width = width + (2 if self.reformat_behavior == "wrong_size" else 0)
+        if height:
+            self.height = height
+        if ratio:
+            self.ratio = ratio
+        elif width and height:
+            self.ratio = width / height
+        if bit_depth:
+            self.bit_depth = bit_depth
+        if scan_mode:
+            self.scan_mode = scan_mode
+        if frame_rate:
+            self.frame_rate = frame_rate
+        if self.reformat_resets_start_frame is not None:
+            self.start_frame = self.reformat_resets_start_frame
+        if self.reformat_changes_uid:
+            self._take_new_identity()
+
+    def _take_new_identity(self) -> None:
+        if ACTIVE_FLAME:
+            ACTIVE_FLAME[0].forget_wiretap(self)
+        self.uid.set_value(next_uid("reformatted"))
+        parent_id = self.parent.get_wiretap_node_id()
+        self._wiretap_id = f"{parent_id}/{self.name.get_value()}.{next_uid('rf')}"
+
+    def change_start_frame(self, start_frame: int, use_segment_connections: bool = True) -> None:
+        self.start_frame_calls.append((start_frame, use_segment_connections))
+        if self.start_frame_behavior == "raise":
+            raise RuntimeError("scripted change_start_frame failure")
+        if self.start_frame_behavior == "apply":
+            self.start_frame = start_frame
 
 
 def clone_effect(fx: PyTimelineFX) -> PyTimelineFX:
@@ -826,12 +1114,36 @@ def clone_versions(entry: PySequence) -> list[PyVersion]:
     ]
 
 
+def _carry_audio_segment(seg: PySegment) -> PySegment:
+    """A copy of an audio segment; one a test made unreadable (a cell that raises `RuntimeError`
+    when read) is carried over as it is. Any other failure of the copy is raised."""
+    try:
+        return clone_segment(seg)
+    except RuntimeError:
+        return seg
+
+
+def clone_audio_tracks(entry: PySequence) -> list[PyAudioTrack]:
+    """A test may delete `audio_tracks` from an object to model a Flame without the member."""
+    return [
+        PyAudioTrack(
+            channels=[
+                PyAudioChannel([_carry_audio_segment(seg) for seg in channel._segments])
+                for channel in track.channels
+            ]
+        )
+        for track in getattr(entry, "audio_tracks", ())
+    ]
+
+
 def copy_media(source: PySequence, name: str, wiretap_id: str, uid: str) -> PySequence:
     """Makes what `media_panel.copy` of a clip / sequence makes.
 
     A new uid and wiretap id, the same versions, tracks, segments and effect settings (on Flame
-    2025.2.4 the fingerprint and the pixels are the original's)."""
-    return type(source)(
+    2025.2.4 the fingerprint and the pixels are the original's), and the audio tracks with their
+    channels and segments (measured: a copy of a sequence with sound has the same audio rows, and a
+    revert from the copy in a checkpoint puts them back)."""
+    made = type(source)(
         name,
         wiretap_id=wiretap_id,
         uid=uid,
@@ -839,7 +1151,16 @@ def copy_media(source: PySequence, name: str, wiretap_id: str, uid: str) -> PySe
         frame_rate=source.frame_rate,
         versions=clone_versions(source),
         bit_depth=source.bit_depth,
+        width=source.width,
+        height=source.height,
+        ratio=source.ratio,
+        scan_mode=source.scan_mode,
+        start_frame=source.start_frame,
     )
+    made.audio_tracks = clone_audio_tracks(source)
+    for key, value in getattr(source, "copy_overrides", {}).items():
+        setattr(made, key, value)
+    return made
 
 
 class PyWorkspace:
@@ -1919,6 +2240,7 @@ class FakeFlame:
         self.timeline = PyTimeline()
         self.PyTime = PyTime
         ACTIVE_TIMELINE[:] = [self.timeline]
+        ACTIVE_FLAME[:] = [self]
         self._wiretap_index = dict(wiretap_index) if wiretap_index else {}
         self.import_calls: list[list[str]] = []
         self.duplicate_calls: list[Any] = []
@@ -2094,6 +2416,10 @@ class FakeFlame:
                 if obj in library._children:
                     library._children = [c for c in library._children if c is not obj]
                     return True
+        if kind == "PyTrack":
+            from fake_timeline_build import delete_track
+
+            return delete_track(obj)
         if kind in ("PyClip", "PySequence"):
             holder = self._container_of(obj)
             if holder is None:
@@ -2137,6 +2463,8 @@ def build_default_tree() -> tuple[FakeFlame, dict[str, Any]]:
     seg1 = PySegment(
         name="seg1", source_name="clip2", record_in=10, record_out=19, record_duration=10
     )
+    seg0.selected = True
+    seg1.selected = True  # PySequence.selected_segments answers these two
     track = PyTrack([seg0, seg1])
     version = PyVersion([track])
     seq = PySequence("Seq1", wiretap_id="/projects/p/ws/P1O/Seq1", versions=[version])
@@ -2165,4 +2493,5 @@ def build_default_tree() -> tuple[FakeFlame, dict[str, Any]]:
 
 import fake_library_batch  # noqa: E402,F401  (create_library rename, Batch group copies)
 import fake_segment_edit  # noqa: E402,F401  (slip, smart_replace*, create_effect, match, ...)
+import fake_selection_connections  # noqa: E402,F401  (extract / lift, segment connections)
 import fake_timeline_build  # noqa: E402,F401  (overwrite, insert, cut, create_*)

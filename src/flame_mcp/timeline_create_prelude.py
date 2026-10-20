@@ -5,14 +5,14 @@ Like `desktop_media_prelude` (it uses its `_dm_*` helpers, `desktop_prelude`'s `
 `_tl_*` helpers of `timeline_prelude`): real Python source that `execution.build_exec_code`
 places ahead of an op's own code. It runs inside Flame (3.11).
 
-What it encodes (measured on Flame 2025.2.4, twice, identical):
+What it encodes (measured on Flame 2025.2.4):
   - `reel.create_sequence(name=, video_tracks=, start_at=, frame_rate=, width=, height=,
     bit_depth=)` answers the new PySequence (name and uid readable) and the reel lists it.
     `frame_rate` is one of the ten strings of the error text ('23.976 fps' ... '60 fps'), anything
     else is a RuntimeError; `start_at` is `flame.PyTime('01:00:00:00', frame_rate)`; width /
     height / frame rate / start read back as given. `bit_depth` (left out when the caller gave
     none, so the project's default applies) takes only the integers 8, 10, 12, 16 and 32 and
-    reads back as given (2025.2.4 and 2026.2.3, 2026-10-16). The same name can be used twice. The
+    reads back as given (2025.2.4 and 2026.2.3). The same name can be used twice. The
     new sequence is one Gap one frame long, and the Timeline then shows it.
   - the sequence is found by the reel's entries before and after (never by the answer alone), and
     judged at revert by its name, duration and fingerprint (`_dm_state`).

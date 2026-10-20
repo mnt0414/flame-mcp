@@ -179,8 +179,8 @@ def _structure_problem(text: str, chunks: Sequence[str]) -> str | None:
     if not odd:
         return None
     return (
-        "the setup's structure is not the one measured (nested or attributed Node elements): "
-        "the Clip nodes were not reordered"
+        "the setup's Node elements cannot be told apart reliably (nested, unbalanced or "
+        "attributed): the Clip nodes were not reordered"
     )
 
 

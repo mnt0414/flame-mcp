@@ -252,6 +252,8 @@ class RevertProfile:
         Callable[[ServerContext, IntentView, dict[str, Any], str], PreRevert | None] | None
     ) = None
     """Server-side work before the Flame call (`pre_revert_copy`); it may end the revert."""
+    intent_extra: Callable[[IntentView], dict[str, Any]] | None = None
+    """Fields added to the revert's intent record (`forced`: what a `force` overrode)."""
 
 
 DEFAULT_REVERT: Final[RevertProfile] = RevertProfile(
@@ -312,6 +314,7 @@ def revert_flow(
                 "revertOf": view.desktop_kind,
                 "createKind": view.intent.get("createKind"),
                 "created": created,
+                **(profile.intent_extra(view) if profile.intent_extra is not None else {}),
             }
         )
     except OSError as exc:

@@ -85,16 +85,19 @@ The tests read their media from `~/Library/Application Support/flame-mcp/probe_p
 * `p2/p2_src_tc1h.mov`, `p2/p2_rep_tc1h.mov`, `p2/p2_rep_tc1h_plus10.mov` and
   `p2/p2_rep_tc2h.mov`, 48 frames each, with different start timecodes. Make them with
   `scripts/make_p2_tc_media.sh`.
+* `p2/p2_av72.mov`, 72 frames with PCM audio (48 kHz, 2 channels) as long as the picture. It is
+  the one clip that has sound. Make it with `scripts/make_p2_av_media.sh`.
 
-All three scripts need `ffmpeg` and `ffprobe` on your `PATH`. Each takes an output folder as an
+All four scripts need `ffmpeg` and `ffprobe` on your `PATH`. Each takes an output folder as an
 optional argument. `make_clip_media.sh` writes to the media folder itself when you give none, and
-the other two write to the `p2` folder named above. `make_clip_media.sh` stops without writing
+the other three write to the `p2` folder named above. `make_clip_media.sh` stops without writing
 anything when a clip is already there; add `--force` to replace it.
 
 ```bash
 scripts/make_clip_media.sh
 scripts/make_p2_media.sh
 scripts/make_p2_tc_media.sh
+scripts/make_p2_av_media.sh
 ```
 
 ### Run the tests
@@ -194,6 +197,7 @@ the order the tests were written. It has no other meaning.
 | `p2_4_restart` | `p2` | How `journal.check` tells what became of intents left undecided across a Flame restart: a write whose server died, and two renders whose answers were lost. Flame is started twice. | Has its own orchestrator, `scripts/run_p2_4_restart_e2e.sh`. |
 | `p3_4_construct` | `p3` | Building a sequence up: `timeline.overwrite`, `timeline.insert`, `timeline.cut`, `timeline.create_version`, `timeline.create_track`, `timeline.create_sequence`, and a `plan.run` that holds them. | - |
 | `p3_5_scenarios` | `p3` | Two editing scenarios run as a plain chain of ops: replacing media from an EDL while keeping the source timecode, and taking a shot out with its handles. | - |
+| `p3_6_edit` | `p3` | Editing a built sequence: `timeline.delete_segments` (ripple and lift, a Gap, the by-product clip left out of the stash reel), `timeline.move_track` (a track to the bottom and to the top, an empty track, the audio left alone), the audio reads of `timeline.info` and `timeline.list_segments`, `timeline.shorten` on a sequence with sound, `timeline.compare` of copies, and `segment.connections` of a segment that has none. | - |
 | `fix2_library_batch` | `p3` | `library.create`, `desktop.copy` of a Batch group into a library, into a library folder and back onto the Desktop, and the `{kind: 'desktop'}` selector, with their journal groups, reverts and `journal.check`. | - |
 | `fix3_reel_order` | `p3` | Restoring a Batch checkpoint puts the clips of a reel back in the order the checkpoint recorded, although Flame writes the Clip nodes of a `.batch` file in another order. | - |
 | `fix5_timeline_selector` | `p3` | The `{kind: 'timeline'}` selector, which names the sequence the Timeline shows now. | - |

@@ -12,6 +12,7 @@ import pytest
 from flame_mcp.policy import Policy
 from flame_mcp.runtime import TestHooks, TestHooksConfigError
 from journal_test_helpers import COMP, REEL_WIRETAP, TREE_REEL_ID, Rig, make_rig
+from test_ops_attributes import ColourLabelAttr, add_attr
 
 
 @pytest.fixture
@@ -363,6 +364,31 @@ def test_check_lifts_the_refusal_whatever_it_finds(rig: Rig) -> None:
     assert rig.runtime.guard.blocked() == []
     again = rig.do("node.set_attributes", {"target": COMP, "values": {"pos_x": 1.0}})
     assert again["ok"] is True, again
+
+
+def test_check_finds_a_colour_label_write_landed_when_flame_stored_the_tables_spelling(
+    rig: Rig,
+) -> None:
+    add_attr(rig.handles["comp"], "colour_label", ColourLabelAttr("Red"))
+    rig.exec.fault("node.set_attributes", "BRIDGE_LOST", when="after")  # landed, answer lost
+    env = rig.do("node.set_attributes", {"target": COMP, "values": {"colour_label": "green"}})
+    assert rig.handles["comp"].colour_label.get_value() == "Green"
+    found = rig.do("journal.check", {"group": env["journal"]["group"]})
+    assert found["ok"] is True, found
+    assert found["result"]["checked"][0]["verdict"] == "landed"
+
+
+def test_revert_after_a_check_puts_back_a_colour_label_stored_in_the_tables_spelling(
+    rig: Rig,
+) -> None:
+    add_attr(rig.handles["comp"], "colour_label", ColourLabelAttr("Red"))
+    rig.exec.fault("node.set_attributes", "BRIDGE_LOST", when="after")
+    env = rig.do("node.set_attributes", {"target": COMP, "values": {"colour_label": "green"}})
+    group = env["journal"]["group"]
+    assert rig.do("journal.check", {"group": group})["ok"] is True
+    back = rig.do("journal.revert", {"group": group})
+    assert back["ok"] is True, back
+    assert rig.handles["comp"].colour_label.get_value() == "Red"
 
 
 def test_a_check_that_could_not_reach_flame_keeps_the_door_closed(rig: Rig) -> None:

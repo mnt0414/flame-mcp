@@ -14,7 +14,7 @@ What it encodes (measured on Flame 2025.2.4):
     `_tl_position`, `_tl_find_at`, `_tl_deltas`) are what the other segment edits
     (`timeline_edit_prelude`) judge by too.
   - a segment with a Timewarp effect whose source is not as long as its record (made in the UI,
-    its setup then loaded onto test segments; twice): Flame keeps its source range at the speed (44
+    its setup then loaded onto test segments): Flame keeps its source range at the speed (44
     record frames show 35 source frames at 0.8), so a trim or a slip moves source_in / source_out
     by the speed times the change, rounded (0.8: trim +-3 -> source +-2; slip +-2 -> source_in -+2,
     source_out -+1 or -+2), while the record side, head and tail move 1:1 as without it. The

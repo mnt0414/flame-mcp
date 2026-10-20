@@ -15,6 +15,7 @@ from flame_mcp.ops import (
     desktop_delete,
     desktop_media,
     desktop_read,
+    desktop_reformat,
     eval,
     journal,
     library,
@@ -24,6 +25,7 @@ from flame_mcp.ops import (
     project,
     render,
     segment,
+    segment_connect,
     segment_edit,
     segment_effects,
     segment_extract,
@@ -32,6 +34,7 @@ from flame_mcp.ops import (
     timeline_build,
     timeline_checkpoints,
     timeline_create,
+    timeline_shorten,
 )
 from flame_mcp.registry import Registry
 
@@ -42,14 +45,17 @@ def register_all(registry: Registry) -> None:
     desktop_read.register(registry)
     desktop_media.register(registry)
     desktop_delete.register(registry)
+    desktop_reformat.register(registry)
     mediahub.register(registry)
     library.register(registry)
     timeline.register(registry)
     timeline_checkpoints.register(registry)
     timeline_build.register(registry)
     timeline_create.register(registry)
+    timeline_shorten.register(registry)
     segment.register(registry)
     segment_trim.register(registry)
+    segment_connect.register(registry)
     segment_edit.register(registry)
     segment_effects.register(registry)
     segment_extract.register(registry)

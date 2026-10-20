@@ -5,7 +5,7 @@ op's own code, so each op's `to_python` output is a few loop-free lines (registr
 parses only that output). It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try` and
 `_OpError` already defined.
 
-What it encodes (measured on Flame 2025.2.4, twice, same values):
+What it encodes (measured on Flame 2025.2.4):
   - `PyDesktop.create_batch_group(name, nb_reels, nb_shelf_reels, reels, shelf_reels, start_frame,
     duration)` returns a PyBatch and always makes it the current Batch group; a name that is taken
     gets " 1" appended. `reels` given = those reels (it wins over nb_reels); `shelf_reels` given =

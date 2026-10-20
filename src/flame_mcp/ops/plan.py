@@ -66,6 +66,16 @@ tested revert. The other way -- one checkpoint per Batch group at the start of t
 whole plan reverted by restoring it -- would make every `value` write in the plan (whose own
 revert is exact and cheap) share the coarse, fingerprint-blind restore. Each such op is one
 call on its own, each with its own group and its own revert."""
+
+
+def _connection_refusal(name: str) -> str:
+    return (
+        f"{name} cannot be a plan step: its connections may reach segments of other sequences, it "
+        "runs with no checkpoint and no journal record, and a plan's group would put nothing of "
+        "it back without saying so. Call it on its own"
+    )
+
+
 REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
     "render.batch": (
         "render.batch cannot be a plan step: a Foreground render occupies Flame for "
@@ -138,6 +148,15 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "group is reverted by putting attribute values back -- it would skip such an intent "
         "without saying so. Call it on its own"
     ),
+    "desktop.reformat": (
+        "desktop.reformat cannot be a plan step: it journals one `desktop_reformat` intent per "
+        "clip that is reverted by restoring the clip's stashed copy (a new uid) or by deleting "
+        "the duplicate it made, and a plan's single group is reverted by putting attribute "
+        "values back -- it would skip such an intent without saying so. Call it on its own"
+    ),
+    "segment.create_connection": _connection_refusal("segment.create_connection"),
+    "segment.remove_connection": _connection_refusal("segment.remove_connection"),
+    "segment.sync_connections": _connection_refusal("segment.sync_connections"),
 }
 """Ops a plan refuses for a reason of their own (not `owns_journal_group`)."""
 BUNDLE_NOTE: Final[str] = (
@@ -554,10 +573,13 @@ def register(registry: Registry) -> None:
                 "(files on disk, clips in the shelf reel) cannot be undone. So are "
                 "desktop.create and desktop.copy: their revert deletes what they made, which a "
                 "plan's group (reverted by putting values back) does not do. Nor can "
-                "mediahub.import, desktop.duplicate, desktop.move and desktop.delete "
-                "(deleting / moving back / copying back), segment.copy_to_media_panel and "
+                "mediahub.import, desktop.duplicate, desktop.move, desktop.delete and "
+                "desktop.reformat (deleting / moving back / copying back / restoring a "
+                "stashed copy), segment.copy_to_media_panel and "
                 "segment.match (deleting the clip they made), timeline.create_sequence (deleting "
-                "the sequence it made), or journal.purge_checkpoints. "
+                "the sequence it made), journal.purge_checkpoints, or "
+                "segment.create_connection / remove_connection / sync_connections (they leave no "
+                "journal record and their connections may reach other sequences). "
                 "All the plan's writes share one "
                 "journal group "
                 "(envelope journal.group, `label` recorded on it): journal.revert(group) puts "
@@ -565,7 +587,8 @@ def register(registry: Registry) -> None:
                 "Timeline writes: a plan that holds a step of a Timeline-checkpointed op "
                 "(segment.trim, segment.slip, segment.replace, segment.create_effect / "
                 "delete_effect / set_effect / effect_load_setup, timeline.overwrite / insert / "
-                "cut / create_version / create_track) is one checkpointed write "
+                "cut / create_version / create_track / delete_segments / move_track / shorten) is "
+                "one checkpointed write "
                 "on one sequence / clip instead. Every "
                 "write step must be to that sequence (a Timeline-checkpointed op, or "
                 "segment.set_attributes of one of its segments); a write to another sequence, or "

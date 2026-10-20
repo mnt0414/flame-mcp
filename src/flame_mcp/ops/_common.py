@@ -19,6 +19,12 @@ AUTO_RESIZE_NOTE: Final[str] = (
     "that situation."
 )
 
+REEL_CLIP_NOTE: Final[str] = (
+    "The segment can also be the one inside a reel clip on the Desktop: parent = the clip's "
+    "wiretap, version 0, track 0, index 0 (a clip with one segment), with no sequence involved. "
+    "Measured on Flame 2025.2.4."
+)
+
 
 def build_source(*blocks: str) -> str:
     """Join generated-code blocks with blank lines between them.

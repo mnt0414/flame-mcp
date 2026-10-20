@@ -40,7 +40,7 @@ def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
 
 
 def old_checkpoint(rig: Rig, monkeypatch: pytest.MonkeyPatch, target: dict[str, Any]) -> str:
-    """A checkpoint the journal says was taken on 2026-08-01."""
+    """A checkpoint the journal says was taken long ago (at OLD)."""
     with monkeypatch.context() as patch:
         patch.setattr(timeline_checkpoints, "now_iso", lambda: OLD)
         return str(take_checkpoint(rig, target)["checkpoint"])

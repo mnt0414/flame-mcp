@@ -169,7 +169,16 @@ def register_attribute_ops(
                 "the current values, records an intent (envelope `journal` = {group, id}), then "
                 "writes with a compare-and-swap; if a value changed in between, nothing is "
                 "written (errorCode CONFLICT, `conflicts` = {key: {expected, current}}). "
-                "journal.revert(group) puts the previous values back."
+                "journal.revert(group) puts the previous values back. For colour_label and "
+                "schematic_colour_label Flame ignores letter case and reports the table's "
+                "spelling in `after` ('green' becomes 'Green'); spaces count ('lightgrey' is "
+                "refused); '' clears the label. The labels are the names in Flame's colour "
+                "coding table (colour_coding.cfg in Flame's cfg directory, section MediaPanel "
+                "for a clip or a segment): read it instead of guessing, match the user's word "
+                "to a label yourself (translate it; ignore case, spaces and spelling "
+                "variants), and ask the user to confirm the label before writing it. A colour "
+                "not in the table is a custom colour: tell the user, and once they confirm "
+                "write its RGB to `colour` (three numbers from 0 to 1)."
                 + (" " + note if note else "")
             ),
             effect="reversible",

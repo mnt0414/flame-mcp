@@ -15,7 +15,15 @@ from typing import Any
 
 import pytest
 
-from fake_media_tree import PyClip, PySequence, PyTime, PyTrack
+from fake_media_tree import (
+    PyAudioChannel,
+    PyAudioTrack,
+    PyClip,
+    PySegment,
+    PySequence,
+    PyTime,
+    PyTrack,
+)
 from flame_mcp import opschema
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
@@ -264,11 +272,13 @@ def test_a_track_cut_makes_the_frame_the_first_one_of_the_right_part(rig: Rig) -
     assert layout(rig.handles["s1"], 1) == [[VIDEO, 0, 47]]
     result = env["result"]
     assert result["scope"] == "track" and result["split"] is True and result["changed"] is True
-    assert result["willCut"] == [{"version": 0, "track": 0, "recordIn": 10, "recordOut": 33}]
+    assert result["willCut"] == [
+        {"version": 0, "track": 0, "type": VIDEO, "recordIn": 10, "recordOut": 33}
+    ]
     assert result["after"]["tracks"][0]["segmentCount"] == 5
 
 
-def test_a_cut_of_the_whole_sequence_cuts_every_track_that_has_media_there(rig: Rig) -> None:
+def test_a_cut_of_the_whole_sequence_cuts_every_track_that_has_a_segment_there(rig: Rig) -> None:
     env = rig.do(CUT, {"sequence": S1, "at": 20, "scope": "all"})
     assert env["ok"] is True, env
     assert layout(rig.handles["s1"], 1) == [[VIDEO, 0, 19], [VIDEO, 20, 47]]
@@ -279,19 +289,66 @@ def test_a_cut_of_the_whole_sequence_cuts_every_track_that_has_media_there(rig: 
 
 @pytest.mark.parametrize(
     "at",
-    [10, 5, 34, 36, 64, 500],
-    ids=["segment-start", "gap", "gap-end", "in-gap", "after", "far"],
+    [0, 10, 34, 40, 64, 500],
+    ids=["gap-start", "segment-start", "second-gap-start", "last-segment-start", "after", "far"],
 )
-def test_a_cut_where_the_track_has_no_media_inside_is_refused(rig: Rig, at: int) -> None:
+def test_a_cut_at_the_first_frame_of_a_segment_or_outside_the_segments_is_refused(
+    rig: Rig, at: int
+) -> None:
     env = rig.do(CUT, {"sequence": S1, "at": at, "track": 0})
-    assert env["errorCode"] == "PRECONDITION_UNMET" and "not inside a media segment" in env["error"]
-    assert env["result"]["ran"] is False and env["result"]["mediaSegments"][0]["recordIn"] == 10
+    assert env["errorCode"] == "PRECONDITION_UNMET" and "not inside a segment" in env["error"]
+    assert env["result"]["ran"] is False and env["result"]["segments"][0]["recordIn"] == 0
+    assert env["result"]["segments"][0]["type"] == GAP
+    assert "mediaSegments" not in env["result"]
     assert untouched_world(rig)
 
 
-def test_a_cut_of_the_whole_sequence_with_no_media_inside_anywhere_is_refused(rig: Rig) -> None:
+@pytest.mark.parametrize("at", [5, 9, 36, 39], ids=["gap-1", "gap-end", "gap2-mid", "gap2-end"])
+def test_a_track_cut_inside_a_gap_splits_the_gap(rig: Rig, at: int) -> None:
+    before = layout(rig.handles["s1"])
+    env = rig.do(CUT, {"sequence": S1, "at": at, "track": 0})
+    assert env["ok"] is True, env
+    gap_in, gap_out = (0, 9) if at < 10 else (34, 39)
+    after = layout(rig.handles["s1"])
+    assert len(after) == len(before) + 1
+    assert [GAP, gap_in, at - 1] in after and [GAP, at, gap_out] in after
+    result = env["result"]
+    assert result["split"] is True and result["changed"] is True
+    assert result["willCut"] == [
+        {"version": 0, "track": 0, "type": GAP, "recordIn": gap_in, "recordOut": gap_out}
+    ]
+    assert result["warnings"] == []
+    assert layout(rig.handles["s1"], 1) == [[VIDEO, 0, 47]]
+
+
+def test_a_cut_of_the_whole_sequence_needs_media_around_the_frame_and_lists_only_media(
+    rig: Rig,
+) -> None:
+    env = rig.do(CUT, {"sequence": S1, "at": 5, "scope": "all"})
+    assert env["ok"] is True, env
+    assert layout(rig.handles["s1"], 1) == [[VIDEO, 0, 4], [VIDEO, 5, 47]]
+    assert [(h["track"], h["type"]) for h in env["result"]["willCut"]] == [(1, VIDEO)]
+    assert env["result"]["split"] == [{"version": 0, "track": 1}]
+
+
+def test_a_cut_of_the_whole_sequence_where_only_a_gap_is_hit_is_refused(rig: Rig) -> None:
+    s1 = rig.handles["s1"]
+    s1._versions[0]._tracks[1]._segments[:] = [rig_seg(0, 3)]
+    env = rig.do(CUT, {"sequence": S1, "at": 36, "scope": "all"})
+    assert env["errorCode"] == "PRECONDITION_UNMET"
+    assert "not inside a media segment" in env["error"] and "use scope track" in env["error"]
+    assert env["result"]["ran"] is False
+    assert {r["type"] for r in env["result"]["segments"]} == {VIDEO}
+    assert untouched_world(rig)
+    track = rig.do(CUT, {"sequence": S1, "at": 36, "track": 0})
+    assert track["ok"] is True, track  # the same frame is cut with scope='track'
+    assert track["result"]["willCut"][0]["type"] == GAP
+
+
+def test_a_cut_of_the_whole_sequence_with_no_segment_inside_anywhere_is_refused(rig: Rig) -> None:
     env = rig.do(CUT, {"sequence": S1, "at": 500, "scope": "all"})
     assert env["errorCode"] == "PRECONDITION_UNMET" and "any track" in env["error"]
+    assert {r["track"] for r in env["result"]["segments"]} == {0, 1}
     assert untouched_world(rig)
 
 
@@ -328,6 +385,182 @@ def test_a_cut_is_reverted_like_the_others(rig: Rig) -> None:
     out = rig.do("journal.revert", {"group": env["journal"]["group"]})
     assert out["ok"] is True
     assert fingerprint_of_target(rig, out["result"]["restored"]["selector"]) == before
+
+
+def audio_seg(source: str, first: int, last: int) -> PySegment:
+    return PySegment(
+        name="AUD",
+        source_name=source,
+        record_in=first,
+        record_out=last,
+        source_in=0,
+        source_out=last - first,
+        record_duration=last - first + 1,
+        type="Audio Segment",
+    )
+
+
+def audio_track(source: str, first: int, last: int, channels: int = 2) -> PyAudioTrack:
+    return PyAudioTrack(
+        channels=[PyAudioChannel([audio_seg(source, first, last)]) for _ in range(channels)]
+    )
+
+
+def audio_sources(seq: Any) -> list[list[str]]:
+    return [
+        [s.source_name for s in channel.segments]
+        for track in seq.audio_tracks
+        for channel in track.channels
+    ]
+
+
+def with_audio_only_change(rig: Rig) -> PySequence:
+    """S2 holds the video of c12 at 0-11 (the same call a second time leaves the video as it is)
+    and two audio channels that hold another source; c12 carries audio of its own."""
+    assert put(rig, OVERWRITE, S2, 0)["ok"] is True
+    seq: PySequence = rig.handles["s2"]
+    seq.audio_tracks = [audio_track("old30", 0, 11)]
+    rig.handles["c12"].audio_tracks = [audio_track("len12", 0, 11)]
+    return seq
+
+
+def test_an_overwrite_that_changes_only_the_audio_is_not_a_silent_noop(rig: Rig) -> None:
+    seq = with_audio_only_change(rig)
+    video_before = fingerprint_of_target(rig, S2)
+    env = put(rig, OVERWRITE, S2, 0)
+    assert env["ok"] is True, env
+    assert fingerprint_of_target(rig, S2) == video_before  # the video tracks did not change
+    assert audio_sources(seq) == [["len12"], ["len12"]]
+    result = env["result"]
+    assert result["changed"] is True
+    audio = result["audio"]
+    assert audio["changed"] is True and audio["complete"] is True
+    assert audio["before"]["trackCount"] == 1 and audio["before"]["channelCount"] == 2
+    assert audio["before"]["segmentCount"] == 2 and audio["after"]["segmentCount"] == 2
+    assert audio["before"]["rows"][0] == [0, 0, "Audio Segment", "old30", 0, 11, 0, 11]
+    assert audio["after"]["rows"][1] == [0, 1, "Audio Segment", "len12", 0, 11, 0, 11]
+    assert audio["before"]["rowsTruncated"] is False and audio["after"]["errors"] == []
+    [warning] = result["warnings"]
+    assert "only the audio changed" in warning and "video tracks" in warning
+    assert "the revert check compares the video fingerprint only" in warning
+    assert env["journal"]["changed"] is False  # the journal compares the video fingerprint
+
+
+def test_an_insert_reports_the_audio_beside_the_video_and_no_only_audio_warning(
+    rig: Rig,
+) -> None:
+    seq = with_audio_only_change(rig)
+    video = seq._versions[0]._tracks[0]
+    before = [s.record_in.frame for s in video._segments]
+    env = put(rig, INSERT, S2, 40)  # past the end of the video: the video changes here as well
+    assert env["ok"] is True and [s.record_in.frame for s in video._segments] != before
+    assert env["result"]["audio"]["changed"] is True
+    assert not any("only the audio changed" in w for w in env["result"]["warnings"])
+
+
+def test_a_silent_noop_stays_one_when_neither_the_video_nor_the_audio_changed(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with_audio_only_change(rig)
+    monkeypatch.setattr(PySequence, "overwrite", lambda self, clip, time, track: None)
+    env = put(rig, OVERWRITE, S2, 0)
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP"
+    audio = env["result"]["audio"]
+    assert audio["changed"] is False and audio["before"] == audio["after"]
+    assert env["result"]["changed"] is False
+
+
+def test_a_sequence_without_audio_tracks_is_judged_as_before(rig: Rig) -> None:
+    env = put(rig, OVERWRITE, S1, 20)
+    assert env["ok"] is True, env
+    audio = env["result"]["audio"]
+    assert audio["changed"] is False and audio["complete"] is True
+    assert audio["before"] == audio["after"]
+    assert audio["before"]["trackCount"] == 0 and audio["before"]["rows"] == []
+
+
+def test_a_sequence_that_has_no_audio_tracks_member_at_all_still_works(rig: Rig) -> None:
+    seq: PySequence = rig.handles["s1"]
+    del seq.audio_tracks
+    env = put(rig, OVERWRITE, S1, 20)
+    assert env["ok"] is True, env
+    audio = env["result"]["audio"]
+    assert audio["before"]["trackCount"] is None and audio["after"]["errors"] == []
+    assert audio["changed"] is False
+
+
+def test_audio_that_cannot_be_read_is_marked_and_the_call_goes_on(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seq = with_audio_only_change(rig)
+    chan = seq.audio_tracks[0].channels[1]
+
+    def broken(self: PyAudioChannel) -> Any:
+        if self is chan:
+            raise RuntimeError("not readable at 0x1234")
+        return list(self._segments)
+
+    monkeypatch.setattr(PyAudioChannel, "segments", property(broken))
+    env = put(rig, OVERWRITE, S2, 0)
+    assert env["ok"] is True, env
+    audio = env["result"]["audio"]
+    assert audio["complete"] is False
+    assert audio["before"]["errors"] == ["audio track 0 channel 1: RuntimeError"]
+    assert audio["after"]["errors"] == audio["before"]["errors"]  # the type only, not the text
+    assert audio["before"]["segmentCount"] == 1 and audio["changed"] is True
+    assert any("could not be read" in w for w in env["result"]["warnings"])
+
+
+def test_a_segment_cell_that_cannot_be_read_leaves_null_and_a_marker(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seq = with_audio_only_change(rig)
+    broken = seq.audio_tracks[0].channels[0]._segments[0]
+
+    class Dead:
+        @property
+        def frame(self) -> int:
+            raise RuntimeError("gone")
+
+    broken.source_out = Dead()
+    env = put(rig, OVERWRITE, S2, 0)
+    assert env["ok"] is True, env
+    audio = env["result"]["audio"]
+    assert audio["before"]["rows"][0][7] is None
+    assert audio["before"]["errors"] == [
+        "audio track 0 channel 0 segment 0 source_out: RuntimeError"
+    ]
+
+
+def test_a_long_audio_listing_is_capped(rig: Rig) -> None:
+    seq: PySequence = rig.handles["s2"]
+    seq.audio_tracks = [
+        PyAudioTrack(
+            channels=[PyAudioChannel([audio_seg("a", i * 3, i * 3 + 2) for i in range(40)])]
+        )
+    ]
+    env = put(rig, OVERWRITE, S2, 90)
+    audio = env["result"]["audio"]
+    assert audio["before"]["segmentCount"] == 40 and len(audio["before"]["rows"]) == 24
+    assert audio["before"]["rowsTruncated"] is True and audio["changed"] is False
+
+
+def test_a_cut_that_changes_only_the_audio_is_not_a_silent_noop(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seq = with_audio_only_change(rig)
+
+    def cut_audio_only(self: PyTrack, time: PyTime) -> Any:
+        for channel in seq.audio_tracks[0].channels:
+            channel._segments[:] = [audio_seg("cut", 0, 5), audio_seg("cut", 6, 11)]
+        return None
+
+    monkeypatch.setattr(PyTrack, "cut", cut_audio_only)
+    env = rig.do(CUT, {"sequence": S2, "at": 5, "track": 0})
+    assert env["ok"] is True, env
+    assert env["result"]["audio"]["changed"] is True and env["result"]["changed"] is True
+    assert any("only the audio changed" in w for w in env["result"]["warnings"])
+    assert not any("no segment ends" in w for w in env["result"]["warnings"])
 
 
 def test_create_version_adds_one_at_the_end_with_one_track_of_gap(rig: Rig) -> None:
@@ -412,6 +645,47 @@ def test_an_answer_that_never_came_is_diverged_when_checked(rig: Rig) -> None:
     assert env["errorCode"] == "TIMEOUT" and rig.runtime.guard.denial() is not None
     [entry] = rig.do("journal.check")["result"]["checked"]
     assert entry["verdict"] == "diverged" and rig.runtime.guard.denial() is None
+
+
+@pytest.mark.parametrize("name", [OVERWRITE, INSERT, CUT, "timeline.delete_segments"])
+def test_the_descriptions_say_that_the_audio_is_judged_apart_from_the_video(
+    rig: Rig, name: str
+) -> None:
+    op = rig.registry.get(name)
+    assert op is not None
+    text = " ".join(op.description.split())
+    for word in (
+        "PySequence.audio_tracks",
+        "result.audio",
+        "not a SILENT_NOOP",
+        "journal.changed stays false",
+        "rowsTruncated",
+        "the revert check compares the video fingerprint only",
+        "can all be read on the Audio Segment objects",
+        "A call that changes nothing, video tracks and audio tracks read back, is SILENT_NOOP.",
+    ):
+        assert word in text, word
+    assert "A call that changes nothing is SILENT_NOOP" not in text
+
+
+def test_the_overwrite_description_gives_the_measured_audio_replacement(rig: Rig) -> None:
+    op = rig.registry.get(OVERWRITE)
+    assert op is not None
+    text = " ".join(op.description.split())
+    assert "Measured on Flame 2025.2.4: overwriting a clip that has audio" in text
+    assert "replaced the audio of the sequence" in text
+
+
+def test_the_cut_description_says_that_a_gap_is_cut_like_a_segment(rig: Rig) -> None:
+    op = rig.registry.get(CUT)
+    assert op is not None
+    text = " ".join(op.description.split())
+    assert "PyTrack.cut inside a Gap splits it into two Gaps" in text
+    assert "scope='all' needs a segment that has media" in text
+    assert "a Gap alone is not enough" in text
+    assert "not inside a segment of that track (media or Gap" in text
+    assert "result.segments" in text and "mediaSegments" not in text
+    assert "is not a Gap" not in text and "in a Gap or outside" not in text
 
 
 @pytest.mark.parametrize(

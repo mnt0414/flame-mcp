@@ -67,6 +67,7 @@ p2_4_stress|standard|p2|yes|yes|yes|-|all stages
 p2_4_restart|dedicated|-|-|-|-|-|-
 p3_4_construct|standard|p3|yes|no|no|-|setup, stages o, i, k, v, c, p, y, z
 p3_5_scenarios|standard|p3|yes|no|no|-|setup, stages a, n, b, z
+p3_6_edit|standard|p3|yes|no|no|-|setup, stages d, m, a, s, q, c, y, z
 fix2_library_batch|standard|p3|yes|no|no|-|setup, stages l, b, r, d, c, e, g, z
 fix3_reel_order|standard|p3|yes|no|no|-|setup, stages n, c, z
 fix5_timeline_selector|standard|p3|yes|no|no|-|setup, stages a, t, p, s, z

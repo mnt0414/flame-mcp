@@ -78,10 +78,18 @@ _KIND_FIELDS: dict[SelectorKind, dict[str, tuple[str, str]]] = {
     "segment": {
         "parent": (
             "selector",
-            "Selector for the sequence that holds the segment (selection / wiretap / path / "
-            "timeline; not itself a 'segment').",
+            "Selector for the sequence, or the reel clip, that holds the segment (selection / "
+            "wiretap / path / timeline; not itself a 'segment'). A reel clip holds its own "
+            "segments (version 0, track 0, index 0 for a clip with one segment), so a clip's "
+            "wiretap id works here like a sequence's. Measured on a clip (Flame 2025.2.4): "
+            "info, get_attributes, set_attributes, list_effects, create_effect, set_effect, "
+            "delete_effect, effect_save_setup, effect_load_setup, trim, slip, shared_sources, "
+            "copy_to_media_panel and match.",
         ),
-        "version": (_NON_NEGATIVE_INT, "Version index within the sequence (0-based)."),
+        "version": (
+            _NON_NEGATIVE_INT,
+            "Version index within the sequence or clip (0-based).",
+        ),
         "track": (_NON_NEGATIVE_INT, "Track index within the version (0-based)."),
         "index": (
             _NON_NEGATIVE_INT,

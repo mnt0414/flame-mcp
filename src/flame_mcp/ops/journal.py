@@ -36,6 +36,8 @@ from flame_mcp.desktop_delete_run import (
     revert_delete_group,
 )
 from flame_mcp.desktop_media_run import check_media_intent, is_media_intent, revert_media_group
+from flame_mcp.desktop_reformat_check import check_reformat_intent, is_reformat_intent
+from flame_mcp.desktop_reformat_revert import revert_reformat_group
 from flame_mcp.desktop_revert import check_desktop_intent, revert_desktop_group
 from flame_mcp.errors import as_error_code
 from flame_mcp.journal import (
@@ -47,9 +49,9 @@ from flame_mcp.journal import (
     VERDICT_UNKNOWN,
     Index,
     IntentView,
+    attribute_values_equal,
     new_id,
     now_iso,
-    values_equal,
 )
 from flame_mcp.newer_groups import NEWER_GROUPS_KEY, newer_groups, newer_groups_sentence
 from flame_mcp.ops._common import offset_param
@@ -159,8 +161,8 @@ def classify(intent: Mapping[str, Any], current: Mapping[str, Any]) -> tuple[str
     all_before = True
     all_after = True
     for key, previous in before.items():
-        is_before = values_equal(current.get(key), previous)
-        is_after = values_equal(current.get(key), after.get(key))
+        is_before = attribute_values_equal(key, current.get(key), previous)
+        is_after = attribute_values_equal(key, current.get(key), after.get(key))
         all_before &= is_before
         all_after &= is_after
         if is_before and is_after:
@@ -380,6 +382,8 @@ def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
             return check_delete_intent(ctx, view)
         if is_media_intent(view):
             return check_media_intent(ctx, view)
+        if is_reformat_intent(view):
+            return check_reformat_intent(ctx, view)
         if is_extract_intent(view):
             return check_extract_intent(ctx, view)
         if is_sequence_intent(view):
@@ -507,7 +511,7 @@ def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPl
             key: {
                 "expected": expected[key],
                 "current": current.values[key],
-                "match": values_equal(current.values[key], expected[key]),
+                "match": attribute_values_equal(key, current.values[key], expected[key]),
             }
             for key in keys
         }
@@ -622,6 +626,10 @@ def _revert(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
                 return revert_delete_group(ctx, index, group, desktop_views)
             if any(is_media_intent(v) for v in desktop_views):
                 return revert_media_group(ctx, index, group, desktop_views)
+            if any(is_reformat_intent(v) for v in desktop_views):
+                return revert_reformat_group(
+                    ctx, index, group, desktop_views, bool(args.get("force", False))
+                )
             if any(is_extract_intent(v) for v in desktop_views):
                 return revert_extract_group(ctx, index, group, desktop_views)
             if any(is_sequence_intent(v) for v in desktop_views):
@@ -872,6 +880,13 @@ def register(registry: Registry) -> None:
                 "parent is gone, or whose stashed copy is gone or changed, stays a CONFLICT "
                 "while the others are put back (result.partial), and a second revert puts back "
                 "only what the first one did not. "
+                "A desktop.reformat group: newest clip first, each stashed copy is restored "
+                "(a Timeline restore: the reformatted clip is moved into the stash reel and the "
+                "stashed copy is copied back; a new uid, the end of the reel; force=true "
+                "overrides the fingerprint check) and its format is read back "
+                "(result.restored[].format); with duplicate=true the copy is deleted instead, "
+                "only while it is as left. One that cannot be put back leaves the others "
+                "restored (result.partial). "
                 "A segment.copy_to_media_panel / segment.match group: the clip the call "
                 "made is deleted by uid (flame.delete), only while its name, duration and content "
                 "(segments and effects, by fingerprint) are still what they were right after the "

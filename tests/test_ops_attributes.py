@@ -12,7 +12,7 @@ fetched `getattr(obj, key)`)."""
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -454,6 +454,32 @@ def test_silent_noop_is_detected_by_reading_back() -> None:
     assert h["comp"].dynamic_name.set_calls == ["y"]  # it was attempted
 
 
+class ColourLabelAttr(SpyAttr):
+    """A colour label like Flame's: matched against the colour coding table ignoring letter
+    case (spaces are not folded), stored in the table's spelling; '' clears it."""
+
+    TABLE: ClassVar[dict[str, str]] = {"red": "Red", "green": "Green", "light grey": "Light Grey"}
+
+    def set_value(self, value: str) -> None:
+        self.set_calls.append(value)
+        if value == "":
+            self._value = ""
+            return
+        if value.lower() not in self.TABLE:
+            raise RuntimeError("The colour label does not exist in the colour coding table.")
+        self._value = self.TABLE[value.lower()]
+
+
+class LowercasingName(SpyAttr):
+    def set_value(self, value: str) -> None:
+        self.set_calls.append(value)
+        self._value = value.lower()
+
+
+for _cls in (ColourLabelAttr, LowercasingName):
+    _cls.__name__ = "PyAttribute"
+
+
 def _swap_in_fresh_view_node(h: dict[str, Any], mode: str) -> None:
     h["bg1"].nodes[1] = _FreshViewNode(mode)
 
@@ -523,6 +549,114 @@ def test_set_value_raising_is_an_error_that_also_stops() -> None:
     assert result["opErrorCode"] == "FLAME_API_ERROR"
     assert result["value"]["failed"]["mode"].startswith("error: RuntimeError")
     assert h["comp"].blend_type.set_calls == []
+
+
+@pytest.mark.parametrize("key", ["colour_label", "schematic_colour_label"])
+def test_a_colour_label_stored_in_the_tables_spelling_is_applied_not_a_silent_noop(
+    key: str,
+) -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], key, ColourLabelAttr("Red"))
+    result = set_call(registry, "node.set_attributes", COMP, {key: "green"}, flame)
+    assert result["opError"] is None, result["opError"]
+    value = result["value"]
+    assert value["applied"] == [key]
+    assert value["failed"] == {}
+    assert value["after"] == {key: "Green"}
+    assert result["partial"] is None
+    assert getattr(h["comp"], key).set_calls == ["green"]
+
+
+@pytest.mark.parametrize("key", ["colour_label", "schematic_colour_label"])
+def test_the_revert_of_a_colour_label_write_restores_the_previous_spelling(key: str) -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], key, ColourLabelAttr("Light Grey"))
+    result = set_call(registry, "node.set_attributes", COMP, {key: "green"}, flame)
+    revert = result["value"]["revert"]
+    assert revert["args"]["values"] == {key: "Light Grey"}
+    back = call(registry, revert["op"], revert["args"], flame)
+    assert back["opError"] is None, back["opError"]
+    assert getattr(h["comp"], key).get_value() == "Light Grey"
+
+
+def test_a_colour_label_written_in_the_stored_spelling_is_still_applied() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], "colour_label", ColourLabelAttr("Red"))
+    result = set_call(registry, "node.set_attributes", COMP, {"colour_label": "Green"}, flame)
+    assert result["opError"] is None
+    assert result["value"]["after"] == {"colour_label": "Green"}
+
+
+def test_an_empty_string_clears_a_colour_label_and_the_revert_puts_it_back() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], "colour_label", ColourLabelAttr("Green"))
+    result = set_call(registry, "node.set_attributes", COMP, {"colour_label": ""}, flame)
+    assert result["opError"] is None, result["opError"]
+    assert result["value"]["after"] == {"colour_label": ""}
+    assert result["value"]["applied"] == ["colour_label"]
+    revert = result["value"]["revert"]
+    assert revert["args"]["values"] == {"colour_label": "Green"}
+    back = call(registry, revert["op"], revert["args"], flame)
+    assert back["opError"] is None
+    assert h["comp"].colour_label.get_value() == "Green"
+
+
+def test_a_case_only_difference_on_another_attribute_is_still_a_silent_noop() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    h["comp"].name = LowercasingName("comp1")
+    result = set_call(registry, "node.set_attributes", COMP, {"name": "Comp1_X"}, flame)
+    assert result["opErrorCode"] == "SILENT_NOOP"
+    assert result["value"]["failed"]["name"].startswith("silent_noop")
+    assert result["value"]["applied"] == []
+    assert result["value"]["after"] == {"name": "comp1_x"}
+
+
+def test_an_unknown_colour_label_is_an_api_error_with_a_colour_coding_table_hint() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], "colour_label", ColourLabelAttr("Red"))
+    result = set_call(registry, "node.set_attributes", COMP, {"colour_label": "lightgrey"}, flame)
+    assert result["opErrorCode"] == "FLAME_API_ERROR"
+    reason = result["value"]["failed"]["colour_label"]
+    assert reason.startswith("error: RuntimeError")
+    assert "colour label does not exist" in reason
+    assert "colour coding table" in reason and "letter case does not matter" in reason
+    assert "'Light Grey'" in reason and "'lightgrey'" in reason
+    assert "means no colour" in reason
+    assert "colour coding table" in result["opError"]
+    assert h["comp"].colour_label.get_value() == "Red"
+    assert result["value"]["applied"] == [] and result["value"]["revert"] is None
+
+
+def test_the_name_in_use_hint_is_not_added_to_a_colour_label_error() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    add_attr(h["comp"], "colour_label", ColourLabelAttr("Red"))
+    result = set_call(registry, "node.set_attributes", COMP, {"colour_label": "nope"}, flame)
+    assert "CURRENT Batch group" not in result["value"]["failed"]["colour_label"]
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    ["desktop.set_attributes", "segment.set_attributes", "node.set_attributes"],
+)
+def test_set_attributes_description_tells_the_caller_how_to_set_a_colour(op_name: str) -> None:
+    registry = make_registry()
+    op = registry.get(op_name)
+    assert op is not None
+    text = op.description
+    assert "colour_coding.cfg" in text and "MediaPanel" in text
+    assert "read it instead of guessing" in text and "match the user's word" in text
+    assert "confirm the label before writing it" in text
+    assert "custom colour" in text and "`colour`" in text
+    assert text.isascii()
+    assert "not measured" not in text and "plan/" not in text
+    assert "/opt/" not in text
 
 
 def test_a_partial_failure_reaches_the_envelope_with_result_and_partial() -> None:

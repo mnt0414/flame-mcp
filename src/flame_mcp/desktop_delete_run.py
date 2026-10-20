@@ -116,7 +116,7 @@ def _refuse(
     )
 
 
-def _stash_record(rt: Any, op: RegisteredOperation, group_id: str, stash: Mapping[str, Any]) -> str:
+def stash_record(rt: Any, op: RegisteredOperation, group_id: str, stash: Mapping[str, Any]) -> str:
     """Journal one stashed copy as a timeline checkpoint; its id. Raises OSError."""
     checkpoint_id = new_id("c")
     rt.journal.append(
@@ -157,7 +157,7 @@ def _prepare(
     ids: list[str] = []
     try:
         for stash in stashes:
-            ids.append(_stash_record(rt, op, group_id, stash))
+            ids.append(stash_record(rt, op, group_id, stash))
     except OSError as exc:
         return _refuse(
             op,

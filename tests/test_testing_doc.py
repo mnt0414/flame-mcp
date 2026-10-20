@@ -42,7 +42,7 @@ def test_table_has_one_row_per_listed_e2e() -> None:
     names = generator.e2e_names()
     rows = re.findall(r"^\| `([a-z0-9_]+)` \|", doc, flags=re.MULTILINE)
     assert rows == names
-    assert len(names) == 28
+    assert len(names) == 29
 
 
 def test_every_listed_e2e_has_a_checks_paragraph() -> None:

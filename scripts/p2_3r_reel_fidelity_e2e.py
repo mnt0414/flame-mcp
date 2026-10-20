@@ -573,7 +573,7 @@ async def stage_c(ctx: Ctx) -> None:
         )
 
 
-# stage d
+# md5 of the rendered files
 def md5_rows(render: Any) -> list[Any]:
     files = render.get("files") if isinstance(render, dict) else None
     return files if isinstance(files, list) else []

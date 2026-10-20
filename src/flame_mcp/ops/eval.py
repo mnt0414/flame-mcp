@@ -80,7 +80,10 @@ def register(registry: Registry) -> None:
                 "(set_value, create_*, delete, copy, load_setup, set_current_tab, ...) or "
                 "attribute assignment. It reads names only: computed getattr, aliases, open(), "
                 "shutil, sockets and urllib all pass. Not allowed in plan.run when "
-                "destructive. undoSteps 0: use journal.revert (a destructive run is undone by "
+                "destructive. Audio segments (seq.audio_tracks[].channels[].segments): on "
+                "Flame 2025.2.4 PySegment.smart_replace_media on one crashed Flame and "
+                "trim_tail turned it into a Gap (flame_context: pitfalls). undoSteps 0: use "
+                "journal.revert (a destructive run is undone by "
                 "restoring the checkpoint). " + RESTORE_SIDE_EFFECTS
             ),
             effect="read",

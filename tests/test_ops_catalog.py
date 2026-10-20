@@ -1,6 +1,6 @@
 """Completion check of the op catalog.
 
-The 84 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
+The 93 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
 the actual MCP tool surface, and READONLY hides/rejects exactly the write ops (`desktop.rename`
 and every `*.set_attributes`) in all 3 policy checkpoints. No bridge/socket is needed here:
 `flame_catalog`/`flame_do`'s POLICY_DENIED path and `tools/list` never touch the bridge.
@@ -25,7 +25,7 @@ from flame_mcp.registry import Registry, sample_selector_for
 from flame_mcp.server import create_server
 from flame_mcp.types import SelectorKind
 
-PROJECTED_OP_COUNT = 84
+PROJECTED_OP_COUNT = 93
 """The number of real ops the listing is projected for; the whole listing must still fit."""
 PROJECTED_BUDGET_SHARE = 0.8
 LISTING_KEYS = {"name", "category", "effect", "undo", "summary", "params", "accepts"}
@@ -130,6 +130,7 @@ EXPECTED_OP_NAMES = {
     "timeline.checkpoint",
     "segment.trim",
     "desktop.delete",
+    "desktop.reformat",
     "journal.purge_checkpoints",
     "segment.slip",
     "segment.replace",
@@ -146,6 +147,14 @@ EXPECTED_OP_NAMES = {
     "timeline.create_version",
     "timeline.create_track",
     "timeline.create_sequence",
+    "timeline.delete_segments",
+    "timeline.move_track",
+    "timeline.shorten",
+    "timeline.compare",
+    "segment.connections",
+    "segment.create_connection",
+    "segment.remove_connection",
+    "segment.sync_connections",
 }
 WRITE_OP_NAMES = {
     "eval.run",  # READONLY refuses eval.run whatever effect the call declares
@@ -184,6 +193,7 @@ WRITE_OP_NAMES = {
     "timeline.checkpoint",
     "segment.trim",
     "desktop.delete",
+    "desktop.reformat",
     "journal.purge_checkpoints",
     "segment.slip",
     "segment.replace",
@@ -200,6 +210,12 @@ WRITE_OP_NAMES = {
     "timeline.create_version",
     "timeline.create_track",
     "timeline.create_sequence",
+    "timeline.delete_segments",
+    "timeline.move_track",
+    "timeline.shorten",
+    "segment.create_connection",
+    "segment.remove_connection",
+    "segment.sync_connections",
 }
 
 
@@ -222,13 +238,13 @@ def _structured(result: Any) -> dict[str, Any]:
     return sc
 
 
-def test_registered_op_count_is_84() -> None:
+def test_registered_op_count_is_93() -> None:
     registry = make_full_registry()
-    assert len(registry.list_ops()) == 84
+    assert len(registry.list_ops()) == 93
     assert {op.name for op in registry.list_ops()} == EXPECTED_OP_NAMES
 
 
-def test_flame_catalog_lists_all_84_ops(run_dir: Path) -> None:
+def test_flame_catalog_lists_all_93_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
@@ -245,7 +261,7 @@ def test_flame_catalog_lists_all_84_ops(run_dir: Path) -> None:
     anyio.run(main)
 
 
-def test_flame_do_tool_enum_lists_all_84_ops(run_dir: Path) -> None:
+def test_flame_do_tool_enum_lists_all_93_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})

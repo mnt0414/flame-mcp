@@ -5,7 +5,7 @@ This page explains how flame-mcp is built: which processes take part, where each
 * For the list of operations, see [ops.md](ops.md).
 * For the promises the server makes, how writes are undone, and what cannot be undone, see [safety.md](safety.md).
 
-Statements about Flame's behavior come from tests on Flame 2025.2.4 on macOS, and each one says what was tested. The end-to-end tests also passed on Flame 2026.2.3, but the individual measurements were not repeated there unless a statement says so. Statements about the server come from its code. Other Flame versions and other operating systems have not been tried.
+Statements about Flame's behavior come from tests on Flame 2025.2.4 on macOS, and each one says what was tested. The end-to-end tests also passed on Flame 2026.2.3, but the individual measurements were not repeated there unless a statement says so. Statements about the server come from its code.
 
 ## Overview
 
@@ -157,7 +157,7 @@ Splitting the bridge this way has these effects:
 Two checks keep a stub, a body, and a server from running together by mistake:
 
 * **ABI.** The body defines `BRIDGE_ABI`. The stub refuses to start a body whose ABI differs from the one it expects. The server also compares the `bridgeAbi` in the bridge's `hello` reply with its own copy and treats a mismatch as no usable bridge (`BRIDGE_UNAVAILABLE`, with the mismatch in the message).
-* **Flame version.** The server and the bridge were tested only on Flame 2025.2.4 and Flame 2026.2.3 (the end-to-end tests passed on both). The bridge is written to start on any other version and to warn in `bridge.log` and in the **Show status** dialog. `flame_version_info` reports `untestedFlameVersion` and adds a notice. Starting on a version other than these two has not been tried.
+* **Flame version.** The server and the bridge were tested only on Flame 2025.2.4 and Flame 2026.2.3 (the end-to-end tests passed on both). The bridge is written to start on any other version and to warn in `bridge.log` and in the **Show status** dialog. `flame_version_info` reports `untestedFlameVersion` and adds a notice.
 
 ### Starting and stopping
 

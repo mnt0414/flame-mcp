@@ -149,7 +149,9 @@ _SAVE_DESCRIPTION = (
     "'<path>.*' already there unless overwrite=true (PRECONDITION_UNMET), a segment without an "
     "effect of that type, a Gap. A call with overwrite=true rewrites those files for good and "
     "counts as destructive for FLAME_MCP_ALLOW_EFFECTS (the op stays effect=create). "
-    "Works on a segment inside a library too (it only reads). "
+    "Works on a segment inside a library too (it only reads), and on the segment of a reel clip "
+    "on the Desktop (parent = the clip's wiretap, version 0, track 0, index 0; measured on Flame "
+    "2025.2.4). "
     "result: type, requestedPath, files, overwritten, returned, warnings. Undo: none "
     "(a file was written, delete it by hand; the project is not changed)."
 )

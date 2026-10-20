@@ -8,13 +8,19 @@ from typing import Any
 
 from flame_mcp import selectors
 from flame_mcp.ops._attributes import attribute_requires, register_attribute_ops
-from flame_mcp.ops._common import AUTO_RESIZE_NOTE, build_source, list_result_src, offset_param
+from flame_mcp.ops._common import (
+    AUTO_RESIZE_NOTE,
+    REEL_CLIP_NOTE,
+    build_source,
+    list_result_src,
+    offset_param,
+)
 from flame_mcp.registry import Registry
 from flame_mcp.types import Category, OperationParam, OperationSpec
 
 CATEGORY = Category(
     name="segment",
-    description="Segments of a sequence's tracks.",
+    description="Segments of a sequence's or a reel clip's tracks.",
     default_thread="main",
     default_pacing="none",
     allowed_thread=frozenset({"main", "main-async"}),
@@ -109,7 +115,7 @@ _LIST_EFFECTS_DESCRIPTION = (
     "type (Flame refuses a second one), and the list is not in the order "
     "the effects were created. Most effect types list only `bypass` as an attribute. "
     "`include_available` also returns `availableTypes`: the effect type names this segment "
-    "accepts (PySegment.effect_types). " + AUTO_RESIZE_NOTE
+    "accepts (PySegment.effect_types). " + AUTO_RESIZE_NOTE + " " + REEL_CLIP_NOTE
 )
 
 _SHARED_SOURCES_DESCRIPTION = (
@@ -129,7 +135,9 @@ _SHARED_SOURCES_DESCRIPTION = (
     "Scope: from a segment on the Desktop it returns the Desktop's "
     "segments of the same source (other sequences, copies on the Desktop, the inside of a reel "
     "clip) and not a copy made in a library; from a segment inside a library it returns "
-    "that segment only, none of the Desktop's."
+    "that segment only, none of the Desktop's. The target can be the segment of a reel clip "
+    "too (measured on Flame 2025.2.4): the sequences' segments of the same source, the other "
+    "clips' segments and the clip itself (isTarget true) come back."
 )
 
 
@@ -150,7 +158,10 @@ def register(registry: Registry) -> None:
                 "`sourceUnlinked` (PySegment.file_path / tape_name / source_uid / "
                 "source_unlinked), returned as Flame gives them (for a segment of an imported "
                 "clip sourceUid and sourceUnlinked are the empty string ''). A value is null when "
-                "it cannot be read, and all four are null for a gap. " + AUTO_RESIZE_NOTE
+                "it cannot be read, and all four are null for a gap. "
+                + AUTO_RESIZE_NOTE
+                + " "
+                + REEL_CLIP_NOTE
             ),
             effect="read",
             params=(
@@ -184,7 +195,7 @@ def register(registry: Registry) -> None:
         category="segment",
         noun="segment",
         accepts=("segment",),
-        target_description="A 'segment' selector identifying one segment.",
+        target_description="A 'segment' selector identifying one segment. " + REEL_CLIP_NOTE,
         stable_src=_segment_stable_src,
         revert_kinds=("segment",),
         requires=attribute_requires("PySegment.attributes", "PyClip.get_wiretap_node_id"),

@@ -115,16 +115,19 @@ The tests read their media from `~/Library/Application Support/flame-mcp/probe_p
 * `p2/p2_src_tc1h.mov`, `p2/p2_rep_tc1h.mov`, `p2/p2_rep_tc1h_plus10.mov` and
   `p2/p2_rep_tc2h.mov`, 48 frames each, with different start timecodes. Make them with
   `scripts/make_p2_tc_media.sh`.
+* `p2/p2_av72.mov`, 72 frames with PCM audio (48 kHz, 2 channels) as long as the picture. It is
+  the one clip that has sound. Make it with `scripts/make_p2_av_media.sh`.
 
-All three scripts need `ffmpeg` and `ffprobe` on your `PATH`. Each takes an output folder as an
+All four scripts need `ffmpeg` and `ffprobe` on your `PATH`. Each takes an output folder as an
 optional argument. `make_clip_media.sh` writes to the media folder itself when you give none, and
-the other two write to the `p2` folder named above. `make_clip_media.sh` stops without writing
+the other three write to the `p2` folder named above. `make_clip_media.sh` stops without writing
 anything when a clip is already there; add `--force` to replace it.
 
 ```bash
 scripts/make_clip_media.sh
 scripts/make_p2_media.sh
 scripts/make_p2_tc_media.sh
+scripts/make_p2_av_media.sh
 ```
 
 ### Run the tests

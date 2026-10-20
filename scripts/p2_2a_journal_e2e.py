@@ -626,7 +626,7 @@ async def stage_c(ctx: Ctx) -> None:
         )
 
 
-# stage d: landed or not, after the server died
+# landed or not, after the server died
 def pid_gone(pid: int) -> bool:
     try:
         os.kill(pid, 0)

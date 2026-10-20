@@ -6,7 +6,7 @@ own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try`, `
 `_dcb_copy` as soon as a source is a PyBatch, and to `_dcb_state*` when it reverts a copy whose
 record says `type: 'PyBatch'`.
 
-What it encodes (measured on Flame 2025.2.4, twice, same values):
+What it encodes (measured on Flame 2025.2.4):
   - `flame.media_panel.copy(PyBatch, library or library folder)` answers a list with one new PyBatch
     (a new uid, the same name); the library / folder lists it in `children` (a library also in
     `batch_groups`). The source group (uid, nodes, current) is untouched. Copying the current group

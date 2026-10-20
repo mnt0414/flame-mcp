@@ -6,7 +6,7 @@ own code, so each op's `to_python` output is a few loop-free lines. It runs insi
 `flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError` and the `_dc_*` helpers of `desktop_prelude` already
 defined.
 
-What it encodes (measured on Flame 2025.2.4, twice each):
+What it encodes (measured on Flame 2025.2.4):
   - `flame.import_clips(path or [paths], destination)` answers the new clips. A path that does not
     exist and a 0-byte file make no clip and raise nothing: the answer is `[]`. A directory brings
     the media in it. So an import is judged by what the destination lists afterwards, never by the
@@ -503,8 +503,7 @@ def _dm_move_snapshot(dest, sources):
         if parent_row['uid'] == dest_row['uid'] or parent_row['selector'] == dest_row['selector']:
             raise _OpError(
                 'PRECONDITION_UNMET',
-                label + ' is already in the destination (moving inside one container was not '
-                'measured)',
+                label + ' is already in the destination: such a move is refused',
             )
         seen.append(row['uid'])
         row['parent'] = parent_row

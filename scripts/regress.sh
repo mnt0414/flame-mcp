@@ -3,7 +3,7 @@
 # up what the test project was left with. Each e2e starts and stops Flame itself.
 #
 # Usage: scripts/regress.sh [name ...]
-#   Without names, every e2e that `scripts/run_e2e.sh --list` prints (28), in that order.
+#   Without names, every e2e that `scripts/run_e2e.sh --list` prints (29), in that order.
 #
 # Output goes to ~/Library/Application Support/flame-mcp/p3/regress_<yymmdd_HHMMSS>/:
 #   <name>_<n>.log   the full output of one run

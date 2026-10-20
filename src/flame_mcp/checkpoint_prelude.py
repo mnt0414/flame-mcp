@@ -24,7 +24,7 @@ What it encodes:
     appended, dots become underscores, and a directory of the same stem is written beside it):
     the path to load later is found by globbing for what appeared, never by trusting the
     requested one.
-  - a failed `load_setup` empties the group (measured on Flame 2025.2.4, twice: `load_setup`
+  - a failed `load_setup` empties the group (measured on Flame 2025.2.4: `load_setup`
     of a path that did not exist raised and left the group with no nodes), so the setup file's
     existence is checked in Flame right before the call, and `load_setup` is not called when it
     is missing.

@@ -4,9 +4,14 @@ run directly against `fake_media_tree.FakeFlame` (no bridge)."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fake_media_tree import (
+    PyAudioChannel,
+    PyAudioTrack,
     PySegment,
     PySequence,
     PyTimelineFX,
@@ -19,6 +24,7 @@ from flame_mcp.ops import register_all
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.registry import Registry
 from op_test_helpers import run_op
+from timeline_p32a_helpers import S1, make_timeline_rig
 
 
 def make_registry() -> Registry:
@@ -400,3 +406,197 @@ def test_timeline_info_works_on_a_clip_too() -> None:
         flame,
     )
     assert result["value"]["startFrame"] == 1 and result["value"]["audioTracks"] == 0
+
+
+# timeline.list_segments media='audio' and the audio part of timeline.info.
+
+
+def _audio_tree() -> tuple[Any, dict[str, Any]]:
+    """Default tree; Seq1 gets two audio tracks: the first with two channels (a 2-segment one and a
+    1-segment one), the second with one empty channel."""
+    flame, h = build_default_tree()
+
+    def seg(name: str, source: str, first: int, last: int) -> PySegment:
+        return PySegment(
+            name=name,
+            source_name=source,
+            record_in=first,
+            record_out=last,
+            source_in=first + 100,
+            source_out=last + 100,
+            record_duration=last - first + 1,
+            type="Audio Segment",
+        )
+
+    first = PyAudioTrack(
+        channels=[
+            PyAudioChannel([seg("a0", "aud1", 0, 29), seg("a1", "aud2", 30, 59)]),
+            PyAudioChannel([seg("b0", "aud3", 0, 59)]),
+        ]
+    )
+    second = PyAudioTrack(channels=[PyAudioChannel([])])
+    h["seq"].audio_tracks = [first, second]
+    return flame, h
+
+
+def _audio(flame: Any, h: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    result: dict[str, Any] = run_op(
+        make_registry(),
+        "timeline.list_segments",
+        {"target": _seq_target(h), "media": "audio", "limit": 50, **extra},
+        flame,
+    )
+    return result
+
+
+def test_list_segments_audio_lists_the_segments_of_one_channel() -> None:
+    flame, h = _audio_tree()
+    value = _audio(flame, h, track=0, channel=0)["value"]
+    assert [i["index"] for i in value["items"]] == [0, 1]
+    first = value["items"][0]
+    assert first["name"] == "a0" and first["sourceName"] == "aud1"
+    assert first["type"] == "Audio Segment" and first["isGap"] is False
+    assert first["recordIn"]["frame"] == 0 and first["recordOut"]["frame"] == 29
+    assert first["sourceIn"]["frame"] == 100 and first["sourceOut"]["frame"] == 129
+    assert first["recordDuration"]["frame"] == 30
+    assert (value["total"], value["shown"], value["truncated"]) == (2, 2, False)
+    json.dumps(value)
+
+
+def test_list_segments_audio_does_not_read_head_tail_or_effects() -> None:
+    flame, h = _audio_tree()
+    item = _audio(flame, h, track=0, channel=0)["value"]["items"][0]
+    assert item["head"] is None and item["tail"] is None and item["effects"] is None
+
+
+def test_list_segments_audio_has_the_keys_of_a_video_item() -> None:
+    flame, h = _audio_tree()
+    audio_item = _audio(flame, h, track=0, channel=0)["value"]["items"][0]
+    video_item = _list(flame, h)["items"][0]
+    assert sorted(audio_item) == sorted(video_item)
+
+
+def test_list_segments_audio_channel_defaults_to_the_first_one() -> None:
+    flame, h = _audio_tree()
+    assert [i["name"] for i in _audio(flame, h, track=0)["value"]["items"]] == ["a0", "a1"]
+    assert [i["name"] for i in _audio(flame, h, track=0, channel=1)["value"]["items"]] == ["b0"]
+
+
+def test_list_segments_audio_pages_like_the_video_listing() -> None:
+    flame, h = _audio_tree()
+    value = _audio(flame, h, track=0, channel=0, limit=1, offset=1)["value"]
+    assert [i["index"] for i in value["items"]] == [1]
+    assert (value["total"], value["offset"], value["truncated"]) == (2, 1, False)
+    first_page = _audio(flame, h, track=0, channel=0, limit=1)["value"]
+    assert first_page["truncated"] is True
+
+
+def test_list_segments_audio_empty_channel_is_an_empty_list() -> None:
+    flame, h = _audio_tree()
+    value = _audio(flame, h, track=1, channel=0)["value"]
+    assert value["items"] == [] and value["total"] == 0
+
+
+def test_list_segments_audio_track_out_of_range_is_selector_empty() -> None:
+    flame, h = _audio_tree()
+    result = _audio(flame, h, track=2)
+    assert result["opErrorCode"] == "SELECTOR_EMPTY"
+    assert "audio track index 2" in result["opError"] and "have 2" in result["opError"]
+
+
+def test_list_segments_audio_channel_out_of_range_is_selector_empty() -> None:
+    flame, h = _audio_tree()
+    result = _audio(flame, h, track=0, channel=2)
+    assert result["opErrorCode"] == "SELECTOR_EMPTY"
+    assert "audio channel index 2" in result["opError"]
+
+
+def test_list_segments_audio_on_a_sequence_without_audio_is_selector_empty() -> None:
+    flame, h = build_default_tree()
+    assert _audio(flame, h, track=0)["opErrorCode"] == "SELECTOR_EMPTY"
+
+
+def test_list_segments_audio_reports_the_identity_of_the_sequence_too() -> None:
+    flame, h = _audio_tree()
+    value = _audio(flame, h, track=0, channel=0)["value"]
+    assert value["wiretapId"] == h["seq"].get_wiretap_node_id()
+    assert value["uid"] == h["seq"].uid.get_value()
+
+
+def test_list_segments_media_is_video_or_audio_only() -> None:
+    op = make_registry().get("timeline.list_segments")
+    assert op is not None
+    assert validate_op_args(op, {"target": {"kind": "selection"}, "media": "audio"}).ok is True
+    assert validate_op_args(op, {"target": {"kind": "selection"}, "media": "data"}).ok is False
+    assert validate_op_args(op, {"target": {"kind": "selection"}, "channel": -1}).ok is False
+
+
+def test_list_segments_channel_with_video_is_invalid_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = make_timeline_rig(monkeypatch, tmp_path)
+    for extra in ({"channel": 0}, {"media": "video", "channel": 1}):
+        env = rig.do("timeline.list_segments", {"target": S1, **extra})
+        assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+        assert "channel" in env["error"] and "audio" in env["error"]
+    ok = rig.do("timeline.list_segments", {"target": S1, "media": "audio", "track": 0})
+    assert ok["errorCode"] == "SELECTOR_EMPTY"  # S1 has no audio, and the call got that far
+    video = rig.do("timeline.list_segments", {"target": S1})
+    assert video["ok"] is True
+
+
+def test_timeline_info_reads_the_audio_tracks_channels_and_segment_counts() -> None:
+    flame, h = _audio_tree()
+    value = _timeline_info(flame, h)
+    assert value["audioTracks"] == 2
+    assert value["audio"] == [
+        {"channelCount": 2, "channels": [{"segmentCount": 2}, {"segmentCount": 1}]},
+        {"channelCount": 1, "channels": [{"segmentCount": 0}]},
+    ]
+    json.dumps(value)
+
+
+def test_timeline_info_audio_is_empty_for_a_sequence_without_audio() -> None:
+    flame, h = build_default_tree()
+    assert _timeline_info(flame, h)["audio"] == []
+
+
+def test_timeline_info_audio_reads_each_track_and_channel_on_its_own() -> None:
+    class _Broken(PyAudioChannel):
+        @property
+        def segments(self) -> Any:
+            raise RuntimeError("no segments")
+
+    flame, h = build_default_tree()
+    good = PyAudioTrack(channels=[PyAudioChannel([PySegment(type="Audio Segment")])])
+    broken = PyAudioTrack(channels=[PyAudioChannel([]), _Broken([])])
+    h["seq"].audio_tracks = [good, object(), broken]
+    value = _timeline_info(flame, h)
+    assert value["audioTracks"] == 3
+    assert value["audio"][0] == {"channelCount": 1, "channels": [{"segmentCount": 1}]}
+    assert "error" in value["audio"][1] and set(value["audio"][1]) == {"error"}
+    assert value["audio"][2] == {
+        "channelCount": 2,
+        "channels": [{"segmentCount": 0}, {"error": "no segments"}],
+    }
+
+
+def test_timeline_info_audio_that_cannot_be_read_is_an_error_and_the_rest_comes_back() -> None:
+    class _Flaky(PySequence):
+        @property
+        def audio_tracks(self) -> Any:
+            raise RuntimeError("no audio")
+
+        @audio_tracks.setter
+        def audio_tracks(self, _value: Any) -> None:
+            pass
+
+    flame, _h = build_default_tree()
+    flaky = _Flaky("F", wiretap_id="/wt/F")
+    flame._wiretap_index["/wt/F"] = flaky
+    result = run_op(
+        make_registry(), "timeline.info", {"target": {"kind": "wiretap", "id": "/wt/F"}}, flame
+    )
+    assert result["opError"] is None
+    assert result["value"]["audio"] == {"error": "no audio"}
+    assert result["value"]["name"] == "F"

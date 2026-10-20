@@ -80,6 +80,13 @@ outcome's `created` is `{deletes: [{from: {parent, name, type, uid}, checkpoint,
 parent that is gone leaves that one as a conflict and restores the others (`partial`).
 `journal.check` of an open one looks the old uids up: all gone = landed, all there = not landed.
 
+`desktop.reformat` writes one intent per clip into one group, kind `desktop_reformat`, `mode`
+`in_place` or `duplicate`, with the clip's format before (`before`) and the format asked for
+(`requested`). Its outcome's `created` is `{mode: "in_place", checkpoint, stash, uid, before, after,
+fingerprintAfter, ...}` (revert: the stashed copy is restored) or `{mode: "duplicate", uid, name,
+type, parent, state, ...}` (revert: the duplicate is deleted while it is as left). `journal.check`
+of an open one reads the clip's format again (`desktop_reformat_check`).
+
 `segment.copy_to_media_panel` / `segment.match` journal the same way with kind
 `desktop_extract` (`op` says which). Their outcome's `created` is `{uid, name, type, wiretapId,
 selector, parent, state: {name, duration, fingerprint}, sourceUid}`; the revert deletes the clip by
@@ -118,6 +125,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Final
 
+from flame_mcp.attribute_prelude import CASE_FOLDED_ATTRIBUTES
+
 JOURNAL_DIR_ENV: Final[str] = "FLAME_MCP_JOURNAL_DIR"
 JOURNAL_MAX_AGE_S: Final[float] = 30 * 24 * 60 * 60
 JOURNAL_FILE_MODE: Final[int] = 0o600
@@ -149,6 +158,7 @@ KIND_DESKTOP_MOVE: Final[str] = "desktop_move"
 KIND_DESKTOP_DELETE: Final[str] = "desktop_delete"
 KIND_DESKTOP_EXTRACT: Final[str] = "desktop_extract"
 KIND_DESKTOP_SEQUENCE: Final[str] = "desktop_sequence"
+KIND_DESKTOP_REFORMAT: Final[str] = "desktop_reformat"
 KIND_DESKTOP_REVERT: Final[str] = "desktop_revert"
 MEDIA_WRITE_KINDS: Final[frozenset[str]] = frozenset(
     {KIND_DESKTOP_IMPORT, KIND_DESKTOP_DUPLICATE, KIND_DESKTOP_MOVE}
@@ -162,6 +172,7 @@ DESKTOP_WRITE_KINDS: Final[frozenset[str]] = (
             KIND_DESKTOP_DELETE,
             KIND_DESKTOP_EXTRACT,
             KIND_DESKTOP_SEQUENCE,
+            KIND_DESKTOP_REFORMAT,
         }
     )
     | MEDIA_WRITE_KINDS
@@ -208,6 +219,14 @@ def values_equal(a: Any, b: Any) -> bool:
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(values_equal(x, y) for x, y in zip(a, b, strict=True))
     return bool(a == b)
+
+
+def attribute_values_equal(key: str, a: Any, b: Any) -> bool:
+    """`values_equal` for attribute `key`: a colour label Flame stored in its colour coding
+    table's spelling equals the one that was written (the rule of the in-Flame read-back)."""
+    if key in CASE_FOLDED_ATTRIBUTES and isinstance(a, str) and isinstance(b, str):
+        return a.lower() == b.lower()
+    return values_equal(a, b)
 
 
 @dataclass(frozen=True)

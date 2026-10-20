@@ -216,8 +216,8 @@ def clip_media(clip: PyClip) -> tuple[int, int]:
     return seg.source_in.frame - head, head + used + tail
 
 
-def smart_replace_with(self: PySegment, clip: PyClip, with_fx: bool) -> None:
-    """Replaces the media of a segment, as Flame 2025.2.4 does.
+def smart_replace_one(self: PySegment, clip: PyClip, with_fx: bool) -> bool:
+    """Replaces the media of one segment, as Flame 2025.2.4 does; True when it changed.
 
     The same range counted from the START OF THE CLIP (the segment's head), not the same
     timecode; record and head stay, tail follows the new clip's length, source_name becomes
@@ -228,7 +228,7 @@ def smart_replace_with(self: PySegment, clip: PyClip, with_fx: bool) -> None:
     offset = 0 if self.head == "infinite" else int(self.head)
     used = self.source_out.frame - self.source_in.frame + 1
     if offset + used > length:
-        return
+        return False
     self.source_name = str(clip.name.get_value())
     self.source_in = PyTime(start + offset)
     self.source_out = PyTime(start + offset + used - 1)
@@ -239,6 +239,16 @@ def smart_replace_with(self: PySegment, clip: PyClip, with_fx: bool) -> None:
         self.effects = [clone_effect(fx) for fx in own]
         for fx in self.effects:
             fx.parent = self
+    return True
+
+
+def smart_replace_with(self: PySegment, clip: PyClip, with_fx: bool) -> None:
+    """Replaces the media of a segment and, when that changed it, of the segments connected to
+    it, in whatever sequence they are (measured on Flame 2025.2.4)."""
+    if smart_replace_one(self, clip, with_fx):
+        for other in self._link_group or []:
+            if other is not self:
+                smart_replace_one(other, clip, with_fx)
 
 
 def seg_smart_replace_media(self: PySegment, clip: PyClip) -> None:

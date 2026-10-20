@@ -6,8 +6,9 @@ p2_len48 72-119; track 1: p2_len72 0-71), so one edit never starts from another'
 call did is read back by transport (`tx_struct`) and compared with the op's own `before` / `after`
 layouts. JUDGED are the things measured on a real Flame beforehand (a time is the absolute record
 frame, overwrite / insert / cut land at it, insert moves only its own track, a cut needs the frame
-inside a media segment, a new version / track is one Gap); OBSERVED (always ok) are the cases
-that were not measured (an overwrite that changes nothing, which tracks `PySequence.cut` cuts)."""
+inside a segment, media or Gap, a new version / track is one Gap); OBSERVED (always ok) are the
+cases that were not measured (an overwrite that changes nothing, which tracks `PySequence.cut`
+cuts)."""
 
 from __future__ import annotations
 
@@ -323,6 +324,35 @@ async def stage_k(ctx: Ctx) -> None:
         await revert_restores(session, ctx, "k3", env, case, fp0)
         await cut_all(session, ctx, case)
         await cut_refusals(session, ctx, case["wt"])
+        await cut_in_gap(session, ctx, case)
+
+
+async def cut_in_gap(session: Any, ctx: Ctx, case: dict[str, Any]) -> None:
+    wiretap = case["wt"]
+    before = await tx_struct(ctx, wiretap)
+    gaps = [r for r in lay(before, 0) if r[0] == "Gap" and r[2] - r[1] >= 1]
+    if not gaps:
+        observe(ctx, "k7_no_gap_of_two_frames_in_track_0_to_cut_in", layout=lay(before, 0))
+        return
+    first, last = gaps[0][1], gaps[0][2]
+    at = first + 1
+    fp0 = await fingerprint(session, ctx, wiretap)
+    env = await run_call(
+        session, ctx, "k_cut_gap", {"sequence": sel(wiretap), "at": at, "track": 0}
+    )
+    after = await tx_struct(ctx, wiretap)
+    pieces = [r[1:3] for r in lay(after, 0) if r[0] == "Gap"]
+    rec(
+        ctx,
+        "k7_a_cut_in_a_gap_splits_the_gap",
+        env.get("ok") is True
+        and [first, at - 1] in pieces
+        and [at, last] in pieces
+        and _result_of(env).get("split") is True,
+        error=env.get("error"),
+        after=lay(after, 0),
+    )
+    await revert_restores(session, ctx, "k7b", env, case, fp0)
 
 
 async def cut_all(session: Any, ctx: Ctx, case: dict[str, Any]) -> None:
@@ -356,7 +386,6 @@ async def cut_refusals(session: Any, ctx: Ctx, wiretap: str) -> None:
     snap = await state_snapshot(ctx)
     cases = [
         ("k6_a_cut_at_the_first_frame_of_a_segment", 0),
-        ("k7_a_cut_in_a_gap", 30),
         ("k8_a_cut_after_the_last_segment", 500),
     ]
     for tag, at in cases:

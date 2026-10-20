@@ -23,6 +23,11 @@ What it encodes (measured on Flame 2025.2.4):
 
 from __future__ import annotations
 
+# Flame matches these labels to its colour coding table ignoring letter case and stores the
+# table's spelling (measured on Flame 2025.2.4): the value read back may differ from the one
+# written only in case. Shared by the in-Flame read-back check and the journal's comparisons.
+CASE_FOLDED_ATTRIBUTES = ("colour_label", "schematic_colour_label")
+
 ATTRIBUTE_HELPER = """
 def _wrapper_ref(v):
     # a Flame object (PyTrack, PySegment, ...): its type, and its name when it has a readable one.
@@ -96,6 +101,12 @@ def _attr_equal(a, b):
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(_attr_equal(x, y) for x, y in zip(a, b))
     return a == b
+
+
+def _written_equal(key, got, want):
+    if key in @CASE_FOLDED@ and isinstance(got, str) and isinstance(want, str):
+        return got.lower() == want.lower()
+    return _attr_equal(got, want)
 
 
 def _same_exact(a, b):
@@ -196,6 +207,11 @@ _NAME_IN_USE_HINT = (
     "node's own group: the current group may hold a node with that name)"
 )
 
+_COLOUR_LABEL_HINT = (
+    " (the label must be a name from Flame's colour coding table; letter case does not "
+    "matter but spaces do: 'Light Grey' is not 'lightgrey'; '' means no colour)"
+)
+
 
 def _set_attributes(obj, values, group=None, expected=None, restoring=False):
     if not isinstance(values, dict) or len(values) == 0:
@@ -241,11 +257,13 @@ def _set_attributes(obj, values, group=None, expected=None, restoring=False):
                 failed[key] = 'error: ' + type(exc).__name__ + ': ' + str(exc)
                 if 'name is already being used' in str(exc):
                     failed[key] += _NAME_IN_USE_HINT
+                if 'colour label does not exist' in str(exc):
+                    failed[key] += _COLOUR_LABEL_HINT
                 break
             after[key] = _ja(got)
             if not _attr_equal(got, current):
                 revert_values[key] = before[key]
-            if not _attr_equal(got, want):
+            if not _written_equal(key, got, want):
                 failed[key] = (
                     'silent_noop: set_value raised nothing but the value read back is '
                     + repr(after[key])
@@ -383,7 +401,7 @@ def _stable_segment(parent, version, track, index, record_in=None, expect=None):
     if expect is not None:
         out['expect_source_name'] = expect
     return out
-"""
+""".replace("@CASE_FOLDED@", repr(CASE_FOLDED_ATTRIBUTES))
 """Shared by every `*.get_attributes` / `*.set_attributes` op. `_stable_*` build
 the selector a `revert` uses: it is computed *after* the writes, so a renamed
 object is addressed by its new name / wiretap id."""

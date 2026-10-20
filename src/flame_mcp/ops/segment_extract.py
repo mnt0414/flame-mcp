@@ -40,6 +40,12 @@ _SHAPES = (
     "read result.clip). A media with no handle gives a handle-0 clip whichever is "
     "used, with no error."
 )
+_FROM_CLIP = (
+    "The target can be the segment of a reel clip on the Desktop (parent = the clip's wiretap, "
+    "version 0, track 0, index 0). Measured on Flame 2025.2.4, with a 71-frame clip trimmed 10 at "
+    "the head and slipped 2: copy_to_media_panel gave a 61-frame clip (the clip's current range, "
+    "head 8, tail 2); match gave the whole 71-frame source with an in / out mark on that range."
+)
 _COMMON = (
     "`destination` is a wiretap / path selector of a reel (a Desktop reel "
     "or one in a library; a reel of a Batch group is refused: INVALID_ARGS, use batch.add_clips). "
@@ -71,7 +77,7 @@ _COPY_DESCRIPTION = (
     "Take one segment out of its sequence as a new clip in a reel (PySegment.copy_to_media_panel): "
     "the used range with its soft handles and its TimelineFX -- the way to hand a shot on with its "
     "handles (for example, take it out, then trim the clip's inner segment to the handle length "
-    "with segment.trim). " + _SHAPES + " " + _COMMON
+    "with segment.trim). " + _SHAPES + " " + _COMMON + " " + _FROM_CLIP
 )
 
 _MATCH_DESCRIPTION = (
@@ -84,6 +90,8 @@ _MATCH_DESCRIPTION = (
     + _SHAPES
     + " "
     + _COMMON
+    + " "
+    + _FROM_CLIP
 )
 
 

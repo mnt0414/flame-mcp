@@ -12,7 +12,7 @@ from typing import Any, Final
 
 from flame_mcp import execution, selectors
 from flame_mcp.errors import as_error_code
-from flame_mcp.ops._common import build_source, raise_on_error_src
+from flame_mcp.ops._common import REEL_CLIP_NOTE, build_source, raise_on_error_src
 from flame_mcp.timeline_restore import NOT_RESTORED
 from flame_mcp.types import (
     CheckpointCheck,
@@ -62,7 +62,9 @@ CHECKPOINTED_SEGMENT_NOTE: Final[str] = (
     "its reel. Not put back: " + "; ".join(NOT_RESTORED) + ". Native Ctrl+Z is not used "
     "(undoSteps 0). Segment edits run on Flame's main thread only. In plan.run: a plan that holds "
     "this step is one checkpointed write on this sequence (one stashed copy, journal.revert(group) "
-    "is one restore; the step's own checkpoint is not taken); see plan.run."
+    "is one restore; the step's own checkpoint is not taken); see plan.run. "
+    + REEL_CLIP_NOTE
+    + " On a clip the stashed copy is a copy of the clip."
 )
 
 

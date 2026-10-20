@@ -5,7 +5,7 @@ rules, each one a measured trap:
 
   1. the checkpoint's file must exist, checked on the server first and again inside Flame
      right before the call. A `load_setup` that fails empties the group (measured on Flame
-     2025.2.4, twice, with a path that did not exist), so it is never called on a path that is
+     2025.2.4, with a path that did not exist), so it is never called on a path that is
      not there;
   2. a new checkpoint of the group's current state is taken right before the load, so the
      restore can itself be undone. Its id and path are in every result, failures included;
@@ -27,7 +27,7 @@ undo it the same way it undoes an eval run.
      checkpoint without an inventory is not tidied, and the result says so.
 
 3''. `load_setup` rebuilds each reel from the Clip nodes in the order they are written in the
-     `.batch` (measured on Flame 2025.2.4, twice: writing the nodes in reverse order reversed
+     `.batch` (measured on Flame 2025.2.4: writing the nodes in reverse order reversed
      the loaded reel, renumbering them did not), which can differ from the order the reel held
      its clips. A restore of a checkpoint with a reel inventory first asks `clip_order.prepare`
      for a copy of the checkpoint (the `.batch` and its `<base>/` directory, in a directory of

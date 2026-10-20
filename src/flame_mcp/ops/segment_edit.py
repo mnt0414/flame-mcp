@@ -68,9 +68,20 @@ _REPLACE_DESCRIPTION = (
     "that Flame added by itself because of a bit depth difference stays, measured on Flame "
     "2026.2.3). `source` "
     "is the clip to put in (a wiretap / path / selection selector of a PyClip). "
-    "It keeps the offset from the start of the clip; it does not match the source timecode: "
-    "the same range of frames counted from the first frame of the new clip "
-    "is used, whatever timecode that clip starts at. Record and head are unchanged; tail follows "
+    "Where the new clip's frames land depends on the segment (measured on Flame 2025.2.4). "
+    "On an Unlinked Video segment (made from an EDL) it keeps the offset from the start of the "
+    "clip and does not match the source timecode: the same range of frames counted from the "
+    "first frame of the new clip is used, whatever timecode that clip starts at. On a linked "
+    "segment of an 8K DPX clip Flame matched by source timecode: a new clip that contains the "
+    "segment's source range keeps sourceIn / sourceOut (the segment used 989364-989386; a clip "
+    "of the same tape read separately as 989350-989400 gave the same range, only head / tail "
+    "changed), and a clip that does not contain it is refused with FLAME_API_ERROR "
+    "'RuntimeError: Invalid source_clip.', nothing changed (journal changed=false): 989380-989410 "
+    "(overlaps the end only), 989387-989410, 989340-989350, and a clip of another shot were all "
+    "refused. A 1-frame clip (a still: one DPX frame, or YELLOW / CYAN) was accepted whatever "
+    "its timecode, and the segment then shows that one frame (head / tail 'infinite'). "
+    "Read 'Invalid source_clip' as: this clip's range cannot hold the segment's range; pick a "
+    "clip that contains it. Record and head are unchanged; tail follows "
     "the new clip's length; source_name becomes the new clip's name. To line up a source "
     "timecode, compare result.after.sourceIn (timecode and frame) with the one you want and pass "
     "the difference to segment.slip (slip(n) takes source_in down by n). It reaches only as "
@@ -88,7 +99,16 @@ _REPLACE_DESCRIPTION = (
     "recordDuration), changed (which of sourceName / sourceIn / sourceOut / head / tail "
     "changed), effects {before, after} (types), position {version, track, index, recordIn, "
     "selector (by record_in, with expect_source_name = the new source name), selectorByIndex}, "
-    "warnings, returned. " + CHECKPOINTED_SEGMENT_NOTE
+    "warnings, returned, connected {count, error} (the number of OTHER segments "
+    "PySegment.connected_segments() answers, read before the replace: the list holds the "
+    "segment itself, which is left out, so a segment with no connection gives 0) and notices. "
+    "When the segment has "
+    "connected segments (segment.connections), the replacement is propagated to them in other "
+    "sequences (measured on Flame 2025.2.4) and the checkpoint below does not cover them: "
+    "result.notices says how many. "
+    + CHECKPOINTED_SEGMENT_NOTE
+    + " On a segment of a reel clip, the refusals tried there (clips that did not contain the "
+    "range) were the same as on a sequence's segment, so the clip as parent was not their cause."
 )
 
 
@@ -223,6 +243,7 @@ def register(registry: Registry) -> None:
                 "PySegment.smart_replace_media",
                 "PySegment.smart_replace",
                 "PySegment.effects",
+                "PySegment.connected_segments",
                 "PyTimelineFX.type",
                 *SEGMENT_REQUIRES,
             ),
