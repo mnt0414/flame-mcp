@@ -32,6 +32,8 @@ from flame_mcp.registry import Registry
 from flame_mcp.runtime import Runtime
 from journal_test_helpers import ExecCall, FakeBridge, ScriptedExec, bridge_result
 
+MEDIA_CLIP_FILES = ("clip1.mov", "clip2.mov", "clip3.mov")
+
 
 class HarnessExec(ScriptedExec):
     """`ScriptedExec` for a script's own transport code: code that assigns no `_result` answers
@@ -87,7 +89,8 @@ def install(
     module: ModuleType, monkeypatch: pytest.MonkeyPatch, flame: FakeFlame, tmp_path: Path
 ) -> HarnessExec:
     """Point `module` (an e2e script) at the fake: its `server_session`, `transport.exec` /
-    `poll` / `probe_features`, and its output directory."""
+    `poll` / `probe_features`, its output directory, and its media directory (a temporary one with
+    small non-empty clips, so nothing depends on files under the real HOME)."""
     bridge = FakeBridge()
     scripted = HarnessExec(flame, Journal(tmp_path / "exec_journal"), bridge)
     monkeypatch.setattr(transport, "exec", scripted)
@@ -123,6 +126,12 @@ def install(
     for name in ("OUTPUT_DIR",):
         if hasattr(module, name):
             monkeypatch.setattr(module, name, tmp_path / "out")
+    if hasattr(module, "MEDIA_DIR"):
+        media_dir = tmp_path / "harness_media"
+        media_dir.mkdir()
+        for clip_file in MEDIA_CLIP_FILES:
+            (media_dir / clip_file).write_bytes(b"dummy clip")
+        monkeypatch.setattr(module, "MEDIA_DIR", media_dir)
     return scripted
 
 

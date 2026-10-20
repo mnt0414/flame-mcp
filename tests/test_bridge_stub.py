@@ -119,6 +119,9 @@ def bridge_dir(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
     d = SCRATCH_ROOT / uuid.uuid4().hex[:8]
     d.mkdir(parents=True, exist_ok=True)
+    # The stub refuses a group- or other-writable directory or body, so set the modes that
+    # install_bridge.sh sets instead of leaving them to the umask (002 on many Linux accounts).
+    d.chmod(0o700)
     monkeypatch.setenv("FLAME_MCP_BRIDGE_DIR", str(d))
     yield d
     shutil.rmtree(d, ignore_errors=True)
@@ -135,6 +138,7 @@ def stub_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
 
 def _write_impl(bridge_dir: Path, body: str) -> None:
     (bridge_dir / "impl.py").write_text(body, encoding="utf-8")
+    (bridge_dir / "impl.py").chmod(0o600)
 
 
 def test_menu_always_registered_before_any_start(stub_module: Any) -> None:

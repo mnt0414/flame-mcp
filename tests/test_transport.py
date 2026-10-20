@@ -32,6 +32,9 @@ from test_bridge_impl import FakeFlame, FakeMainLoop, FakeTimer
 
 SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "scratch" / "p13"
 
+# Read at import time, before `_fast_client_timeouts` shrinks the live constant.
+PRODUCTION_CLIENT_TIMEOUT_MARGIN_S = transport.CLIENT_TIMEOUT_MARGIN_S
+
 
 @pytest.fixture
 def scratch_dir() -> Iterator[Path]:
@@ -59,6 +62,17 @@ def _fast_client_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(transport, "CLIENT_TIMEOUT_MARGIN_S", 0.05)
     monkeypatch.setattr(transport, "HELLO_TIMEOUT_S", 0.1)
     monkeypatch.setattr(transport, "CRASH_LOG_GRACE_S", 0.0)
+
+
+@pytest.fixture
+def bridge_answers_within_production_margin(
+    _fast_client_timeouts: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # For tests that expect the bridge's own answer to a short `timeout_s`: the
+    # bridge sends that answer only after `timeout_s` has elapsed, so with the
+    # shrunken margin the client gives up (and reports "bridge alive but no
+    # reply") whenever a slow runner delays the reply by more than 0.05 s.
+    monkeypatch.setattr(transport, "CLIENT_TIMEOUT_MARGIN_S", PRODUCTION_CLIENT_TIMEOUT_MARGIN_S)
 
 
 @pytest.fixture(autouse=True)
@@ -279,6 +293,7 @@ def test_exec_flame_api_error(real_bridge: impl.Bridge, loop: FakeMainLoop, run_
     assert _inflight_files(run_dir) == []
 
 
+@pytest.mark.usefixtures("bridge_answers_within_production_margin")
 def test_exec_timeout_queued_phase(real_bridge: impl.Bridge, run_dir: Path) -> None:
     # The loop is never pumped, so the callback stays QUEUED until the
     # bridge's own timeoutS elapses and self-cancels it — this is a
@@ -291,6 +306,7 @@ def test_exec_timeout_queued_phase(real_bridge: impl.Bridge, run_dir: Path) -> N
     assert _inflight_files(run_dir) == []
 
 
+@pytest.mark.usefixtures("bridge_answers_within_production_margin")
 def test_exec_main_async_pending_then_poll(
     real_bridge: impl.Bridge, loop: FakeMainLoop, run_dir: Path
 ) -> None:
