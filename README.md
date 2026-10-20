@@ -354,7 +354,7 @@ The unit tests in `tests/` run without Flame. The regression tests on a real Fla
 
 ## Questions, requests, and bug reports
 
-Ask questions, make requests, and report bugs in GitHub Issues. To propose a code change, discuss it in an issue before you open a pull request.
+Ask questions, make requests, and report bugs in GitHub Issues. To propose a code change, discuss it in an issue before you open a pull request. For how to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgments
 
