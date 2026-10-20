@@ -312,7 +312,7 @@ Report security vulnerabilities as described in [SECURITY.md](.github/SECURITY.m
 
 ## Limitations
 
-- Not supported: transitions, markers, audio, connected segments, deleting reels or folders, and Linux.
+- Not supported: transitions, markers, deleting reels or folders, and Linux.
 - You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays).
 - A sequence or clip that's restored by an undo goes to the end of its reel. Flame's API has no way to set the order of items in a reel. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
 - The `flame_context` tool lists known pitfalls in its `pitfalls` field.

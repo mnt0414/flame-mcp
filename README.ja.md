@@ -312,7 +312,7 @@ GitHub の Issues で報告してください。次の情報があると、原�
 
 ## 制約
 
-- 未対応: transition・marker・audio・connected segments・reel や folder の削除・Linux。
+- 未対応: transition・marker・reel や folder の削除・Linux。
 - ライブラリの中身は、削除することも、ライブラリの外へ移動することもできません。ライブラリに保存された過去の作業データを、誤って変更しないためです。取り出すときは `desktop.copy` を使います (元は残ります)。
 - 元に戻したシーケンス・クリップは、reel の末尾に入ります。Flame の API には、reel の中の並び順を指定する方法がありません。シーケンスを元に戻すときは、変更前に保存しておいた複製と差し替えます。変更後のシーケンスは削除せず、取り消し用のライブラリ (`flame_mcp_checkpoints`) に移します。
 - 既知の落とし穴は、`flame_context` の `pitfalls` に記載されています。
