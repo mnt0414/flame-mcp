@@ -9,8 +9,13 @@ write.
   check   decides, for every intent that has no outcome, whether its write landed by reading
           Flame again -- and writes nothing to the project (recovery after a crash is never
           automatic). Its finding is appended to the journal as a `check`.
-  revert  puts the previous values back for the keys a group applied, but only while each
-          still holds what the group left; otherwise it refuses and reports the current values.
+  revert  puts the previous values back for the keys a group applied or changed, but only
+          while each still holds what the group left; otherwise it refuses and reports the
+          current values.
+          When a group wrote one key of one target several times, only the newest write is
+          compared to Flame's current value; each earlier one is compared to the value the next
+          write found before it (`reason` on that entry), and the writes are put back newest
+          first.
           A group of a checkpoint intent (an `eval.run` destructive run, a checkpoint restore, a
           `batch.load_setup`, an op that declares a `CheckpointSpec`: checkpointed.py)
           is put back by restoring its checkpoint, but only while the Batch group's fingerprint
@@ -21,15 +26,24 @@ write.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from flame_mcp import transport
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
-from flame_mcp.checkpoints import TIMELINE_KIND, fingerprint_of, kind_named, read_fingerprint
+from flame_mcp.checkpoints import (
+    ATTRIBUTES_SECTION,
+    TIMELINE_KIND,
+    fingerprint_of,
+    kind_named,
+    read_fingerprint,
+)
 from flame_mcp.clip_order import CLIP_ORDER_NOTE
+from flame_mcp.desktop_arrange_revert import revert_arrange_group
+from flame_mcp.desktop_arrange_run import ARRANGE_GROUP_KIND
 from flame_mcp.desktop_delete_run import (
     check_delete_intent,
     is_delete_intent,
@@ -57,6 +71,8 @@ from flame_mcp.newer_groups import NEWER_GROUPS_KEY, newer_groups, newer_groups_
 from flame_mcp.ops._common import offset_param
 from flame_mcp.registry import Registry
 from flame_mcp.render_check import check_render_intent, poll_handle
+from flame_mcp.render_clip_check import check_render_clip_intent
+from flame_mcp.render_clip_run import RENDER_CLIP_KIND
 from flame_mcp.render_run import RENDER_KIND
 from flame_mcp.restore import restore_checkpoint
 from flame_mcp.runtime import ServerContext
@@ -65,11 +81,13 @@ from flame_mcp.segment_extract_run import (
     is_extract_intent,
     revert_extract_group,
 )
+from flame_mcp.segment_remove_run import REMOVE_KIND, check_remove_intent
 from flame_mcp.timeline_create_run import (
     check_sequence_intent,
     is_sequence_intent,
     revert_sequence_group,
 )
+from flame_mcp.timeline_purge import settle_unrecorded
 from flame_mcp.timeline_restore import (
     RESTORE_NOTE,
     check_timeline_intent,
@@ -377,6 +395,10 @@ def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
     intent = view.intent
     if intent.get("kind") == RENDER_KIND:
         return check_render_intent(ctx, view)
+    if intent.get("kind") == RENDER_CLIP_KIND:
+        return check_render_clip_intent(ctx, view)
+    if intent.get("kind") == REMOVE_KIND:
+        return check_remove_intent(ctx, view)
     if view.desktop_kind is not None:
         if is_delete_intent(view):
             return check_delete_intent(ctx, view)
@@ -435,12 +457,14 @@ def _check(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
             raise ServerOpError("INVALID_ARGS", f"no journal group {group!r}")
         pending = index.in_doubt(str(group) if group is not None else None)
         checked = [_check_one(ctx, view) for view in pending]
+        unrecorded = settle_unrecorded(ctx, index) if group is None else []
     undecided = [c for c in checked if c["verdict"] == VERDICT_UNKNOWN]
     return ServerResult(
         result={
             "inDoubt": len(pending),
             "checked": checked,
-            "stillUnknown": len(undecided),
+            "unrecorded": unrecorded,
+            "stillUnknown": len(undecided) + sum(1 for u in unrecorded if not u["released"]),
             "writesBlocked": bool(ctx.guard.blocked()),
         },
         affected=len(checked) - len(undecided),
@@ -462,6 +486,12 @@ def _nothing_to_revert(index: Index, group: str) -> ServerOpError:
             f"group {group} is a render: its output (the files on disk, the clips in the shelf "
             "reel) cannot be undone, so there is nothing to revert",
         )
+    if any(view.intent.get("kind") == RENDER_CLIP_KIND for view in index.groups[group]):
+        return ServerOpError(
+            "PRECONDITION_UNMET",
+            f"group {group} is a render of a clip's Timeline FX: it cannot be undone, so there is "
+            "nothing to revert",
+        )
     state = index.group_state(group)
     if state == STATE_REVERTED:
         by = ", ".join(index.reverted_by(group))
@@ -475,14 +505,26 @@ def _nothing_to_revert(index: Index, group: str) -> ServerOpError:
         )
     return ServerOpError(
         "PRECONDITION_UNMET",
-        f"group {group} is in state {state!r}: it applied no key that a revert could put back",
+        f"group {group} is in state {state!r}: it applied or changed no key that a revert "
+        "could put back",
     )
 
 
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPlan]:
-    """Read Flame for every key the group applied (and that no earlier, partial revert already
-    put back) and require each to still hold what the group left. Raises before anything is
-    written. Intents are taken in reverse order of the group."""
+    """Read Flame for every key the group applied or changed (and that no earlier, partial
+    revert already put back) and require each to still hold what the group left. Raises before
+    anything is written. Intents are taken in reverse order of the group.
+
+    A key written more than once on one target is compared to Flame's current value by its
+    newest intent only; each older intent is compared to what the next one recorded as its
+    `before` (the value it found), so the chain must be unbroken (an entry of `keys` says so in
+    its `reason`). The chain is followed per recorded `target`, so writes that moved the target's
+    address (a node renamed twice, a node of a shared name moved) are not linked: they are
+    each compared to the current value, which can end in CONFLICT or SELECTOR_EMPTY."""
     views = [
         v
         for v in reversed(index.groups[group])
@@ -492,9 +534,23 @@ def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPl
         raise _nothing_to_revert(index, group)
     plans: list[_RevertPlan] = []
     refused: list[dict[str, Any]] = []
+    reads: dict[str, CurrentRead] = {}
+    newer_writes: dict[tuple[str, str], IntentView] = {}  # (target, key) -> next intent in time
     for view in views:
         keys = view.revertible_keys()
-        current = read_current(ctx, view.intent, keys)
+        intent = view.intent
+        read_key = _canonical(
+            [
+                intent.get("readOp"),
+                intent.get("op"),
+                intent.get("target"),
+                intent.get("targetAfter"),
+                keys,
+            ]
+        )
+        current = reads.get(read_key)
+        if current is None:
+            current = reads[read_key] = read_current(ctx, intent, keys)
         if current.status == "unreachable":
             raise ServerOpError(
                 as_error_code(current.code),
@@ -507,16 +563,29 @@ def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPl
                 "address",
             )
         expected = {key: view.expected_after(key) for key in keys}
-        per_key = {
-            key: {
-                "expected": expected[key],
-                "current": current.values[key],
-                "match": attribute_values_equal(key, current.values[key], expected[key]),
-            }
-            for key in keys
-        }
+        target_id = _canonical(intent.get("target"))
+        per_key: dict[str, dict[str, Any]] = {}
+        for key in keys:
+            newer = newer_writes.get((target_id, key))
+            found = (
+                current.values[key] if newer is None else (newer.intent.get("before") or {})[key]
+            )
+            match = attribute_values_equal(key, found, expected[key])
+            per_key[key] = {"expected": expected[key], "current": found, "match": match}
+            if newer is not None:
+                per_key[key]["reason"] = (
+                    f"compared with the next write's before ({newer.id}), not with the current "
+                    "value"
+                    + (
+                        ""
+                        if match
+                        else f": the journal is not continuous (this write left "
+                        f"{expected[key]!r} but the next write found {found!r})"
+                    )
+                )
+            newer_writes[(target_id, key)] = view
         if not all(entry["match"] for entry in per_key.values()):
-            refused.append({"id": view.id, "op": view.intent.get("op"), "keys": per_key})
+            refused.append({"id": view.id, "op": intent.get("op"), "keys": per_key})
         plans.append(_RevertPlan(view, keys, current.target, expected))
     if refused:
         raise ServerOpError(
@@ -530,6 +599,26 @@ def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPl
     return plans
 
 
+def _attribute_change_note(ctx: ServerContext, view: IntentView) -> str | None:
+    """For a bundled plan with value writes: why a revert must not go on (an attribute value of
+    the group changed after the run, or the run recorded none to compare), None when they match.
+    Raises `ServerOpError` when the group cannot be read."""
+    env = read_fingerprint(ctx, view.intent.get("target") or {}, sections=[ATTRIBUTES_SECTION])
+    current = fingerprint_of(env)
+    if current is None:
+        raise ServerOpError(
+            as_error_code(str(env.get("errorCode"))),
+            f"nothing was restored: the Batch group's attribute values could not be read "
+            f"({env.get('error')})",
+        )
+    expected = view.attribute_fingerprint_after()
+    if expected is None:
+        return "the run recorded no fingerprint of the group's attribute values"
+    if current != expected:
+        return "the group's attribute values changed after the run"
+    return None
+
+
 def _revert_by_checkpoint(
     ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
 ) -> ServerResult:
@@ -540,8 +629,13 @@ def _revert_by_checkpoint(
     view = views[0]
     if len(views) != 1 or not view.is_revertible():
         raise _nothing_to_revert(index, group)
+    newer = _refuse_for_newer_groups(ctx, index, group, force)
+    forced_over_newer = {NEWER_GROUPS_KEY: [row["group"] for row in newer]} if newer else None
     if kind_named(view.intent.get("targetKind")) is TIMELINE_KIND:
-        return revert_timeline_group(ctx, index, group, view, force)
+        return _with_newer_groups(
+            revert_timeline_group(ctx, index, group, view, force, forced_note=forced_over_newer),
+            newer,
+        )
     checkpoint_id = view.revert_checkpoint()
     assert checkpoint_id is not None  # views were picked by it
     if checkpoint_id not in index.checkpoints:
@@ -558,13 +652,18 @@ def _revert_by_checkpoint(
         )
     expected = view.fingerprint_after()
     matches = expected is not None and current == expected
+    attribute_note: str | None = None
+    if matches and view.intent.get("watchAttributes") is True:
+        attribute_note = _attribute_change_note(ctx, view)
     forced: dict[str, Any] | None = None
-    if not matches:
+    if not matches or attribute_note is not None:
         detail = {
             "expectedFingerprint": expected,
             "currentFingerprint": current,
             "note": (
-                "the run recorded no fingerprint of its result"
+                attribute_note
+                if matches and attribute_note is not None
+                else "the run recorded no fingerprint of its result"
                 if expected is None
                 else "the group's nodes or wiring changed after the run"
             ),
@@ -578,38 +677,70 @@ def _revert_by_checkpoint(
                 result={"refused": True, "group": group, **detail},
             )
         forced = {"used": True, **detail}
+    if forced_over_newer is not None:
+        forced = {"used": True, **(forced or {}), **forced_over_newer}
+    # a plan.run that was bundled has the plan's value writes (node.set_attributes ...) in the
+    # same group: the one restore puts them back too, so it covers the whole group
+    covers_group = len(index.groups[group]) > 1
     outcome = restore_checkpoint(
-        ctx, checkpoint_id, reverts=group, reverts_intent=view.id, forced=forced
+        ctx,
+        checkpoint_id,
+        reverts=group,
+        reverts_intent=None if covers_group else view.id,
+        forced=forced,
     )
     result = dict(outcome.result) if isinstance(outcome.result, dict) else {}
     result["reverted"] = group
-    return ServerResult(result=result, affected=outcome.affected, journal=outcome.journal)
-
-
-def _with_newer_groups(
-    ctx: ServerContext, index: Index, group: str, error: ServerOpError
-) -> ServerOpError:
-    """A CONFLICT of a checkpointed group, with the later groups of the same target that were not
-    reverted (`result.newerGroups`, newest first) and the advice to put those back first. Any other
-    error, and a CONFLICT with no such group, is returned as it was."""
-    if error.code != "CONFLICT":
-        return error
-    rows = newer_groups(ctx.journal.read_all().records, index, group)
-    if not rows:
-        return error
-    body = dict(error.result) if isinstance(error.result, dict) else {}
-    body[NEWER_GROUPS_KEY] = rows
-    message = error.message.rstrip()
-    return ServerOpError(
-        error.code,
-        message + ("" if message.endswith(".") else ".") + newer_groups_sentence(rows),
-        result=body,
-        hint=error.hint,
-        affected=error.affected,
-        undo_steps=error.undo_steps,
-        partial=error.partial,
-        journal=error.journal,
+    return _with_newer_groups(
+        ServerResult(result=result, affected=outcome.affected, journal=outcome.journal), newer
     )
+
+
+def _refuse_for_newer_groups(
+    ctx: ServerContext, index: Index, group: str, force: bool
+) -> list[dict[str, Any]]:
+    """The groups written to the same target after the checkpointed `group` that landed and were
+    not reverted, newest first. Without `force` they end the revert in CONFLICT before anything is
+    restored (the restore would overwrite what they wrote, and the fingerprint cannot see all of
+    it); with `force` the list comes back for the result."""
+    rows = newer_groups(ctx.journal.read_all().records, index, group)
+    if rows and not force:
+        raise ServerOpError(
+            "CONFLICT",
+            f"nothing was restored: restoring the checkpoint of {group} would overwrite what "
+            "later group(s) wrote to the same target (pass force=true to restore anyway; that "
+            "is journaled)." + newer_groups_sentence(rows),
+            result={"refused": True, "group": group, NEWER_GROUPS_KEY: rows},
+        )
+    return rows
+
+
+def _with_newer_groups(result: ServerResult, rows: list[dict[str, Any]]) -> ServerResult:
+    """A forced revert's result, with the newer groups it restored over."""
+    if not rows:
+        return result
+    body = dict(result.result) if isinstance(result.result, dict) else {}
+    body[NEWER_GROUPS_KEY] = rows
+    return replace(result, result=body)
+
+
+def _revert_desktop(
+    ctx: ServerContext, index: Index, group: str, desktop_views: list[IntentView], force: bool
+) -> ServerResult:
+    """The revert of a group of Desktop writes, by the kind of the write."""
+    if index.group_meta.get(group, {}).get("kind") == ARRANGE_GROUP_KIND:
+        return revert_arrange_group(ctx, index, group, desktop_views)
+    if any(is_delete_intent(v) for v in desktop_views):
+        return revert_delete_group(ctx, index, group, desktop_views)
+    if any(is_media_intent(v) for v in desktop_views):
+        return revert_media_group(ctx, index, group, desktop_views)
+    if any(is_reformat_intent(v) for v in desktop_views):
+        return revert_reformat_group(ctx, index, group, desktop_views, force)
+    if any(is_extract_intent(v) for v in desktop_views):
+        return revert_extract_group(ctx, index, group, desktop_views)
+    if any(is_sequence_intent(v) for v in desktop_views):
+        return revert_sequence_group(ctx, index, group, desktop_views)
+    return revert_desktop_group(ctx, index, group, desktop_views)
 
 
 def _revert(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
@@ -622,27 +753,20 @@ def _revert(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
             raise _nothing_to_revert(index, group)
         desktop_views = [v for v in index.groups[group] if v.desktop_kind is not None]
         if desktop_views:
-            if any(is_delete_intent(v) for v in desktop_views):
-                return revert_delete_group(ctx, index, group, desktop_views)
-            if any(is_media_intent(v) for v in desktop_views):
-                return revert_media_group(ctx, index, group, desktop_views)
-            if any(is_reformat_intent(v) for v in desktop_views):
-                return revert_reformat_group(
-                    ctx, index, group, desktop_views, bool(args.get("force", False))
-                )
-            if any(is_extract_intent(v) for v in desktop_views):
-                return revert_extract_group(ctx, index, group, desktop_views)
-            if any(is_sequence_intent(v) for v in desktop_views):
-                return revert_sequence_group(ctx, index, group, desktop_views)
-            return revert_desktop_group(ctx, index, group, desktop_views)
+            force = bool(args.get("force", False))
+            newer = (
+                _refuse_for_newer_groups(ctx, index, group, force)
+                if any(v.is_revertible() for v in desktop_views)
+                else []
+            )
+            return _with_newer_groups(
+                _revert_desktop(ctx, index, group, desktop_views, force), newer
+            )
         checkpoint_views = [v for v in index.groups[group] if v.revert_checkpoint() is not None]
         if checkpoint_views:
-            try:
-                return _revert_by_checkpoint(
-                    ctx, index, group, checkpoint_views, bool(args.get("force", False))
-                )
-            except ServerOpError as exc:
-                raise _with_newer_groups(ctx, index, group, exc) from exc
+            return _revert_by_checkpoint(
+                ctx, index, group, checkpoint_views, bool(args.get("force", False))
+            )
         plans = _plan_revert(ctx, index, group)
 
         new_group = new_id("g")
@@ -751,9 +875,11 @@ def register(registry: Registry) -> None:
             description=(
                 "List the journal's groups, newest first: id, time, op names, state and any "
                 "revert relation. state: landed (the write took effect), not_landed (a check "
-                "found nothing written), failed, partial (a check found only some of a render's "
-                "frames, or a render came out short), conflict (a compare-and-swap found "
-                "the value changed and wrote nothing), unknown (no outcome and not checked yet), "
+                "found nothing written), failed (nothing applied or changed), partial (a write "
+                "applied or changed some of its keys but not all as asked; a check found only "
+                "some of a render's frames, or a render came out short), conflict (a "
+                "compare-and-swap found the value changed and wrote nothing), unknown (no outcome "
+                "and not checked yet), "
                 "diverged (a check found neither the old nor the new value), reverted. "
                 "One page at a time (limit / offset)."
             ),
@@ -791,14 +917,24 @@ def register(registry: Registry) -> None:
                 "ended; the result is handed over once and journaled at once), then counting "
                 "the planned output files: landed / partial (some frames) / failed (the "
                 "render reported a failure), basis 'handle'. A render still running, or a "
-                "bridge that does not answer, is unknown (the door stays shut: retry later). "
+                "bridge that does not answer, is unknown (the intent stays open and writes stay "
+                "refused; call journal.check again later, which is a read and not a retry of "
+                "the render). "
                 "Without a handle, or with one the bridge no longer knows, the files alone "
                 "decide (landed = every planned frame written since the intent, partial = "
                 "some, not_landed = none; basis 'disk', an estimate: the files can be "
-                "complete before render() returns). Each finding is "
+                "complete before render() returns). An open render.clip intent is decided the "
+                "same way, the bridge's answer first (basis 'handle'); without one Flame is "
+                "read again and is_rendered() decides: true = landed, false = not_landed (basis "
+                "'flame', an estimate; when the intent's isRenderedBefore was true, a true read is "
+                "not evidence that the render ran). Each finding is "
                 "appended to the journal. "
                 "A finding of any kind other than unknown lifts this server's refusal of writes "
-                "that followed a write with no answer."
+                "that followed a write with no answer. "
+                "A refusal that has no intent (a checkpoint or stash copy, or a purge batch, "
+                "that ended without an answer) is lifted by one read of the checkpoint library "
+                "when `group` is omitted: result.unrecorded lists those refusals and the stash "
+                "copies no checkpoint accounts for (a copy made by such a call is among them)."
             ),
             effect="read",
             params=(
@@ -887,6 +1023,11 @@ def register(registry: Registry) -> None:
                 "(result.restored[].format); with duplicate=true the copy is deleted instead, "
                 "only while it is as left. One that cannot be put back leaves the others "
                 "restored (result.partial). "
+                "A desktop.arrange group: newest item first, each by the revert of its own op "
+                "(a copy is deleted only while it is as made; a move puts the thing back into "
+                "its old parent, at the end, with a new uid); one that cannot be put back leaves "
+                "the others reverted (result.notReverted, result.partial) and a second revert "
+                "does the rest. "
                 "A segment.copy_to_media_panel / segment.match group: the clip the call "
                 "made is deleted by uid (flame.delete), only while its name, duration and content "
                 "(segments and effects, by fingerprint) are still what they were right after the "
@@ -928,7 +1069,8 @@ def register(registry: Registry) -> None:
                 "run left (else CONFLICT, nothing restored; force=true overrides, journaled); "
                 "what the restore does not bring back is in the op's own description. A group "
                 "of segment.trim / slip / replace / create_effect / delete_effect / set_effect / "
-                "effect_load_setup (a sequence / clip): restore its stash copy, only "
+                "effect_load_setup / edit_effect_setup (a sequence / clip): restore its stash "
+                "copy, only "
                 "while "
                 "the sequence's fingerprint (segments and effects) is still the one the call "
                 "left (else CONFLICT; force=true overrides, journaled); result.restored is the "
@@ -939,14 +1081,29 @@ def register(registry: Registry) -> None:
                 "purged (journal.purge_checkpoints) cannot be restored (PRECONDITION_UNMET). "
                 + RESTORE_NOTE
                 + " Other groups: put back the "
-                "previous values of the keys the group applied, each only if it still holds "
+                "previous values of the keys the group applied or changed (a key whose value moved "
+                "without becoming the one asked for counts), each only if it still holds "
                 "what the group left (compare-and-swap, checked twice); if any differs nothing "
                 "is written and the current values are reported (CONFLICT) -- a value changed "
                 "by someone else is never overwritten automatically. An already reverted group, "
-                "or one that applied nothing, is refused. Journaled as a new group (`reverts` "
-                "= this one), itself revertible. A CONFLICT of a checkpointed group lists the "
-                "later landed groups of the same target that were not reverted in "
-                "result.newerGroups [{group, op, ts}], newest first: revert those first. "
+                "or one that applied and changed nothing, is refused. Journaled as a new group "
+                "(`reverts` "
+                "= this one), itself revertible. The newer-group rule: a revert of a checkpointed "
+                "group, of a desktop.reformat in place, of a timeline.create_sequence, of a "
+                "segment.match / copy_to_media_panel or of a desktop.move stops while a later "
+                "group landed (or has an unknown or diverged result) on the same target and was "
+                "not reverted -- the same Batch group, or the same sequence / clip followed "
+                "through the new uids a restore or a desktop.reformat gave it, or the thing the "
+                "group made or moved. A value write (set_attributes, rename ...), a reformat, a "
+                "move and a checkpointed write count; a read, a reverted group and a group that "
+                "made something new do not. The revert then ends in CONFLICT, nothing is restored, "
+                "and the landed groups are in result.newerGroups [{group, op, ts}] (newest first): "
+                "revert those first, or pass force=true (journaled for a checkpointed group; the "
+                "result still has newerGroups; for the other kinds force skips only this rule). "
+                "Other desktop groups (desktop.delete, copy, import, duplicate, create, "
+                "arrange) have no such rule. What a person changed in the GUI is seen only as far "
+                "as the fingerprint reaches (nodes and wiring, or segments and effects), so a "
+                "change of that kind is not caught. "
                 "Refused while a write is unsettled "
                 "(journal.check). A revert of a checkpointed group returns result.reelsRestored / "
                 "result.reelTidy (the reel layout put back after the load). Restoring a "

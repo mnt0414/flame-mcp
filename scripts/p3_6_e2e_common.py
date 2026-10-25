@@ -151,6 +151,17 @@ declare("s_shorten", "timeline.shorten", {"sequence": _SEQ, "duration": 36})
 declare("s_shorten_refused", "timeline.shorten", {"sequence": _SEQ, "duration": 36})
 declare("q_compare", "timeline.compare", {"a": _SEQ, "b": sel("/wt/t")})
 declare("c_connections", "segment.connections", {"target": _SEG})
+declare(
+    "c_list_connections",
+    "timeline.list_segments",
+    {"target": _SEQ, "version": 0, "track": 0, "include_connections": True},
+)
+declare("c_list_plain", "timeline.list_segments", {"target": _SEQ, "version": 0, "track": 0})
+declare(
+    "c_list_connections_audio",
+    "timeline.list_segments",
+    {"target": _SEQ, "media": "audio", "track": 0, "channel": 0, "include_connections": True},
+)
 declare("v_create_version", "timeline.create_version", {"sequence": _SEQ})
 declare("v_create_track", "timeline.create_track", {"sequence": _SEQ})
 declare(

@@ -149,6 +149,9 @@ def test_the_edit_e2e_runs_to_the_end_against_the_fake(
         "q4_",
         "c1_",
         "c2_",
+        "c3_list_segments_with_include_connections",
+        "c4_",
+        "c5_",
         "y1_",
         "y2_",
         "z_",
@@ -167,11 +170,15 @@ def test_the_edit_e2e_runs_to_the_end_against_the_fake(
         "m10b_",
         "m11_",
         "m11b_",
+        "c3_list_segments_with_include_connections",
+        "c4_",
+        "c5_",
         "z_the_judged_steps_of_the_measured_cases",
     ):
         assert judged_steps(results, judged), f"no JUDGED step {judged}"
-    assert [s["name"] for s in results["steps"] if s.get("kind") == "observation"] == []
-    assert results["observations"] == []
+    observed = ["c3_connections_of_the_gap_items_as_listed"]
+    assert [s["name"] for s in results["steps"] if s.get("kind") == "observation"] == observed
+    assert [o["name"] for o in results["observations"]] == observed
     assert flame.exited is True
     assert set(results["opsUsed"]) >= {
         "timeline.delete_segments",

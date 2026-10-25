@@ -79,8 +79,16 @@ _MOVE_DESCRIPTION = (
     "journaled. After the call the moved things are found by a diff of the destination's entries "
     "before and after, matched with Flame's answer (a list in the order given). result: "
     "destination, requested / returned, moved [{from: {parent, name, type, uid (the old one)}, "
-    "to}], notMoved. No source reached the destination: SILENT_NOOP. Only some of them: ok with "
-    "result.partial = true, the envelope's partial {moved, notMoved} and a degraded note. "
+    "to}], notMoved [{from, uidGone}]. A moved thing that cannot be paired by Flame's answer or "
+    "its name is paired by position when its old uid is gone and it is the only such source of "
+    "its type (moved[].pairedBy, a degraded note); with two or more of one type none is paired: "
+    "they are in notMoved with uidGone true and journal.revert cannot put them back. If the "
+    "destination cannot be read after the move the call is FLAME_API_ERROR ('may have been "
+    "written'): notMoved says which sources are gone from their old place (moved, new place "
+    "unknown) and nothing is journaled as moved. No source reached the destination: SILENT_NOOP. "
+    "Only some of them: FLAME_API_ERROR whose message starts with 'partial:', result.partial = "
+    "true and the envelope's partial {moved, notMoved}; what moved is journaled (journal state "
+    "partial), so journal.revert puts it back. "
     "JOURNAL as desktop.copy (intent with the destination's uids -> compare-and-swap -> outcome "
     "with the moves). Envelope journal = {group, id, revert}. journal.check of a call whose "
     "answer was lost: all old uids gone and as many new entries as sources = landed (the moves "
@@ -144,12 +152,12 @@ def _move_to_python(args: Mapping[str, Any]) -> str:
     return build_source(
         *blocks,
         f"_result = _dm_move(dest, {listed}, {args.get(EXPECTED_ARG)!r})",
-        raise_on_error_src(),
         "_affected = len(_result['moved'])",
         "_partial = (\n"
         "    {'moved': len(_result['moved']), 'notMoved': len(_result['notMoved'])}\n"
         "    if _result['partial'] else None\n"
         ")",
+        raise_on_error_src(),
     )
 
 

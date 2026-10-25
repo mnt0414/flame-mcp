@@ -331,7 +331,23 @@ def test_a_clip_whose_content_was_edited_is_a_conflict(rig: Rig) -> None:
     )
     assert trimmed["ok"] is True, trimmed
     out = rig.do("journal.revert", {"group": env["journal"]["group"]})
-    assert out["errorCode"] == "CONFLICT" and "fingerprint" in str(out["result"]["conflicts"])
+    assert out["errorCode"] == "CONFLICT"
+    assert [r["group"] for r in out["result"]["newerGroups"]] == [trimmed["journal"]["group"]]
+    assert clip in reel_entries(rig)
+
+
+@pytest.mark.parametrize("op", [COPY_OUT, MATCH])
+def test_a_clip_whose_content_was_changed_by_hand_is_a_conflict_by_its_own_fingerprint(
+    rig: Rig, op: str
+) -> None:
+    env = take(rig, op, a_seg())
+    clip = made_clip(rig, env)
+    inner(clip).head = 9  # a hand edit the journal never saw: no newer group can name it
+    out = rig.do("journal.revert", {"group": env["journal"]["group"]})
+    assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
+    assert any("fingerprint" in c for c in out["result"]["conflicts"]), out["result"]
+    assert not out["result"].get("newerGroups")
+    assert clip in reel_entries(rig) and out["result"]["deleted"] is False
 
 
 def test_a_clip_that_is_gone_already_is_ok(rig: Rig) -> None:

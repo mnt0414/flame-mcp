@@ -2,8 +2,8 @@
 """MCP end-to-end verification client (run with the `.venv` Python).
 
 Checks: Eight basic operations (reads of the project, libraries, desktop, timeline and segments, and
-`desktop.rename`) through the MCP server: the catalog, the answers, a rename and its revert, and the
-error cases.
+`desktop.rename`) through the MCP server: the catalog, the answers, a rename and its revert, the
+refusal of a rename inside a library, and the error cases.
 
 Drives the real MCP surface (`python -m flame_mcp` over stdio, via the
 `mcp` package's own stdio client -- `mcp.client.stdio.stdio_client` +
@@ -40,13 +40,14 @@ Steps:
      c_segment_info_attributes (a dict whose `name` is a string),
      a_catalog_selector_fields / c_selector_vocabulary_fields (fields +
      example are published), d_revert_op_is_desktop_rename
-  d. write: rename a clip (path selector); confirm undoSteps==0 and a
+  d. write: a rename inside a library is refused (PRECONDITION_UNMET, name unchanged);
+     rename a Desktop sequence (path selector, root desktop); confirm undoSteps==0 and a
      `revert` op+args came back (a set_value() rename is
      never pushed onto Flame's native Undo history, so `execute_shortcut
      ('Undo')` must not be used -- it would silently revert an unrelated
      prior operation instead); call flame_do again with that `revert`, then
      verify via a transport read that the name is back to `before`; repeat
-     via a wiretap selector (the reel)
+     via a wiretap selector (the Desktop reel)
   e. abnormal paths: unknown wiretap/path -> SELECTOR_EMPTY, selection of 0
      -> SELECTOR_EMPTY, wrong shape / unaccepted kind -> INVALID_ARGS
   f. a second server subprocess with FLAME_MCP_READONLY=1: tools/list's
@@ -1013,17 +1014,43 @@ async def step_d_rename_and_revert(
     session: ClientSession,
     run_dir: Path,
     lib: dict[str, Any],
+    desk: dict[str, Any],
     results: dict[str, Any],
 ) -> None:
-    lib_name = lib["libName"]
-    clip_wtid = lib["clipWtids"][0]
+    """The renames run on the Desktop (a sequence by path, a reel by wiretap id): `desktop.rename`
+    refuses anything inside a library, which the first check below confirms."""
+    lib_clip_wtid = lib["clipWtids"][0]
+    lib_clip_before = _read_name_by_wiretap(run_dir, lib_clip_wtid) if lib_clip_wtid else None
+    refused_env = await _rename_via_flame_do(
+        session, {"kind": "wiretap", "id": lib_clip_wtid}, "P1O_in_library", results
+    )
+    lib_clip_after = _read_name_by_wiretap(run_dir, lib_clip_wtid) if lib_clip_wtid else None
+    record(
+        results,
+        "d_rename_in_library_refused",
+        refused_env.get("ok") is False
+        and refused_env.get("errorCode") == "PRECONDITION_UNMET"
+        and lib_clip_before is not None
+        and lib_clip_after is not None
+        and lib_clip_after.result == lib_clip_before.result,
+        env=refused_env,
+        nameBefore=lib_clip_before.result if lib_clip_before else None,
+        nameAfter=lib_clip_after.result if lib_clip_after else None,
+    )
 
+    clip_wtid = desk["seqWtid"]
+    group_name_br = _read_name_by_wiretap(run_dir, desk["reelGroupWtid"])
+    desk_reel_name_br = _read_name_by_wiretap(run_dir, desk["deskReelWtid"])
     before_br = _read_name_by_wiretap(run_dir, clip_wtid) if clip_wtid else None
     before_name = before_br.result if before_br and before_br.ok else None
 
     rename_env = await _rename_via_flame_do(
         session,
-        {"kind": "path", "path": [lib_name, "R1", str(before_name)]},
+        {
+            "kind": "path",
+            "root": "desktop",
+            "path": [str(group_name_br.result), str(desk_reel_name_br.result), str(before_name)],
+        },
         "P1O_renamed",
         results,
     )
@@ -1071,7 +1098,7 @@ async def step_d_rename_and_revert(
         expectedName=before_name,
     )
 
-    reel_wtid = lib["reelWtid"]
+    reel_wtid = desk["deskReelWtid"]
     before_reel_br = _read_name_by_wiretap(run_dir, reel_wtid) if reel_wtid else None
     before_reel_name = before_reel_br.result if before_reel_br and before_reel_br.ok else None
 
@@ -1272,7 +1299,7 @@ async def async_main(run_dir: Path, results: dict[str, Any]) -> None:
         await step_c_reads(session, run_dir, lib, results)
         await step_c_timeline(session, run_dir, desk["seqWtid"], results)
         await step_c_flame_context(session, lib, results)
-        await step_d_rename_and_revert(session, run_dir, lib, results)
+        await step_d_rename_and_revert(session, run_dir, lib, desk, results)
         await step_e_abnormal(session, results)
 
         results["_lib"] = lib

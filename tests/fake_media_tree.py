@@ -79,6 +79,19 @@ class FakeAttr:
 FakeAttr.__name__ = "PyAttribute"
 
 
+class TupleAttr(FakeAttr):
+    """A PyAttribute whose value is a tuple: `set_value` of anything else raises, as the real
+    Render node's `destination` does (measured on Flame 2025.2.4: a list is refused)."""
+
+    def set_value(self, value: Any) -> None:
+        if not isinstance(value, tuple):
+            raise RuntimeError("Wrong input type. Check values property for help.")
+        self._value = value
+
+
+TupleAttr.__name__ = "PyAttribute"
+
+
 def adopt(parent: Any, children: Iterable[Any]) -> None:
     """Flame answers `parent` on every entry of a container (a clip's is its reel)."""
     for child in children:
@@ -567,6 +580,8 @@ class PySegment:
         self.trim_calls.append((edge, offset, ripple))
         handle = self.head if edge == "head" else self.tail
         n = offset
+        if edge == "tail" and n < 0 and self._tail_passes_the_media_end(-n):
+            return self._extend_tail_past_the_media_end(-n)
         if n < 0 and handle != "infinite":
             n = -min(-n, int(handle))
         if n == 0:
@@ -595,6 +610,25 @@ class PySegment:
             self._ripple(segs, i, n)
         else:
             self._free_frames(segs, i, edge, n, rin, rout, before, after)
+        return False
+
+    def _tail_passes_the_media_end(self, frames: int) -> bool:
+        """True when a tail extension of `frames` goes past the end of the media on a segment with
+        a Timewarp (any speed): only this case is the 'infinite' tail below, every other extension
+        goes as far as the handle."""
+        return (
+            self.tail != "infinite"
+            and frames > int(self.tail)
+            and any(fx.type == "Timewarp" for fx in self.effects)
+        )
+
+    def _extend_tail_past_the_media_end(self, frames: int) -> bool:
+        """Measured on Flame 2025.2.4 (a 48-frame clip with a Timewarp, `trim_tail(-5)`): False
+        is returned, record_out grows by 5 (47 -> 52) and the tail reads 'infinite' from then on,
+        whatever room there is after the segment. The source range is not known to change; the
+        fake leaves it."""
+        self._set_record(self.record_in.frame, self.record_out.frame + frames)
+        self.tail = "infinite"
         return False
 
     @staticmethod
@@ -835,6 +869,11 @@ class PyVersion:
         raise NotImplementedError
 
 
+RENDER_MODES = ("Top", "All", "Selection")
+RENDER_QUALITIES = ("Full Resolution", "Proxy", "Full Resolution and Proxy")
+RENDER_CACHING_MODES = ("Current", "Up To", "All")
+
+
 class PySequence:
     """Fake sequence with the attributes the timeline.* ops read.
 
@@ -898,6 +937,18 @@ class PySequence:
         self._media: tuple[int, int] | None = None  # (first source frame, length), see
         # fake_segment_edit's media model; None = derived from the first segment
         self.parent: Any = None
+        self.rendered: bool | None = None
+        """What `is_rendered()` answers; None: True when the entry has no Timeline FX (measured on
+        Flame 2025.2.4) or `render` has run on it, else False."""
+        self._render_done = False
+        self.render_calls: list[dict[str, Any]] = []
+        self.is_rendered_calls: list[dict[str, Any]] = []
+        self.flush_calls = 0
+        self.render_returns: bool = True
+        self.render_raises: str | None = None
+        self.render_effective = True
+        """False: `render` answers without an error and renders nothing."""
+        self.render_changes_uid = False
         adopt(self, self._versions)
 
     @property
@@ -905,6 +956,58 @@ class PySequence:
         for version in self._versions:
             version.parent = self
         return list(self._versions)
+
+    def is_rendered(self, top_only: bool = False, render_quality: str = "Full Resolution") -> bool:
+        self.is_rendered_calls.append({"top_only": top_only, "render_quality": render_quality})
+        if self.rendered is not None:
+            return self.rendered
+        has_fx = any(
+            seg.effects for ver in self.versions for trk in ver.tracks for seg in trk.segments
+        )
+        return not has_fx or self._render_done
+
+    def render(
+        self,
+        render_mode: str = "All",
+        render_option: str = "Foreground",
+        render_quality: str = "Full Resolution",
+        effect_type: str = "",
+        effect_caching_mode: str = "Current",
+        include_handles: bool = False,
+    ) -> bool:
+        """On Flame 2025.2.4 a value outside the lists raises RuntimeError naming the accepted
+        ones (for `render_option` only "Invalid render option."). A render of a clip with
+        Timeline FX makes `is_rendered()` True and changes neither its uid nor its wiretap id."""
+        self.render_calls.append(
+            {
+                "render_mode": render_mode,
+                "render_option": render_option,
+                "render_quality": render_quality,
+                "effect_type": effect_type,
+                "effect_caching_mode": effect_caching_mode,
+                "include_handles": include_handles,
+            }
+        )
+        for label, value, accepted in (
+            ("render_mode", render_mode, RENDER_MODES),
+            ("render_quality", render_quality, RENDER_QUALITIES),
+            ("effect_caching_mode", effect_caching_mode, RENDER_CACHING_MODES),
+        ):
+            if value not in accepted:
+                raise RuntimeError(f"Invalid {label} {value!r}: use one of {list(accepted)}")
+        if render_option != "Foreground":
+            raise RuntimeError("Invalid render option.")
+        if self.render_raises is not None:
+            raise RuntimeError(self.render_raises)
+        if self.render_effective:
+            self._render_done = True
+        if self.render_changes_uid:
+            self.uid.set_value(next_uid("rendered"))
+        return self.render_returns
+
+    def flush_renders(self) -> None:
+        """Measured on Flame 2025.2.4: `is_rendered()` stays True afterwards."""
+        self.flush_calls += 1
 
     @property
     def primary_track(self) -> Any:
@@ -998,6 +1101,10 @@ class PyClip(PySequence):
         """When set, a reformat that applies also moves the start frame to this value."""
         self.copy_overrides: dict[str, Any] = {}
         """Attributes a copy of this clip gets instead of the clip's own (a copy that differs)."""
+        self.fx_lost_on_load = False
+        """A Batch `load_setup` rebuilds this clip WITHOUT its Timeline FX (measured on Flame
+        2025.2.4: a clip whose FX were changed or rendered inside the group; a clip that was
+        only copied in can lose them too). False: the rebuilt clip keeps them."""
 
     def reformat(
         self,
@@ -1303,6 +1410,7 @@ class PyNode(PyFlameObject):
             for position, target in enumerate(targets):
                 with open(target, "w", encoding="utf-8") as fh:
                     json.dump(values if position == 0 else {}, fh)
+                os.chmod(target, 0o666)  # Flame runs with umask 0
         return True
 
     def load_node_setup(self, path: str) -> bool:
@@ -1337,6 +1445,8 @@ class PyCoNode(PyFlameObject):
 
 
 AUTO_AXIS_TYPES = ("3D Path", "3D Shape", "3D Text")
+TYPES_WITH_COMPANION = ("Colour Blend", "Matte Blend")
+"""Node types that Flame 2025.2.4 creates together with a 'Group Input' node (pos -186, 0)."""
 
 
 def canonical_type_of(node_types: list[str], wanted: str) -> str:
@@ -1396,12 +1506,22 @@ class PyActionNode(PyNode):
 
 
 class PyResolution:
-    def __init__(self, width: int, height: int) -> None:
+    """`flame.PyResolution(width, height, bit_depth, frame_ratio, scan_format)`; the members are
+    read back as `scan_mode`."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        bit_depth: int = 10,
+        frame_ratio: float = 1.7778,
+        scan_format: str = "P",
+    ) -> None:
         self.width = width
         self.height = height
-        self.bit_depth = 10
-        self.scan_mode = "P"
-        self.frame_ratio = 1.7778
+        self.bit_depth = bit_depth
+        self.scan_mode = scan_format
+        self.frame_ratio = frame_ratio
 
 
 CLIP_NODE_SETUP_SUFFIXES: tuple[str, ...] = (
@@ -1514,10 +1634,21 @@ class PyRenderNode(PyNode):
             extra={
                 "range_start": FakeAttr(first, (-2147483647, 2147483647)),
                 "range_end": FakeAttr(last, (-2147483647, 2147483647)),
-                "destination": FakeAttr(["Batch Reels", "Batch Renders"]),
+                "destination": TupleAttr(("Batch Reels", "Batch Renders")),
                 "tape_name": FakeAttr("Batch"),
             },
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """An assignment to `destination` goes through `set_value`, like the real attribute."""
+        if name == "destination" and "destination" in self.__dict__:
+            self.destination.set_value(value)
+        else:
+            super().__setattr__(name, value)
+
+    def is_effective(self) -> bool:
+        wired = any(self._sockets["input"].values())
+        return not self.bypass.get_value() and wired
 
 
 DEFAULT_REEL_COUNT = 4
@@ -1594,6 +1725,7 @@ class PyBatch(PyFlameObject):
         self.render_raises: str | None = None
         self.render_frames_limit: int | None = None  # write only this many frames per node
         self.render_before_write: Any = None  # called at the start of a render (test hook)
+        self.render_desktop_writes = True  # a Render node aimed at a Desktop reel group writes
 
     def _next_uid(self, kind: str) -> str:
         self._uid_seq += 1
@@ -1774,6 +1906,14 @@ class PyBatch(PyFlameObject):
         node._owner = self
         if not self.create_node_makes_nothing:
             self.nodes.append(node)
+            if node_type in TYPES_WITH_COMPANION:
+                taken_now = {str(n.name.get_value()) for n in self.nodes}
+                count = 1
+                while f"groupinput{count}" in taken_now:
+                    count += 1
+                companion = PyNode(f"groupinput{count}", "Group Input", pos=(-186.0, 0.0))
+                companion._owner = self
+                self.nodes.append(companion)
         return node
 
     def connect_nodes(
@@ -1808,7 +1948,40 @@ class PyBatch(PyFlameObject):
             if isinstance(node, PyWriteFileNode) and node.is_effective():
                 node.write_frames(self.render_frames_limit)
                 self._add_render_clip(str(node.name.get_value()))
+            elif isinstance(node, PyRenderNode) and node.is_effective():
+                self._render_into_desktop(node)
         return self.render_returns
+
+    def _render_into_desktop(self, node: PyRenderNode) -> None:
+        """A Render node whose destination is ['Reel Groups', <group>]: the clip lands in the
+        reel `Batch Renders` of that Desktop reel group, named after the node; Flame creates the
+        reel when the group has none (measured on Flame 2025.2.4). With a third element
+        (['Reel Groups', <group>, <reel>], what Flame 2026.2.3 reads back) the clip lands in that
+        reel instead (measured on Flame 2026.2.3). Any other destination writes nothing here
+        (the fake does not model it)."""
+        destination = node.destination.get_value()
+        if not self.render_desktop_writes or destination[0] != "Reel Groups":
+            return
+        assert self._desktop is not None
+        group = next(
+            (g for g in self._desktop.reel_groups if g.name.get_value() == destination[1]), None
+        )
+        if group is None:
+            # ASSUMPTION, not measured: nothing is written when the reel group is not there. One
+            # probe saw a missing group name replaced by an existing group's name instead.
+            return
+        reel_name = destination[2] if len(destination) > 2 else "Batch Renders"
+        reel = next((r for r in group.reels if r.name.get_value() == reel_name), None)
+        if reel is None:
+            # ASSUMPTION, not measured: a named reel the group does not have is made, as
+            # `Batch Renders` is (only existing reels were set in the 2026.2.3 probe).
+            reel = group.create_reel(reel_name)
+        reel._children.append(
+            PyClip(
+                str(node.name.get_value()),
+                wiretap_id=f"{reel.get_wiretap_node_id()}/render{len(reel._children)}",
+            )
+        )
 
     def _add_render_clip(self, name: str) -> None:
         shelf = next((r for r in self.shelf_reels if r.name.get_value() == "Batch Renders"), None)
@@ -1859,8 +2032,10 @@ class PyBatch(PyFlameObject):
             if r.children
         ]
         payload = {"nodes": nodes, "reels": reels}
-        with open(os.path.join(directory, stem + ".batch"), "w", encoding="utf-8") as fh:
+        batch_file = os.path.join(directory, stem + ".batch")
+        with open(batch_file, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
+        os.chmod(batch_file, 0o666)  # Flame runs with umask 0
         return True
 
     def _clip_position(self, node: PyClipNode) -> list[Any] | None:
@@ -1868,6 +2043,12 @@ class PyBatch(PyFlameObject):
             for index, child in enumerate(reel.children):
                 if child is node.clip:
                     return [reel.name.get_value(), index]
+        return None
+
+    def _current_child(self, reel_name: str, index: int) -> Any:
+        for reel in self.reels:
+            if str(reel.name.get_value()) == reel_name and index < len(reel.children):
+                return reel.children[index]
         return None
 
     def _rebuild_reels(self, saved: list[dict[str, Any]]) -> dict[tuple[str, int], Any]:
@@ -1892,6 +2073,9 @@ class PyBatch(PyFlameObject):
                 made = kinds[child["cls"]](
                     child["name"], wiretap_id=f"{reel._wiretap_id}/copy{reel._copies}"
                 )
+                old = self._current_child(name, index)
+                if isinstance(old, PyClip) and isinstance(made, PyClip) and not old.fx_lost_on_load:
+                    made._versions = clone_versions(old)
                 reel._children.append(made)
                 clips[(name, index)] = made
             rebuilt.append(reel)
@@ -2239,6 +2423,7 @@ class FakeFlame:
         self.media_panel = PyMediaPanel(selected, flame=self)
         self.timeline = PyTimeline()
         self.PyTime = PyTime
+        self.PyResolution = PyResolution
         ACTIVE_TIMELINE[:] = [self.timeline]
         ACTIVE_FLAME[:] = [self]
         self._wiretap_index = dict(wiretap_index) if wiretap_index else {}

@@ -344,14 +344,15 @@ def test_another_kind_of_write_is_refused_for_its_own_way_back(
     assert nothing_happened(rig)
 
 
-def test_a_batch_checkpointed_op_is_still_refused_in_a_plan(rig: Rig) -> None:
+def test_a_batch_checkpointed_op_cannot_share_a_timeline_plan(rig: Rig) -> None:
     step = {
         "op": "batch.create_reel",
         "args": {"target": {"kind": "batch", "name": "BG1"}, "name": "r"},
     }
     env = plan(rig, [trim_step(10), step])
     assert env["errorCode"] == "INVALID_ARGS"
-    assert "cannot be a plan step" in str(env["result"]["issues"])
+    assert "the ways of reverting differ" in str(env["result"]["issues"])
+    assert [i["index"] for i in env["result"]["issues"]] == [1]
     assert nothing_happened(rig)
 
 
@@ -471,3 +472,26 @@ def test_a_checkpoint_that_cannot_be_taken_ends_the_plan_before_anything_runs(
     assert "scripted copy failure" in env["error"] and env["result"]["ran"] is False
     assert s1_rows(rig) == before and checkpoints(rig) == []
     assert [r["type"] for r in rig.records()] == ["group"]
+
+
+def test_a_plan_stopped_at_step_0_before_any_write_is_not_revertible(rig: Rig) -> None:
+    before = s1_rows(rig)
+    env = plan(rig, [trim_step(0), trim_step(40, "tail")])  # the first step is a Gap
+    assert env["errorCode"] == "PRECONDITION_UNMET" and env["result"]["stoppedAt"] == 0
+    assert "journal.revert" not in str(env.get("hint"))
+    assert "stay applied" not in str(env.get("hint"))
+    group = env["journal"]["group"]
+    states = {i["group"]: i["state"] for i in rig.do("journal.list", {})["result"]["items"]}
+    assert states[group] == "failed"
+    moves = len(rig.flame.media_panel.move_calls)
+    out = rig.do("journal.revert", {"group": group})
+    assert out["ok"] is False and out["errorCode"] == "PRECONDITION_UNMET", out
+    assert len(rig.flame.media_panel.move_calls) == moves
+    assert s1_rows(rig) == before
+
+
+def test_a_plan_stopped_after_a_step_ran_is_still_revertible(rig: Rig) -> None:
+    env = plan(rig, [trim_step(10), trim_step(0)])  # the second step is a Gap
+    assert env["result"]["stoppedAt"] == 1 and "journal.revert" in env["hint"]
+    out = rig.do("journal.revert", {"group": env["journal"]["group"]})
+    assert out["ok"] is True, out

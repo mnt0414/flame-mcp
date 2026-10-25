@@ -754,8 +754,8 @@ def test_static_context_has_the_pitfall_about_the_length_an_extract_leaves() -> 
 def test_the_checkpoint_sentence_lists_the_ops_without_a_doubled_and() -> None:
     contract = server_mod._static_context(make_test_registry())["undoContract"]
     assert (
-        "effect_load_setup, timeline.delete_segments, timeline.move_track and timeline.shorten)"
-        in contract
+        "effect_load_setup, edit_effect_setup, timeline.delete_segments, timeline.move_track "
+        "and timeline.shorten)" in contract
     )
     assert "effect_load_setup and timeline.delete_segments and" not in contract
 

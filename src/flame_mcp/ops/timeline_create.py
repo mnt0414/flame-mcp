@@ -50,7 +50,7 @@ _DESCRIPTION = (
     "else is INVALID_ARGS before Flame is called). Left out, the sequence gets the project's "
     "default, which differs from project to project: read the result "
     "(result.sequence.bitDepth) instead of assuming it. When a sequence's bit depth differs from "
-    "the media put on it (a clip's bitDepth, desktop.info), Flame adds a TimelineFX Resize to "
+    "the media put on it (a clip's bitDepth, desktop.info), Flame adds a Timeline FX Resize to "
     "that segment by itself. On Flame 2026.2.3 Flame refused to delete that Resize, and "
     "segment.delete_effect refuses it up front on every version, for safety: give the new "
     "sequence the bit depth of the media it will hold and none is added. "
@@ -66,8 +66,11 @@ _DESCRIPTION = (
     "name} or null) say what the Timeline showed before and after. "
     "result: parent, created {type, name, uid, wiretapId, selector} (use its selector), sequence "
     "{frameRate, width, height, bitDepth, startFrame, startTime, duration, videoTracks} as read "
-    "back, state {name, duration, fingerprint}, returned, warnings (a value that reads back "
-    "differently from what was asked). Fill it with timeline.overwrite / timeline.insert. "
+    "back, state {name, duration, fingerprint}, returned, warnings. A value that reads back "
+    "differently from what was asked (frame_rate, width, height, video_tracks, bit_depth, "
+    "start_tc) is FLAME_API_ERROR whose message starts with 'partial:': the sequence exists "
+    "and is journaled (state partial), so journal.revert deletes it. "
+    "Fill it with timeline.overwrite / timeline.insert. "
     "Undo: journal.revert(group) deletes the new sequence, only while its name, duration and "
     "content are still what they were right after the call (else CONFLICT and nothing is "
     "deleted); a sequence that is gone already is ok (result.alreadyGone). When it was the one "
@@ -102,7 +105,9 @@ def _to_python(args: Mapping[str, Any]) -> str:
         f"{args.get('start_tc')!r}, {args.get(EXPECTED_ARG)!r}, "
         f"{None if depth is None else int(depth)!r})"
     )
-    return build_source(parent, call, raise_on_error_src(), "_affected = 1")
+    return build_source(
+        parent, call, "_affected = 1 if _result['created'] is not None else 0", raise_on_error_src()
+    )
 
 
 def _precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:

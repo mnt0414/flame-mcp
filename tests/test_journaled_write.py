@@ -11,7 +11,7 @@ import pytest
 
 from flame_mcp.policy import Policy
 from flame_mcp.runtime import TestHooks, TestHooksConfigError
-from journal_test_helpers import COMP, REEL_WIRETAP, TREE_REEL_ID, Rig, make_rig
+from journal_test_helpers import COMP, DESKTOP_REEL_ID, REEL_WIRETAP, Rig, make_rig
 from test_ops_attributes import ColourLabelAttr, add_attr
 
 
@@ -69,14 +69,15 @@ def test_the_envelope_names_its_journal_records_and_keeps_the_revert(rig: Rig) -
 
 def test_the_write_goes_to_the_stable_address_not_the_callers_selector(rig: Rig) -> None:
     env = rig.do(
-        "desktop.rename", {"target": {"kind": "path", "path": ["P1O", "R1"]}, "name": "R1b"}
+        "desktop.rename",
+        {"target": {"kind": "path", "path": ["RG", "Reel 1"], "root": "desktop"}, "name": "R1b"},
     )
     assert env["ok"] is True, env
     intent = rig.records()[0]
     assert intent["target"] == REEL_WIRETAP
     write_call = next(c for c in rig.exec.calls if c.label == "desktop.rename")
     assert "target = _resolve_path(" not in write_call.code  # the op's own source, not the prelude
-    assert f"target = _resolve_wiretap({TREE_REEL_ID!r})" in write_call.code
+    assert f"target = _resolve_wiretap({DESKTOP_REEL_ID!r})" in write_call.code
 
 
 def test_a_call_may_join_an_existing_group(rig: Rig) -> None:
@@ -94,7 +95,7 @@ def test_rename_is_journaled_and_reports_what_a_journal_needs(rig: Rig) -> None:
     env = rig.do("desktop.rename", {"target": REEL_WIRETAP, "name": "R1b"})
     assert env["ok"] is True, env
     intent, outcome = rig.records()
-    assert (intent["before"], intent["after"]) == ({"name": "R1"}, {"name": "R1b"})
+    assert (intent["before"], intent["after"]) == ({"name": "Reel 1"}, {"name": "R1b"})
     assert outcome["applied"] == ["name"] and outcome["readBack"] == {"name": "R1b"}
 
 
@@ -190,7 +191,7 @@ def test_one_conflicting_key_stops_every_key_of_the_call(
 
 def test_rename_conflict_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     rig = make_rig(monkeypatch, tmp_path)
-    reel = rig.handles["tree_reel"]
+    reel = rig.handles["reel"]
 
     def sleeper(_seconds: float) -> None:
         reel.name.set_value("renamed by someone else")
@@ -200,7 +201,7 @@ def test_rename_conflict_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert env["ok"] is False and env["errorCode"] == "CONFLICT"
     assert reel.name.get_value() == "renamed by someone else"
     assert env["result"]["conflicts"] == {
-        "name": {"expected": "R1", "current": "renamed by someone else"}
+        "name": {"expected": "Reel 1", "current": "renamed by someone else"}
     }
 
 
@@ -567,17 +568,21 @@ def test_generated_code_without_expected_values_is_the_plain_write(rig: Rig) -> 
 
 
 def test_generated_rename_compares_the_name_before_writing(rig: Rig) -> None:
-    reel = rig.handles["tree_reel"]
+    reel = rig.handles["reel"]
     result = run_generated(
         rig,
         "desktop.rename",
         {"target": REEL_WIRETAP, "name": "R1b", "_expected": {"name": "something else"}},
     )
     assert result["opErrorCode"] == "CONFLICT"
-    assert reel.name.get_value() == "R1"
-    assert result["value"]["conflicts"] == {"name": {"expected": "something else", "current": "R1"}}
+    assert reel.name.get_value() == "Reel 1"
+    assert result["value"]["conflicts"] == {
+        "name": {"expected": "something else", "current": "Reel 1"}
+    }
     ok = run_generated(
-        rig, "desktop.rename", {"target": REEL_WIRETAP, "name": "R1b", "_expected": {"name": "R1"}}
+        rig,
+        "desktop.rename",
+        {"target": REEL_WIRETAP, "name": "R1b", "_expected": {"name": "Reel 1"}},
     )
     assert ok["opError"] is None and ok["verified"] is True and reel.name.get_value() == "R1b"
 

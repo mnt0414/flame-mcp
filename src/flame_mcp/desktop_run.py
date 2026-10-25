@@ -35,7 +35,8 @@ group onto the Desktop; `desktop_batch_prelude`): the copy's record is `{uid, na
 names, on the Desktop also the node fingerprint) is unchanged.
 
 A write that ends without an answer (TIMEOUT / BRIDGE_LOST / BRIDGE_UNAVAILABLE) leaves the intent
-open and shuts the write door (`WriteGuard`) until `journal.check` has decided
+open and shuts the write guard (`WriteGuard`; writes are refused until `journal.check` has
+decided)
 (`desktop_revert.check_desktop_intent`: it reads the parent / destination again -- new entries are
 what a create / copy made).
 """
@@ -201,15 +202,40 @@ BATCH_REEL_HINT: Final[str] = (
 )
 
 
-def _fail_pre_read(
-    op: RegisteredOperation, pre: dict[str, Any], hint: str | None = None
+def pre_read_failure(
+    op: RegisteredOperation, pre: Mapping[str, Any], done: str, hint: str | None = None
 ) -> dict[str, Any]:
+    """The envelope of a call whose pre-read did not give a usable answer, so nothing was `done`
+    ("written" / "rendered"). A read that ended with the bridge's pending handle is a TIMEOUT that
+    says so, with the handle kept in `pending` (journal.poll fetches the read's answer)."""
     failure = dict(pre)
     failure["execution"] = envelope_mod.execution_meta(op)
-    failure["error"] = f"nothing was written: {pre.get('error')}"
+    failure["ok"] = False
+    pending = failure.get("pending")
+    if isinstance(pending, Mapping) and pending.get("handle") and not failure.get("error"):
+        failure["errorCode"] = "TIMEOUT"
+        failure["error"] = (
+            f"nothing was {done}: the read of the target had not answered when its wait ended "
+            f"(the bridge gave the pending handle {pending['handle']}); it may still be running"
+        )
+        failure["hint"] = (
+            f"Nothing was {done} or journaled. Fetch the read's answer with "
+            f"journal.poll(handle={pending['handle']!r}), or call again."
+        )
+        return failure
+    error = failure.get("error") or "the read answered without a result"
+    failure["error"] = f"nothing was {done}: {error}"
+    if not failure.get("errorCode"):
+        failure["errorCode"] = "FLAME_API_ERROR"
     if hint is not None:
         failure["hint"] = hint
     return failure
+
+
+def _fail_pre_read(
+    op: RegisteredOperation, pre: dict[str, Any], hint: str | None = None
+) -> dict[str, Any]:
+    return pre_read_failure(op, pre, "written", hint)
 
 
 def _stable_write_args(
@@ -333,6 +359,13 @@ def _pre_read_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | Non
 
 def _no_read_back(env: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
+
+
+def partial_verdict(ok: bool, created: Mapping[str, Any] | None) -> dict[str, str]:
+    """The outcome key that makes the intent's state `partial` (`IntentView.state`): the call
+    ended in an error after it had made or changed something that `created` records, so a
+    `journal.revert` can still put that part back."""
+    return {"verdict": "partial"} if not ok and created is not None else {}
 
 
 @dataclass(frozen=True)
@@ -467,6 +500,7 @@ def run_write_flow(
             "errorCode": None if ok else end_code,
             "readBack": profile.read_back(env),
             "created": created,
+            **partial_verdict(ok, created),
         }
         try:
             rt.journal.append(outcome)

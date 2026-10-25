@@ -23,6 +23,7 @@ from flame_mcp.checkpoints import (
     DEFAULT_FINGERPRINT_SECTIONS,
     DIR_ARG,
     FINGERPRINT_SECTIONS,
+    FX_ARG,
     REELS_ARG,
     TIMELINE_KIND,
     kind_named,
@@ -37,6 +38,26 @@ from flame_mcp.runtime import ServerContext
 from flame_mcp.timeline_purge import DEFAULT_OLDER_THAN_DAYS, purge_checkpoints
 from flame_mcp.timeline_restore import RESTORE_NOTE
 from flame_mcp.types import OperationParam, OperationSpec, Refusal, ServerResult
+
+CLIP_FX_REQUIRES: tuple[str, ...] = (
+    "PyBatch.reels",
+    "PyBatch.shelf_reels",
+    "PyReel.name",
+    "PyReel.clips",
+    "PyClip.name",
+    "PyClip.versions",
+    "PyVersion.tracks",
+    "PyTrack.segments",
+    "PySegment.effects",
+    "PyTimelineFX.type",
+)
+"""What `checkpoint_prelude._clip_fx_read` reads."""
+
+OVERWRITE_NOTE = (
+    "This op overwrites the target without comparing it with the current state: whatever "
+    "was written since is lost (the state just before is kept in result.preCheckpoint, and "
+    "restoring that undoes this call)."
+)
 
 _TARGET = OperationParam(
     name="target",
@@ -100,6 +121,8 @@ def _load_setup_to_python(args: Mapping[str, Any]) -> str:
             f"_result['reelTidy'] = _tidy_reels(target, {recorded!r}, "
             f"{list(FINGERPRINT_SECTIONS)!r})"
         )
+    if args.get(FX_ARG) is True:
+        lines.append("_result['clipFx'] = _clip_fx_read(target)")
     return build_source(selectors.resolve_code(args["target"], "target"), "\n".join(lines))
 
 
@@ -198,6 +221,7 @@ def register(registry: Registry) -> None:
                 "PyBatch.batch_iterations",
                 "PyReel.clips",
                 "PyReel.sequences",
+                *CLIP_FX_REQUIRES,
             ),
         )
     )
@@ -258,7 +282,10 @@ def register(registry: Registry) -> None:
                 "(result.preCheckpoint {id, path}, also in a failure's result) and the run is "
                 "journaled with fingerprints: journal.revert(group) or "
                 "journal.restore_checkpoint(preCheckpoint) puts it back. `path` is a real "
-                "`.batch` path (a checkpoint's result.path). " + RESTORE_SIDE_EFFECTS
+                "`.batch` path (a checkpoint's result.path). The group's fingerprint is read "
+                "back after the load; when that read fails the call ends in FLAME_API_ERROR "
+                "(the load was called and the group may have been replaced; the pre-load "
+                "checkpoint restores it). " + OVERWRITE_NOTE + " " + RESTORE_SIDE_EFFECTS
             ),
             effect="destructive",
             params=(
@@ -283,6 +310,7 @@ def register(registry: Registry) -> None:
                 "PyReel.clips",
                 "PyReel.sequences",
                 "flame.delete",
+                *CLIP_FX_REQUIRES,
             ),
         )
     )
@@ -299,6 +327,8 @@ def register(registry: Registry) -> None:
                 "taken as part of it (result.preCheckpoint, the id, restoring it undoes this "
                 "restore). A checkpoint whose stashed copy was purged by "
                 "journal.purge_checkpoints is refused (PRECONDITION_UNMET, 'was purged'). "
+                + OVERWRITE_NOTE
+                + " "
                 + RESTORE_NOTE
                 + " For a Batch checkpoint: (1) its file must exist, else nothing "
                 "happens and load_setup is not called (PRECONDITION_UNMET); (2) the group's "
@@ -363,7 +393,12 @@ def register(registry: Registry) -> None:
                 "`older_than_days` days ago (0 = every one) whose copy is still in the library "
                 "(`dry_run`, the default, deletes nothing and reads Flame only). Flame checks "
                 "again, copy by copy, that it is inside the checkpoint library with the uid AND "
-                "the name the journal recorded; one that is not is skipped. Then the date reels "
+                "the name the journal recorded; one that is not is skipped. A copy whose "
+                "flame.delete was called and that is still there is not a skip: it is listed in "
+                "notDeleted [{id, uid, name, reason}] and ends the call in SILENT_NOOP (none "
+                "deleted) or FLAME_API_ERROR whose message starts with 'partial:' (some "
+                "deleted; the deleted ones are recorded as purged and a purge again retries "
+                "the rest). Then the date reels "
                 "('timeline_<YYMMDD>', directly in the library) that this left empty are "
                 "deleted. dry_run result: candidates [{id, ts, label, group, sourceName, stash "
                 "{uid, name, library, reel}, exists, nameMatches}], count (what a real run would "
@@ -372,8 +407,10 @@ def register(registry: Registry) -> None:
                 "checkpoint accounts for (a copy made by hand, or by a call whose record was "
                 "lost): it is NEVER deleted here. A real run adds purged [{id, uid, name, "
                 "reel}], gone (ids recorded as purged because their copy was missing), skipped "
-                "[{id, reason}], reelsDeleted, purgeRecord, and writes a `purge` record to the "
-                "journal: the checkpoints are then listed as purged by journal.list_checkpoints, "
+                "[{id, reason}], notDeleted, warnings (a copy that is gone but flame.delete "
+                "did not answer True), reelsDeleted, purgeRecord, and writes a `purge` record "
+                "to the journal: the checkpoints are then listed as purged by "
+                "journal.list_checkpoints, "
                 "and journal.restore_checkpoint / journal.revert refuse to restore from them "
                 "('purged'), so a delete or an edit whose stash was purged can no longer be "
                 "undone. Not undoable. The journal's own 30-day cleanup keeps a journal file "

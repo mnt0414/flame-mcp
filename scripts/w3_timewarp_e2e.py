@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Real-Flame end-to-end check of `segment.trim` / `segment.slip` with a Timewarp.
 
-Checks: `segment.trim` and `segment.slip` on a segment that has a Timewarp.
+Checks: `segment.trim` and `segment.slip` on a segment that has a Timewarp, and on a clip whose
+tail is 'infinite' before the edit (that side is not judged).
 
 The test sequences are made with the bit depth of the media, read from the clip: Flame puts a
 Resize on each segment of a sequence of another bit depth, and a new sequence otherwise gets the
@@ -30,11 +31,19 @@ revert puts the sequence back; the negative control (no Timewarp) still judges t
 OBSERVED steps (`kind: "observation"`, always ok) record how far source_in / source_out really
 moved (the rounding is not known).
 
+JUDGED steps of stage i (a clip on the Desktop, not a sequence): a Timewarp is created on the clip
+and its tail is made 'infinite' by transport (`trim_tail(-5)`); then `segment.trim` tail +3 and
+`segment.slip` are ok, say `handleJudged` tail false / head true (the trim also names the reason in
+`handleNotJudgedBecause`), and move the record side and the head as transport reads them back; the
+return value of the transport trim and the tail after each edit are only recorded.
+
 Stages (material: scripts/make_p2_media.sh; p2_len72 trimmed head 14 / tail 14 = 44 frames)
   t  six cases, each on a fresh sequence: segment.create_effect Timewarp, segment.effect_load_setup,
      segment.info (source 35 frames), then trim tail +3 / -3, head +3 / -3, slip +2 / -2.
   r  trim tail +3 then journal.revert: the sequence and the segment (source range too) are back.
   n  the negative control: no Timewarp, trim tail +3 and slip +2 are judged on the source side.
+  i  p2_len48 (the clip itself, not a sequence) with a Timewarp and an 'infinite' tail:
+     segment.trim tail +3, then segment.slip (+2 when the head handle allows it, else -2).
   z  cross-cutting checks; everything this run made is deleted; flame.exit().
 """
 
@@ -76,6 +85,7 @@ from p3_2a_e2e_common import (  # noqa: E402
     OUTPUT_DIR,
     PREPARE_CODE,
     SEG_FACTS_CODE,
+    TRANSPORT_TRIM_CODE,
     Results,
     call,
     ckpt_library,
@@ -108,8 +118,10 @@ SKIP_EXIT_CODE: Final[int] = 3
 CLIP_FILES: Final[tuple[tuple[str, Path], ...]] = (
     ("clip1", MEDIA_DIR / "clip1.mov"),
     ("p2_len72", MEDIA_DIR / "p2" / "p2_len72.mov"),
+    ("p2_len48", MEDIA_DIR / "p2" / "p2_len48.mov"),
 )
-"""clip1 is only there for the frame rate and size the sequences are made with."""
+"""clip1 is only there for the frame rate and size the sequences are made with; p2_len48 is only
+used by stage i (the clip itself is edited, no sequence)."""
 SETUP_ENV: Final[str] = "FLAME_MCP_W3_SETUP"
 """Names the setup file; scripts/run_e2e.sh reads the same variable for its SKIP check."""
 
@@ -161,6 +173,12 @@ CASES: Final[tuple[tuple[str, str, int, dict[str, int]], ...]] = (
 left out: they are not judged). Each case runs on a fresh sequence, so one edit never starts from
 another's result."""
 RECORD_SIDE: Final[tuple[str, ...]] = ("rin", "rout", "head", "tail")
+INFINITE_CLIP: Final[str] = "p2_len48"
+INFINITE: Final[str] = "infinite"
+TAIL_EXTEND_FRAMES: Final[int] = 5
+"""`trim_tail(-5)` by transport: past the end of the 48 frames of media the tail handle reads
+'infinite' (measured on a Timewarp clip)."""
+INFINITE_TAIL_REASON: Final[str] = "tail was 'infinite' before the edit"
 
 # -- the calls made through the MCP surface (one table: the run and --dry-run read the same one) --
 
@@ -195,6 +213,7 @@ TEMPLATES: Final[dict[str, str]] = {
     "prepare": PREPARE_CODE,
     "make_seq": MAKE_SEQ_TEMPLATE,
     "seg_facts": SEG_FACTS_CODE,
+    "transport_trim": TRANSPORT_TRIM_CODE,
     "struct": STRUCT_CODE,
     "cleanup": CLEANUP_CODE,
     "left": LEFT_CODE,
@@ -213,6 +232,18 @@ def facts_deltas(before: dict[str, Any] | None, after: dict[str, Any] | None) ->
     if not before or not after:
         return {}
     return {k: after[k] - before[k] for k in FACT_KEYS}
+
+
+def number_deltas(before: dict[str, Any] | None, after: dict[str, Any] | None) -> dict[str, int]:
+    """after - before for the facts that are numbers on both sides (head / tail can read
+    'infinite', a string, which has no difference)."""
+    if not before or not after:
+        return {}
+    return {
+        k: after[k] - before[k]
+        for k in FACT_KEYS
+        if all(isinstance(x[k], int) and not isinstance(x[k], bool) for x in (before, after))
+    }
 
 
 def op_deltas_as_facts(result: dict[str, Any]) -> dict[str, Any]:
@@ -539,6 +570,140 @@ async def stage_n(ctx: Ctx) -> None:
             previous = after or previous
 
 
+# -- i: a clip whose tail is 'infinite' before the edit -----------------------------------------
+
+
+def judged_sides(facts: dict[str, Any]) -> dict[str, bool]:
+    """The sides the op should judge before an edit: those whose handle transport reads as a
+    number (not 'infinite')."""
+    return {"head": facts["head"] != INFINITE, "tail": facts["tail"] != INFINITE}
+
+
+def handle_says(
+    ctx: Ctx, tag: str, env: dict[str, Any], before: dict[str, Any], *, reason: str | None
+) -> None:
+    """The result names the sides it judged, as built from what transport read just before the
+    edit (`before`); `reason` is the sentence for the side left out (None: not checked)."""
+    res = _result_of(env)
+    want = judged_sides(before)
+    rec(
+        ctx,
+        f"{tag}_the_result_names_the_judged_sides_as_transport_read_them_before_the_edit",
+        env.get("ok") is True
+        and res.get("handleJudged") == want
+        and (reason is None or res.get("handleNotJudgedBecause") == reason),
+        error=env.get("error"),
+        errorCode=env.get("errorCode"),
+        want=want,
+        result={k: res.get(k) for k in ("handleJudged", "handleNotJudgedBecause")},
+    )
+
+
+async def stage_i(ctx: Ctx) -> None:
+    wiretap = ctx.ids["clipWt"][INFINITE_CLIP]
+    async with server_session(ctx, "ptw3e-i") as session:
+        struct = await tx_struct(ctx, wiretap)
+        media = [r for r in track_rows(struct, 0) if r["type"] != "Gap"]
+        if not media:
+            rec(ctx, "i0_the_clip_has_a_segment", False, track0=track_rows(struct, 0))
+            return
+        rin = media[0]["rin"]
+        seg = seg_at(sel(wiretap), 0, rin)
+        created = await run_call(session, ctx, "t_create_effect", {"target": seg, "type": FX_TYPE})
+        info = await run_call(session, ctx, "t_info", {"target": seg})
+        rec(
+            ctx,
+            "i0_the_clip_has_a_timewarp",
+            created.get("ok") is True
+            and info.get("ok") is True
+            and _result_of(info).get("effects") == [FX_TYPE],
+            created=created.get("error"),
+            effects=_result_of(info).get("effects"),
+        )
+        start = await tx_seg(ctx, wiretap, 0, rin)
+        returned = await tx_val(
+            ctx,
+            fill(TRANSPORT_TRIM_CODE, WT=wiretap, TRACK=0, RECORD_IN=rin, N=-TAIL_EXTEND_FRAMES),
+            "ptw3e_extend_tail",
+        )
+        before = await tx_seg(ctx, wiretap, 0, rin)
+        observe(
+            ctx,
+            "i0_how_the_transport_trim_extended_the_tail",
+            returned=returned,
+            start=start,
+            after=before,
+        )
+        ready = (
+            created.get("ok") is True
+            and before is not None
+            and before["tail"] == INFINITE
+            and isinstance(before["head"], int)
+        )
+        rec(
+            ctx,
+            "i0_the_tail_is_infinite_and_the_head_is_a_number_before_the_edits",
+            ready,
+            before=before,
+        )
+        if not ready or before is None:
+            return
+        env = await run_call(
+            session, ctx, "t_trim", {"target": seg, "edge": "tail", "offset": TRIM_FRAMES}
+        )
+        after_trim = await tx_seg(ctx, wiretap, 0, rin)
+        got = number_deltas(before, after_trim)
+        rec(
+            ctx,
+            "i1_trim_tail_plus_3_is_ok_the_record_out_moved_by_3_and_in_and_head_did_not_(by_transport)",
+            env.get("ok") is True
+            and got.get("rin") == 0
+            and got.get("rout") == -TRIM_FRAMES
+            and got.get("head") == 0,
+            error=env.get("error"),
+            errorCode=env.get("errorCode"),
+            got=got,
+            before=before,
+            after=after_trim,
+        )
+        handle_says(ctx, "i1", env, before, reason=INFINITE_TAIL_REASON)
+        observe(
+            ctx,
+            "i1_the_tail_after_the_trim",
+            tail=after_trim and after_trim["tail"],
+            head=after_trim and after_trim["head"],
+        )
+        if after_trim is None or not isinstance(after_trim["head"], int):
+            rec(ctx, "i2_the_head_can_be_read_back", False, after=after_trim)
+            return
+        offset = SLIP_FRAMES if after_trim["head"] >= SLIP_FRAMES else -SLIP_FRAMES
+        observe(
+            ctx,
+            "i2_the_slip_direction_chosen_from_the_head_handle",
+            head=after_trim["head"],
+            offset=offset,
+        )
+        slip = await run_call(session, ctx, "t_slip", {"target": seg, "offset": offset})
+        after_slip = await tx_seg(ctx, wiretap, 0, rin)
+        got = number_deltas(after_trim, after_slip)
+        rec(
+            ctx,
+            "i2_slip_is_ok_the_record_did_not_move_and_the_head_moved_by_the_offset_(read_back_by_transport)",
+            slip.get("ok") is True
+            and got.get("rin") == 0
+            and got.get("rout") == 0
+            and got.get("head") == -offset,
+            error=slip.get("error"),
+            errorCode=slip.get("errorCode"),
+            offset=offset,
+            got=got,
+            before=after_trim,
+            after=after_slip,
+        )
+        handle_says(ctx, "i2", slip, after_trim, reason=None)
+        observe(ctx, "i2_the_tail_after_the_slip", tail=after_slip and after_slip["tail"])
+
+
 # -- z / driver ---------------------------------------------------------------------------------
 
 
@@ -601,7 +766,7 @@ async def async_main(ctx: Ctx) -> None:
             return
         await guarded(ctx, "prepare", prepare)
         if "seqReelWt" in ctx.ids and "clipWt" in ctx.ids:
-            for name, stage in (("t", stage_t), ("r", stage_r), ("n", stage_n)):
+            for name, stage in (("t", stage_t), ("r", stage_r), ("n", stage_n), ("i", stage_i)):
                 await guarded(ctx, name, stage)
         else:
             rec(ctx, "prepare_incomplete_the_stages_were_skipped", False, ids=sorted(ctx.ids))
@@ -668,7 +833,7 @@ def dry_run() -> int:
     else:
         setup_state = f"{SETUP_SRC} ({'there' if SETUP_SRC.is_file() else 'NOT THERE'})"
     print(f"===== setup file: {setup_state} =====")
-    print(f"===== calls: {len(CALLS)}; stages: t r n, prepare and z =====")
+    print(f"===== calls: {len(CALLS)}; stages: t r n i, prepare and z =====")
     print(f"=== dry run: {'FAILED' if failures else 'OK'} ({failures} problem(s)) ===")
     return 1 if failures else 0
 

@@ -26,12 +26,20 @@ from flame_mcp.checkpointed import refuse_if_denied
 from flame_mcp.checkpoints import TIMELINE_KIND
 from flame_mcp.desktop_reformat_check import observe_items, same_format
 from flame_mcp.desktop_reformat_state import DUPLICATE, IN_PLACE, OP_NAME
-from flame_mcp.desktop_revert import RevertProfile, chain_of_uid, revert_flow
+from flame_mcp.desktop_revert import (
+    RevertProfile,
+    chain_of_uid,
+    failure_code,
+    revert_flow,
+    unresolved_hint,
+    unresolved_of,
+)
 from flame_mcp.desktop_run import CREATED_ARG, PHASE_ARG, PHASE_REVERT
 from flame_mcp.errors import as_error_code
 from flame_mcp.journal import KIND_DESKTOP_REFORMAT, Index, IntentView
+from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.timeline_restore import restore_timeline_checkpoint
-from flame_mcp.types import ErrorCode, ServerOpError, ServerResult
+from flame_mcp.types import ServerOpError, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -244,8 +252,11 @@ def revert_reformat_group(
                     "errorCode": exc.code,
                     "reason": exc.message,
                     "result": exc.result,
+                    "group": (exc.journal or {}).get("group"),
                 }
             )
+            if exc.code in UNKNOWN_END_CODES:
+                groups.append((exc.journal or {}).get("group"))
             if exc.code not in INDEPENDENT_CODES:
                 stopped_at = position + 1
                 break
@@ -253,10 +264,11 @@ def revert_reformat_group(
     done = len(restored) + len(deleted)
     journal = {"group": groups[-1], "groups": groups} if groups else None
     if failures:
-        codes = {str(f["errorCode"]) for f in failures}
-        code: ErrorCode = failures[0]["errorCode"] if len(codes) == 1 else "CONFLICT"
+        unresolved = unresolved_of(failures)
+        if unresolved:
+            body["unresolved"] = unresolved
         raise ServerOpError(
-            code,
+            failure_code(failures),
             "; ".join(f"clip {f['index']}: {f['reason']}" for f in failures)
             + (
                 f" -- {done} clip(s) were put back, {len(failures)} were not (result.partial); "
@@ -265,6 +277,7 @@ def revert_reformat_group(
                 else ""
             ),
             result=body,
+            hint=unresolved_hint(unresolved),
             affected=done,
             partial={"done": done, "failed": len(failures), "notRun": len(todo) - stopped_at}
             if done

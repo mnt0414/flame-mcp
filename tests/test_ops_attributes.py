@@ -27,6 +27,7 @@ from fake_media_tree import (
     PyNode,
     PyReel,
     PyReelGroup,
+    PyResolution,
     PySegment,
     build_default_tree,
 )
@@ -506,13 +507,15 @@ def test_a_stale_wrapper_does_not_cause_a_false_failure() -> None:
     assert result["value"]["after"] == {"dynamic_name": "after"}
 
 
-def test_a_value_clamped_by_flame_counts_as_failed_and_stays_revertable() -> None:
+def test_a_value_flame_rounded_to_another_value_is_a_partial_write_and_stays_revertable() -> None:
     registry = make_registry()
     flame, h = make_batch_world()
     add_attr(h["comp"], "gain", ClampAttr(1.0, None, ndigits=1))
     result = set_call(registry, "node.set_attributes", COMP, {"gain": 2.26}, flame)
-    assert result["opErrorCode"] == "SILENT_NOOP"
+    assert result["opErrorCode"] == "FLAME_API_ERROR"  # the value moved: not a SILENT_NOOP
+    assert result["value"]["failed"]["gain"].startswith("partial:")
     assert result["value"]["after"] == {"gain": 2.3}
+    assert result["value"]["changedKeys"] == ["gain"] and result["value"]["applied"] == []
     # the value did change (to something else): the revert must still put it back
     assert result["value"]["revert"]["args"]["values"] == {"gain": 1.0}
 
@@ -605,14 +608,14 @@ def test_an_empty_string_clears_a_colour_label_and_the_revert_puts_it_back() -> 
     assert h["comp"].colour_label.get_value() == "Green"
 
 
-def test_a_case_only_difference_on_another_attribute_is_still_a_silent_noop() -> None:
+def test_a_case_only_difference_on_another_attribute_is_a_partial_write() -> None:
     registry = make_registry()
     flame, h = make_batch_world()
     h["comp"].name = LowercasingName("comp1")
     result = set_call(registry, "node.set_attributes", COMP, {"name": "Comp1_X"}, flame)
-    assert result["opErrorCode"] == "SILENT_NOOP"
-    assert result["value"]["failed"]["name"].startswith("silent_noop")
-    assert result["value"]["applied"] == []
+    assert result["opErrorCode"] == "FLAME_API_ERROR"  # the name moved, to another spelling
+    assert result["value"]["failed"]["name"].startswith("partial:")
+    assert result["value"]["applied"] == [] and result["value"]["changedKeys"] == ["name"]
     assert result["value"]["after"] == {"name": "comp1_x"}
 
 
@@ -1240,3 +1243,409 @@ def test_a_non_flame_object_value_still_falls_back_to_its_repr() -> None:
         flame,
     )
     assert result["value"]["attributes"]["odd"] == {"value": repr({"not": "a scalar"})}
+
+
+class ResolutionAttr(SpyAttr):
+    """A PyAttribute that holds a PyResolution and takes every field of what it is given. Every
+    read answers a fresh PyResolution, like Flame."""
+
+    def _take(self, value: Any) -> PyResolution:
+        return PyResolution(
+            value.width, value.height, value.bit_depth, value.frame_ratio, value.scan_mode
+        )
+
+    def get_value(self) -> Any:
+        return self._take(self._value)
+
+    def set_value(self, value: Any) -> None:
+        self.set_calls.append(value)
+        self._value = self._take(value)
+
+
+class ColourSourceResolution(ResolutionAttr):
+    """A Colour Source: width and height take; bit_depth takes only as 8 / 16 / 32, and 10 and 12
+    become 16 (measured on Flame 2025.2.4)."""
+
+    def _take(self, value: Any) -> PyResolution:
+        taken = super()._take(value)
+        if taken.bit_depth not in (8, 16, 32):
+            taken.bit_depth = 16
+        return taken
+
+
+class FrozenResolution(ResolutionAttr):
+    """set_value answers and changes nothing."""
+
+    def set_value(self, value: Any) -> None:
+        self.set_calls.append(value)
+
+
+for _res_cls in (ResolutionAttr, ColourSourceResolution, FrozenResolution):
+    _res_cls.__name__ = "PyAttribute"
+
+RES_START = {
+    "type": "PyResolution",
+    "width": 1920,
+    "height": 1080,
+    "bit_depth": 16,
+    "frame_ratio": 1.7778,
+    "scan_mode": "P",
+}
+RES_NODES = {
+    "res_full": ResolutionAttr,
+    "res_colour": ColourSourceResolution,
+    "res_frozen": FrozenResolution,
+}
+
+
+def add_resolution_nodes(h: dict[str, Any]) -> None:
+    """Three nodes in BG1, all starting at 1920x1080, 16 bit, also put into `h` by name. Their
+    `resolution` takes everything, behaves like a Colour Source and takes nothing, in that order."""
+    for name, attr_cls in RES_NODES.items():
+        node = PyNode(
+            name, "Colour Source", extra={"resolution": attr_cls(PyResolution(1920, 1080, 16))}
+        )
+        node._owner = h["bg1"]
+        h["bg1"].nodes.append(node)
+        h[name] = node
+
+
+def make_resolution_world() -> tuple[FakeFlame, dict[str, Any]]:
+    flame, h = make_batch_world()
+    add_resolution_nodes(h)
+    return flame, h
+
+
+def res_node(name: str) -> dict[str, Any]:
+    return {"kind": "node", "batch": BG1, "name": name}
+
+
+def write_resolution(registry: Registry, flame: Any, name: str, resolution: Any) -> dict[str, Any]:
+    return set_call(
+        registry, "node.set_attributes", res_node(name), {"resolution": resolution}, flame
+    )
+
+
+def res_of(h: dict[str, Any], name: str) -> tuple[Any, ...]:
+    res = h[name].resolution.get_value()
+    return (res.width, res.height, res.bit_depth, res.frame_ratio, res.scan_mode)
+
+
+def test_get_attributes_reads_a_resolution_as_its_five_fields() -> None:
+    registry = make_registry()
+    flame, _h = make_resolution_world()
+    result = call(
+        registry,
+        "node.get_attributes",
+        {"target": res_node("res_full"), "keys": ["resolution"]},
+        flame,
+    )
+    assert result["value"]["attributes"]["resolution"] == {"value": RES_START}
+
+
+def test_get_attributes_include_values_gives_no_candidates_for_a_resolution() -> None:
+    registry = make_registry()
+    flame, _h = make_resolution_world()
+    result = call(
+        registry,
+        "node.get_attributes",
+        {"target": res_node("res_full"), "keys": ["resolution"], "include_values": True},
+        flame,
+    )
+    assert result["value"]["attributes"]["resolution"] == {"value": RES_START, "values": None}
+
+
+def test_a_resolution_that_takes_is_applied_and_reads_back_all_five_fields() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(
+        registry, flame, "res_full", {"width": 800, "height": 1080, "bit_depth": 16}
+    )
+    assert result["opError"] is None
+    value = result["value"]
+    assert value["applied"] == ["resolution"] and value["failed"] == {}
+    assert value["after"]["resolution"] == {**RES_START, "width": 800}
+    assert value["before"]["resolution"] == RES_START
+    assert value["changedKeys"] == ["resolution"]
+    assert res_of(h, "res_full") == (800, 1080, 16, 1.7778, "P")
+    assert value["revert"]["args"]["values"] == {"resolution": RES_START}
+
+
+def test_a_resolution_with_only_some_keys_keeps_the_current_value_of_the_others() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(registry, flame, "res_full", {"height": 720})
+    assert result["opError"] is None
+    assert res_of(h, "res_full") == (1920, 720, 16, 1.7778, "P")
+    built = h["res_full"].resolution.set_calls[0]
+    assert type(built).__name__ == "PyResolution"
+
+
+def test_a_resolution_read_by_get_attributes_can_be_written_back_as_it_is() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(
+        registry, flame, "res_full", {**RES_START, "width": 1280, "height": 720}
+    )
+    assert result["opError"] is None
+    assert res_of(h, "res_full") == (1280, 720, 16, 1.7778, "P")
+
+
+def test_writing_the_current_resolution_is_applied_with_nothing_changed() -> None:
+    registry = make_registry()
+    flame, _h = make_resolution_world()
+    result = write_resolution(registry, flame, "res_full", {"width": 1920})
+    assert result["opError"] is None
+    assert result["value"]["applied"] == ["resolution"]
+    assert result["value"]["changedKeys"] == [] and result["value"]["revert"] is None
+
+
+def test_a_bit_depth_the_node_does_not_take_is_a_partial_write_and_names_the_field() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(
+        registry, flame, "res_colour", {"width": 800, "height": 1080, "bit_depth": 10}
+    )
+    assert result["opErrorCode"] == "FLAME_API_ERROR"
+    value = result["value"]
+    assert value["applied"] == []
+    assert value["failed"]["resolution"].startswith("partial:")
+    assert "did not take: bit_depth (asked 10, read back 16)" in value["failed"]["resolution"]
+    assert value["after"]["resolution"] == {**RES_START, "width": 800}
+    assert value["changedKeys"] == ["resolution"]
+    assert result["partial"] == {"applied": 0, "failed": 1}
+    assert res_of(h, "res_colour") == (800, 1080, 16, 1.7778, "P")
+
+
+def test_a_partial_resolution_write_hands_back_a_revert_that_restores_width_and_height() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(
+        registry, flame, "res_colour", {"width": 800, "height": 1080, "bit_depth": 10}
+    )
+    revert = result["value"]["revert"]
+    assert revert is not None and revert["args"]["values"] == {"resolution": RES_START}
+    back = call(registry, revert["op"], revert["args"], flame)
+    assert back["opError"] is None
+    assert res_of(h, "res_colour") == (1920, 1080, 16, 1.7778, "P")
+
+
+def test_colour_source_bit_depths_8_16_32_take_and_12_does_not() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    for depth in (8, 32, 16):
+        assert (
+            write_resolution(registry, flame, "res_colour", {"bit_depth": depth})["opError"] is None
+        )
+        assert res_of(h, "res_colour")[2] == depth
+    result = write_resolution(registry, flame, "res_colour", {"bit_depth": 12})
+    assert result["opErrorCode"] == "SILENT_NOOP"  # 16 -> 12 reads back 16: nothing changed
+
+
+def test_a_resolution_that_does_not_change_at_all_is_a_silent_noop() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(registry, flame, "res_frozen", {"width": 800, "height": 600})
+    assert result["opErrorCode"] == "SILENT_NOOP"
+    value = result["value"]
+    assert value["failed"]["resolution"].startswith("silent_noop")
+    assert value["applied"] == [] and value["changedKeys"] == [] and value["revert"] is None
+    assert value["after"]["resolution"] == RES_START
+    assert len(h["res_frozen"].resolution.set_calls) == 1  # it was attempted
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(800, id="not-a-dict"),
+        pytest.param([800, 600], id="a-list"),
+        pytest.param({"depth": 8}, id="unknown-key"),
+        pytest.param({"type": "PyTime"}, id="wrong-type-tag"),
+        pytest.param({"width": 0}, id="zero-width"),
+        pytest.param({"height": -1}, id="negative-height"),
+        pytest.param({"width": 800.5}, id="float-width"),
+        pytest.param({"width": 800.0}, id="whole-float-width"),
+        pytest.param({"width": True}, id="bool-width"),
+        pytest.param({"width": "800"}, id="string-width"),
+        pytest.param({"bit_depth": 7}, id="bit-depth-7"),
+        pytest.param({"bit_depth": "16"}, id="bit-depth-string"),
+        pytest.param({"bit_depth": True}, id="bit-depth-bool"),
+        pytest.param({"frame_ratio": "1.7"}, id="ratio-string"),
+        pytest.param({"frame_ratio": True}, id="ratio-bool"),
+        pytest.param({"scan_mode": "F9"}, id="unknown-scan-mode"),
+        pytest.param({"scan_mode": 1}, id="scan-mode-int"),
+    ],
+)
+def test_a_malformed_resolution_is_refused_before_anything_is_written(bad: Any) -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(registry, flame, "res_full", bad)
+    assert result["opErrorCode"] == "INVALID_ARGS"
+    assert result["value"]["failed"]["resolution"].startswith("rejected")
+    assert h["res_full"].resolution.set_calls == []
+
+
+def test_a_rejected_resolution_stops_the_other_keys_too() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = set_call(
+        registry,
+        "node.set_attributes",
+        res_node("res_full"),
+        {"pos_x": 9.0, "resolution": {"width": 0}},
+        flame,
+    )
+    assert result["opErrorCode"] == "INVALID_ARGS"
+    assert h["res_full"].pos_x.get_value() == 0.0
+
+
+@pytest.mark.parametrize("bit_depth", [8, 10, 12, 16, 32])
+def test_every_bit_depth_flame_has_is_accepted_up_front(bit_depth: int) -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = write_resolution(registry, flame, "res_full", {"bit_depth": bit_depth})
+    assert result["opError"] is None
+    assert res_of(h, "res_full")[2] == bit_depth
+
+
+def test_the_scan_mode_it_already_has_is_accepted() -> None:
+    registry = make_registry()
+    flame, _h = make_resolution_world()
+    assert write_resolution(registry, flame, "res_full", {"scan_mode": "P"})["opError"] is None
+
+
+def test_a_frame_ratio_is_written_as_a_number() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    assert write_resolution(registry, flame, "res_full", {"frame_ratio": 1.0})["opError"] is None
+    assert res_of(h, "res_full")[3] == 1.0
+    assert write_resolution(registry, flame, "res_full", {"frame_ratio": 2})["opError"] is None
+
+
+def test_the_resolution_of_a_clip_node_is_read_by_node_info_without_a_type_tag() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    clip_node = h["bg1"].add_clip_node("clipnode")
+    result = call(registry, "node.info", {"target": res_node("clipnode")}, flame)
+    assert result["value"]["clip"]["resolution"] == {
+        "width": 1920,
+        "height": 1080,
+        "bit_depth": 10,
+        "scan_mode": "P",
+        "frame_ratio": 1.7778,
+    }
+    assert clip_node is not None
+
+
+def test_desktop_get_attributes_reads_a_resolution_the_same_way() -> None:
+    registry = make_registry()
+    flame, h = build_default_tree()
+    add_attr(h["clip1"], "resolution", ResolutionAttr(PyResolution(1920, 1080, 16)))
+    result = call(
+        registry,
+        "desktop.get_attributes",
+        {
+            "target": {"kind": "wiretap", "id": "/projects/p/ws/P1O/R1/clip1"},
+            "keys": ["resolution"],
+        },
+        flame,
+    )
+    assert attr_of(result, "resolution") == RES_START
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "node.get_attributes",
+        "node.set_attributes",
+        "desktop.get_attributes",
+        "desktop.set_attributes",
+        "batch.get_attributes",
+        "segment.set_attributes",
+    ],
+)
+def test_the_attribute_ops_declare_the_pyresolution_names_they_use(op_name: str) -> None:
+    op = make_registry().get(op_name)
+    assert op is not None
+    for symbol in (
+        "flame.PyResolution",
+        "PyResolution.width",
+        "PyResolution.height",
+        "PyResolution.bit_depth",
+        "PyResolution.frame_ratio",
+        "PyResolution.scan_mode",
+    ):
+        assert symbol in op.requires, (op_name, symbol)
+
+
+def test_set_attributes_description_says_how_a_resolution_is_written() -> None:
+    op = make_registry().get("node.set_attributes")
+    assert op is not None
+    assert "bit_depth" in op.description and "FLAME_API_ERROR" in op.description
+    assert "8 / 16 / 32" in op.description
+
+
+def test_a_dict_written_to_a_scalar_attribute_is_refused() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    result = set_call(
+        registry, "node.set_attributes", res_node("res_full"), {"pos_x": {"a": 1}}, flame
+    )
+    assert result["opErrorCode"] == "INVALID_ARGS"
+    assert result["value"]["failed"]["pos_x"].startswith("rejected")
+    assert h["res_full"].pos_x.get_value() == 0.0
+
+
+class UnreadableRatio(PyResolution):
+    @property
+    def frame_ratio(self) -> float:
+        raise RuntimeError("cannot read")
+
+    @frame_ratio.setter
+    def frame_ratio(self, value: float) -> None:
+        pass
+
+
+UnreadableRatio.__name__ = "PyResolution"
+
+
+def test_a_resolution_whose_field_cannot_be_read_needs_that_field_to_be_given() -> None:
+    registry = make_registry()
+    flame, h = make_resolution_world()
+    h["res_full"].resolution = SpyAttr(UnreadableRatio(1920, 1080, 16))
+    refused = write_resolution(registry, flame, "res_full", {"width": 800})
+    assert refused["opErrorCode"] == "INVALID_ARGS"
+    assert "frame_ratio cannot be read" in refused["value"]["failed"]["resolution"]
+    assert h["res_full"].resolution.set_calls == []
+    given = write_resolution(registry, flame, "res_full", {"width": 800, "frame_ratio": 1.7778})
+    assert given["opError"] is None, given
+
+
+class LiveResolutionAttr(SpyAttr):
+    """get_value answers the same object every time and set_value changes it in place (a live
+    reference, not a snapshot)."""
+
+    def set_value(self, value: Any) -> None:
+        self.set_calls.append(value)
+        for field in ("width", "height", "bit_depth", "frame_ratio", "scan_mode"):
+            setattr(self._value, field, getattr(value, field))
+
+
+LiveResolutionAttr.__name__ = "PyAttribute"
+
+
+def test_a_value_that_is_a_live_reference_is_still_seen_as_changed() -> None:
+    registry = make_registry()
+    flame, h = make_batch_world()
+    node = PyNode(
+        "live1",
+        "Colour Source",
+        extra={"resolution": LiveResolutionAttr(PyResolution(1920, 1080, 16))},
+    )
+    node._owner = h["bg1"]
+    h["bg1"].nodes.append(node)
+    result = write_resolution(registry, flame, "live1", {"width": 800})
+    assert result["opError"] is None
+    assert result["value"]["changedKeys"] == ["resolution"]
+    assert result["value"]["before"]["resolution"]["width"] == 1920
+    assert result["value"]["revert"]["args"]["values"]["resolution"]["width"] == 1920

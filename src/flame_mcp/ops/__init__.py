@@ -12,7 +12,9 @@ from flame_mcp.ops import (
     batch,
     checkpoints,
     desktop,
+    desktop_arrange,
     desktop_delete,
+    desktop_list,
     desktop_media,
     desktop_read,
     desktop_reformat,
@@ -21,9 +23,11 @@ from flame_mcp.ops import (
     library,
     mediahub,
     node,
+    node_edit_setup,
     plan,
     project,
     render,
+    render_clip,
     segment,
     segment_connect,
     segment_edit,
@@ -43,7 +47,9 @@ def register_all(registry: Registry) -> None:
     project.register(registry)
     desktop.register(registry)
     desktop_read.register(registry)
+    desktop_list.register(registry)
     desktop_media.register(registry)
+    desktop_arrange.register(registry)
     desktop_delete.register(registry)
     desktop_reformat.register(registry)
     mediahub.register(registry)
@@ -61,8 +67,10 @@ def register_all(registry: Registry) -> None:
     segment_extract.register(registry)
     batch.register(registry)
     node.register(registry)
+    node_edit_setup.register(registry)
     action.register(registry)
     render.register(registry)
+    render_clip.register(registry)
     journal.register(registry)
     checkpoints.register(registry)
     eval.register(registry)

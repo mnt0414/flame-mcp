@@ -110,13 +110,28 @@ def test_revert_is_a_conflict_when_the_clip_was_edited_after_the_reformat(rig: R
     assert clip_format(reel(rig).children[-1])["width"] == 1920
 
 
+def test_revert_is_a_conflict_when_the_format_was_changed_by_hand_after_the_reformat(
+    rig: Rig,
+) -> None:
+    clip = rig.handles["clipx"]
+    env = reformat(rig)
+    clip.bit_depth = 12  # not seen by the segment fingerprint, and not in any journal group
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
+    assert "bitDepth" in out["error"] and "force=true" in out["error"]
+    assert not out["result"].get("newerGroups")
+    assert clip.width == 960 and clip in reel(rig).children
+    assert stash_entries(rig) and len(reel(rig).children) == len(set(map(uid, reel(rig).children)))
+
+
 def test_revert_is_a_conflict_when_a_later_reformat_changed_the_format_again(rig: Rig) -> None:
     clip = rig.handles["clipx"]
     first = reformat(rig, width=1280, height=720)
-    reformat(rig, [wt(clip.get_wiretap_node_id())], width=640, height=360)
+    second = reformat(rig, [wt(clip.get_wiretap_node_id())], width=640, height=360)
     out = revert(rig, first)
     assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
-    assert "format" in out["error"] and (clip.width, clip.height) == (640, 360)
+    assert [r["group"] for r in out["result"]["newerGroups"]] == [second["journal"]["group"]]
+    assert (clip.width, clip.height) == (640, 360)
     assert "force=true" in out["error"]
     assert first["journal"]["group"] not in [
         r.get("reverts") for r in rig.records() if r["type"] == "intent"
@@ -227,6 +242,27 @@ def test_revert_of_a_duplicate_is_a_conflict_when_the_copy_was_changed(rig: Rig)
     out = revert(rig, env)
     assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
     assert made in reel(rig).children
+
+
+def test_a_revert_with_a_conflict_and_a_timeout_reports_the_timeout_and_names_its_group(
+    rig: Rig,
+) -> None:
+    env = reformat(rig, [CLIPX, sel(rig, "a"), sel(rig, "b")], duplicate=True)
+    copy_of_a = next(c for c in reversed(reel(rig).children) if str(c.name.get_value()) == "A")
+    copy_of_a.name.set_value("renamed")
+    # the revert goes b, a, CLIPX; each is a format read and a revert call: the revert of a is a
+    # CONFLICT (calls 2 and 3), the revert call of CLIPX (call 5) loses its answer after it ran
+    rig.exec.fault(OP, "TIMEOUT", when="after", skip=5)
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "TIMEOUT", out
+    unresolved = out["result"]["unresolved"]
+    assert len(unresolved) == 1 and unresolved[0]["errorCode"] == "TIMEOUT"
+    lost = unresolved[0]["group"]
+    assert out["journal"]["group"] == lost and lost in out["journal"]["groups"]
+    assert [f["errorCode"] for f in out["result"]["notRestored"]] == ["CONFLICT", "TIMEOUT"]
+    assert rig.runtime.guard.denial() is not None
+    assert rig.do("journal.check", {"group": lost})["ok"] is True
+    assert rig.runtime.guard.denial() is None
 
 
 def test_revert_of_duplicates_of_several_clips_deletes_each_copy(rig: Rig) -> None:

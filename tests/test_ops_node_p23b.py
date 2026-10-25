@@ -917,22 +917,23 @@ def test_readonly_hides_every_new_write_but_not_the_reads(
     assert ro.do("node.info", {"target": COMP})["ok"] is True
 
 
-def test_plan_run_refuses_a_step_that_takes_its_own_checkpoint(rig: Rig) -> None:
+def test_plan_run_bundles_a_step_that_runs_behind_a_checkpoint(rig: Rig) -> None:
     for op_name, args in (
         ("node.create", {"target": BG1, "type": "Blur"}),
         ("node.delete", {"target": BLUR}),
         ("node.connect", {"source": BLUR, "target": COMP}),
         ("node.disconnect", {"target": COMP}),
-        ("node.duplicate", {"target": BLUR}),
-        ("node.load_setup", {"target": EXPO, "path": "/x"}),
     ):
         env = rig.do("plan.run", {"steps": [{"op": op_name, "args": args}]})
-        assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", op_name
-        assert "cannot be a plan step" in str(env["result"]["issues"]), op_name
-    assert len(names(rig)) == 4 and sent(rig) == [] and rig.records() == []
+        assert env["ok"] is True, (op_name, env)
+        assert env["result"]["batch"]["checkpoint"], op_name
+        assert env["journal"] == {"group": env["result"]["group"]}, op_name
+        back = rig.do("journal.revert", {"group": env["result"]["group"]})
+        assert back["ok"] is True, (op_name, back)
+    assert len(names(rig)) == 4
 
 
-def test_the_plan_run_description_names_every_refused_node_op(rig: Rig) -> None:
+def test_the_plan_run_description_names_every_bundled_node_op(rig: Rig) -> None:
     op = rig.registry.get("plan.run")
     assert op is not None
     text = " ".join(op.description.split())

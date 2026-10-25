@@ -34,8 +34,10 @@ Stages
      revert.
   d  desktop.delete: a clip, a sequence, a list of two (gone, stashed, revert puts them back: new
      uid, same fingerprint, end of the reel); a library clip is refused; a shown sequence is shown
-     again after the revert; another shown sequence stays shown; a reel / reel group / Batch reel
-     clip / stash entry / the same thing twice / a plan are refused; a gone parent is a CONFLICT.
+     again after the revert; another shown sequence stays shown; a reel with a clip / reel group /
+     Batch reel clip / stash entry / the same thing twice / a plan are refused; an empty reel is
+     deleted without a stash and the revert makes a new empty reel of the same name (where it
+     lands in the group is OBSERVED); a gone parent is a CONFLICT.
   m  desktop.move: the sequence in front of the shown one is moved, the Timeline stays on it.
   g  journal.purge_checkpoints: dry run by default, the unknown copy is reported and kept, a real
      run (given the dry run's token) deletes the recorded copies, a purged checkpoint cannot be

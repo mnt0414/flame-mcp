@@ -2,7 +2,7 @@
 
 smart_replace_media / smart_replace keep the OFFSET FROM THE START OF THE CLIP (not the source
 timecode), a clip too short for the range changes nothing and raises nothing (SILENT_NOOP), the
-TimelineFX stay or go with the mode, and a replacement is brought back to a wanted source timecode
+Timeline FX stay or go with the mode, and a replacement is brought back to a wanted source timecode
 with `segment.slip`. Run through the real Runtime over the fake Flame tree
 (fake_segment_edit.smart_replace_with follows what was measured on Flame 2025.2.4)."""
 
@@ -101,6 +101,23 @@ def test_the_effects_stay_in_media_mode_and_are_replaced_in_media_and_fx_mode(ri
     assert both["ok"] is True, both
     assert effect_names(seg_b(rig)) == ["Blur"]
     assert both["result"]["effects"] == {"before": ["Burn-in Letterbox"], "after": ["Blur"]}
+
+
+def test_a_segment_with_a_timewarp_gets_a_notice_about_its_setup(rig: Rig) -> None:
+    seg = seg_a(rig)
+    seg.effects.append(PyTimelineFX("Timewarp"))
+    new = add_media_clip(rig, "replacement", start=0, length=48)
+    got = replace(rig, a_seg(), clip_sel(new))
+    assert got["ok"] is True, got
+    notices = [str(n) for n in got["result"]["notices"]]
+    assert any("Timewarp" in n and "effect_save_setup" in n for n in notices), notices
+
+
+def test_a_segment_without_a_timewarp_gets_no_timewarp_notice(rig: Rig) -> None:
+    new = add_media_clip(rig, "replacement2", start=0, length=48)
+    got = replace(rig, a_seg(), clip_sel(new))
+    assert got["ok"] is True, got
+    assert not any("Timewarp" in str(n) for n in got["result"]["notices"]), got["result"]
 
 
 def test_a_clip_too_short_for_the_range_is_a_silent_noop_and_nothing_changes(rig: Rig) -> None:

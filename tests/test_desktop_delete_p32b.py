@@ -256,7 +256,7 @@ def test_a_container_is_refused_and_nothing_is_copied_or_journaled(
 
 def test_a_container_among_valid_targets_stops_the_whole_call(rig: Rig) -> None:
     env = delete(rig, [CLIPX, REEL1])
-    assert env["errorCode"] == "PRECONDITION_UNMET" and "only a clip or a sequence" in env["error"]
+    assert env["errorCode"] == "PRECONDITION_UNMET" and "only an empty reel" in env["error"]
     assert untouched_world(rig)
     assert "CLIPX" in reel_names(reel(rig))
 
@@ -380,7 +380,9 @@ def test_nothing_deleted_is_a_silent_noop(rig: Rig, monkeypatch: pytest.MonkeyPa
     assert list(states.values()) == ["failed"]
 
 
-def test_some_deleted_is_ok_with_partial(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_some_deleted_is_a_partial_error_and_the_deleted_part_can_be_reverted(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     real = rig.flame.delete
 
     def picky(obj: Any, confirm: bool = True) -> bool:
@@ -390,14 +392,36 @@ def test_some_deleted_is_ok_with_partial(rig: Rig, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(rig.flame, "delete", picky)
     env = delete(rig, [S2, S3])
-    assert env["ok"] is True and env["result"]["partial"] is True
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and env["result"]["partial"] is True
     assert env["partial"] == {"deleted": 1, "notDeleted": 1}
     assert [d["from"]["name"] for d in env["result"]["deleted"]] == ["S2"]
     assert env["result"]["notDeleted"][0]["from"]["name"] == "S3"
     assert reel_names(reel(rig)) == ["c1", "S1", "S3", "CLIPX"]
-    assert any("notDeleted" in d for d in env.get("degraded", []))
+    assert env["affected"] == 1 and env["journal"]["revert"] is not None
+    outcome = next(r for r in rig.records() if r["type"] == "outcome")
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert [d["from"]["name"] for d in outcome["created"]["deletes"]] == ["S2"]
+    assert rig.do("journal.list", {})["result"]["items"][0]["state"] == "partial"
     out = revert(rig, env)
     assert out["ok"] is True and len(out["result"]["reverted"]) == 1
+
+
+def test_a_delete_that_answers_false_but_removed_everything_is_ok_with_a_degraded_note(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = rig.flame.delete
+
+    def false_answer(obj: Any, confirm: bool = True) -> bool:
+        real(obj, confirm)
+        return False
+
+    monkeypatch.setattr(rig.flame, "delete", false_answer)
+    env = delete(rig, [S2, S3])
+    assert env["ok"] is True, env
+    assert reel_names(reel(rig)) == ["c1", "S1", "CLIPX"]
+    assert sum("flame.delete answered" in d for d in env["degraded"]) == 2
+    assert env["journal"]["revert"] is not None
 
 
 def test_deleting_the_shown_sequence_is_reported_and_reverting_opens_it_again(rig: Rig) -> None:

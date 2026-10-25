@@ -158,12 +158,15 @@ def _rp_shared_item(seg, target_id, target_pos, cache):
             'parent': _rp_parent_ref(container),
         }
         wid = None if csel is None else csel['id']
-        if wid is not None and wid in cache:
-            positions = cache[wid]
+        key = wid
+        if key is None:
+            key = ('unaddressed', id(container))
+            cache.setdefault(('keepalive',), []).append(container)
+        if key in cache:
+            positions = cache[key]
         else:
             positions = _rp_positions(container)
-            if wid is not None:
-                cache[wid] = positions
+            cache[key] = positions
         found = positions.get(_rp_key(seg), [])
     except BaseException as exc:
         item['error'] = str(exc) or type(exc).__name__
@@ -223,6 +226,14 @@ def _rp_media_basics(obj):
         'width': _rp_try(lambda: _ja(obj.width)),
         'height': _rp_try(lambda: _ja(obj.height)),
         'audioTracks': _rp_try(lambda: len(list(obj.audio_tracks))),
+    }
+
+
+def _rp_size_facts(obj):
+    return {
+        'width': _try(lambda: _ja(obj.width)),
+        'height': _try(lambda: _ja(obj.height)),
+        'bitDepth': _try(lambda: _ja(obj.bit_depth)),
     }
 
 

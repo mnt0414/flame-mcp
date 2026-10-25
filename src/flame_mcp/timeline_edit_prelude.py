@@ -12,7 +12,7 @@ What it encodes (measured on Flame 2025.2.4):
   - `seg.slip(n)` moves source_in (and source_out) by -n: n > 0 takes the source toward its head.
     record is unchanged, head goes by -n and tail by +n. The return value False is not a failure,
     and an amount beyond the handle does not raise: it stops at the handle (+ at head, - at tail).
-  - `seg.smart_replace_media(clip)` (TimelineFX kept) / `seg.smart_replace(clip)` (TimelineFX
+  - `seg.smart_replace_media(clip)` (Timeline FX kept) / `seg.smart_replace(clip)` (Timeline FX
     replaced too) answer None. They keep the same offset from the start of the clip, not the source
     timecode; record and head are unchanged, tail follows the new media's length. A clip too short
     for the range changes nothing and raises nothing. source_name becomes the new clip's name. The
@@ -154,6 +154,7 @@ def _te_slip_check(seg, parent, offset):
     _tl_judge_source(seg, out)
     if out['error'] is not None:
         return out
+    _tl_judge_handles(out)
     before = out['before']
     edge = 'head' if offset > 0 else 'tail'
     handle = before[edge]
@@ -184,7 +185,7 @@ def _te_slip(seg, parent, version, track, offset):
         track=None,
         returned=None,
         deltas=None,
-        expectedDeltas=_tl_expected_shown(expected, out['sourceJudged']),
+        expectedDeltas=_tl_expected_shown(expected, out['sourceJudged'], out['handleJudged']),
         requested=offset,
         moved=None,
         ran=True,
@@ -218,7 +219,7 @@ def _te_slip_judge(out, parent, version, track, numbers, expected, after_rows):
     out['deltas'] = _tl_deltas(numbers, _tl_seg_numbers(found))
     out['moved'] = numbers['sourceIn'] - found.source_in.frame
     out['position'] = _tl_position(parent, version, track, index, found)
-    if not _tl_deltas_match(out['deltas'], expected, out['sourceJudged']):
+    if not _tl_deltas_match(out['deltas'], expected, out['sourceJudged'], out['handleJudged']):
         return _te_fail(
             out,
             'FLAME_API_ERROR',
@@ -226,7 +227,9 @@ def _te_slip_judge(out, parent, version, track, numbers, expected, after_rows):
             'source moved by ' + str(out['moved']) + ' (expected ' + repr(out['expectedDeltas'])
             + ', read back ' + repr(out['deltas'])
             + (', source side not judged: ' + out['sourceNotJudgedBecause']
-               if not out['sourceJudged'] else '') + ')',
+               if not out['sourceJudged'] else '')
+            + (', handle not judged: ' + out['handleNotJudgedBecause']
+               if out['handleNotJudgedBecause'] is not None else '') + ')',
         )
     return out
 
@@ -253,6 +256,15 @@ def _te_replace_check(seg, parent, source, mode):
 
 
 _TE_REPLACE_KEYS = ('sourceName', 'sourceIn', 'sourceOut', 'head', 'tail')
+_TE_TIMEWARP_NOTICE = (
+    'this segment has a Timewarp: a replace can move its setup (measured on Flame 2025.2.4: '
+    'TW_AnchorOffset of a default Timewarp, the timing keys of one with keys, by the length of '
+    'the head). To keep it, save it before with segment.effect_save_setup and load it after with '
+    'segment.effect_load_setup, each as a call of its own. Saving or loading in the same Flame '
+    'call as the replace left clips put on a sequence later in the session with an extra Image '
+    'effect, and Flame 2025.2.4 later hung or crashed in save_setup (seen on Flame 2025.2.4 and '
+    '2026.2.3), so this op does not do it for you'
+)
 
 
 def _te_replace_key(facts, key):
@@ -277,6 +289,8 @@ def _te_replace(seg, parent, version, track, source, mode):
         warnings=[],
         ran=True,
     )
+    if 'Timewarp' in out['effects']['before']:
+        out['notices'].append(_TE_TIMEWARP_NOTICE)
     before = out['before']
     if mode == 'media':
         returned = seg.smart_replace_media(source)
@@ -683,10 +697,23 @@ def _te_save_setup(seg, parent, fx_type, path, overwrite):
     fx = _te_fx_find(seg, fx_type)
     directory, name = os.path.split(path)
     before = _dir_files(directory)
-    out.update(ran=True, requestedPath=path, returned=None, files=[], overwritten=[], warnings=[])
+    out.update(
+        ran=True, requestedPath=path, returned=None, files=[], overwritten=[], warnings=[],
+        madePrivate=[], notMadePrivate={},
+    )
     out['returned'] = _ja(fx.save_setup(path))
     after = _dir_files(directory)
     written = sorted(p for p in after if p not in before or after[p] != before[p])
+    named = [p for p in written if os.path.basename(p).startswith(name)]
+    stray = [p for p in written if p not in named]
+    out['madePrivate'], out['notMadePrivate'] = _make_files_private(named)
+    if out['notMadePrivate']:
+        out['warnings'].append(
+            'these files could not be made 0600 and keep the mode Flame gave them: '
+            + repr(sorted(out['notMadePrivate']))
+        )
+    for p in stray:
+        out['notMadePrivate'][p] = 'not named after the file asked for'
     out['files'] = [{'path': p, 'size': after[p][1]} for p in written]
     out['overwritten'] = [p for p in written if p in before]
     if not written:
@@ -696,7 +723,6 @@ def _te_save_setup(seg, parent, fx_type, path, overwrite):
             'save_setup returned ' + repr(out['returned']) + ' and ' + repr(directory)
             + ' has no new or changed file',
         )
-    stray = [p for p in written if not os.path.basename(p).startswith(name)]
     if stray:
         out['warnings'].append(
             'files that do not start with the name asked for appeared: ' + repr(stray)

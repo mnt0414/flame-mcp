@@ -44,11 +44,12 @@ from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution, opschema
 from flame_mcp.callargs import apply_limit_default, apply_param_defaults
 from flame_mcp.checkpointed import run_declared
-from flame_mcp.journal import Index, Journal
+from flame_mcp.journal import Index, Journal, new_id
 from flame_mcp.journaled_write import run_journaled_write
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import Denial, Policy, deny_operation
 from flame_mcp.registry import RegisteredOperation, Registry
+from flame_mcp.setup_work import set_journal_directory
 from flame_mcp.types import ServerOpError
 
 TEST_PAUSE_ENV: Final[str] = "FLAME_MCP_TEST_PAUSE_AFTER_PREREAD"
@@ -136,10 +137,14 @@ class TestHooks:
 
 @dataclass(frozen=True)
 class BlockedIntent:
+    """`recorded` is False for a block that has no journal intent (a stash / checkpoint copy or a
+    purge batch that ended without an answer): `journal.check` lifts it by reading Flame again."""
+
     intent_id: str
     group: str
     op: str
     reason: str
+    recorded: bool = True
 
 
 class WriteGuard:
@@ -152,6 +157,16 @@ class WriteGuard:
     def block(self, intent_id: str, group: str, op: str, reason: str) -> None:
         with self._lock:
             self._blocked[intent_id] = BlockedIntent(intent_id, group, op, reason)
+
+    def block_unrecorded(self, group: str | None, op: str, reason: str) -> str:
+        """Shuts the guard for a call that left no journal intent and returns the id of the block
+        (`group` is "" when the call had none)."""
+        block_id = new_id("u")
+        with self._lock:
+            self._blocked[block_id] = BlockedIntent(
+                block_id, group or "", op, reason, recorded=False
+            )
+        return block_id
 
     def release(self, intent_id: str) -> bool:
         with self._lock:
@@ -167,6 +182,18 @@ class WriteGuard:
             return None
         first = blocked[0]
         more = f" (and {len(blocked) - 1} more)" if len(blocked) > 1 else ""
+        if not first.recorded:
+            return Denial(
+                message=(
+                    f"writes are refused: {first.op} ended without an answer ({first.reason}) and "
+                    f"left no journal record, so it is not known what it did{more}"
+                ),
+                hint=(
+                    "Run journal.check (without group) to read Flame again: it lists the stashed "
+                    "copies no checkpoint accounts for, and writes resume once it has read Flame. "
+                    "Do not retry the call. Reads are not affected."
+                ),
+            )
         return Denial(
             message=(
                 f"writes are refused: it is not known whether journaled write group "
@@ -213,8 +240,12 @@ class Runtime:
     journal: Journal
     run_dir: Path | None = None
     hooks: TestHooks = field(default_factory=TestHooks)
+    permissions: dict[str, Any] | None = None
     guard: WriteGuard = field(default_factory=WriteGuard)
     write_lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def __post_init__(self) -> None:
+        set_journal_directory(self.journal.directory)
 
     def call(
         self,
@@ -294,7 +325,14 @@ class Runtime:
         precondition: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
-        if op.effect != "read":
+        if op.effect == "read":
+            return self._dispatch(
+                op, op_args, started, group, reverts, reverts_intent, precondition
+            )
+        # The guard is read only once `write_lock` is held: a write that waited for the lock
+        # while another one ended without an answer must see that block. The lock is re-entrant,
+        # so the steps and inner calls of this op take it again without waiting.
+        with self.write_lock:
             denial = self.guard.denial()
             if denial is not None:
                 return envelope_mod.from_pre_bridge_error(
@@ -304,6 +342,20 @@ class Runtime:
                     duration_ms=_elapsed_ms(started),
                     hint=denial.hint,
                 )
+            return self._dispatch(
+                op, op_args, started, group, reverts, reverts_intent, precondition
+            )
+
+    def _dispatch(
+        self,
+        op: RegisteredOperation,
+        op_args: dict[str, Any],
+        started: float,
+        group: str | None,
+        reverts: str | None,
+        reverts_intent: str | None,
+        precondition: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
         if op.thread == "server":
             return self._run_server_op(op, op_args, started)
         if op.wrap is not None:

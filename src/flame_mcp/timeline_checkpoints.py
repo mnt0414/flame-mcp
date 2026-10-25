@@ -32,6 +32,7 @@ from flame_mcp import execution
 from flame_mcp.checkpoints import CHECKPOINT_TIMEOUT_S
 from flame_mcp.journal import new_id, now_iso
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -138,6 +139,7 @@ def run_timeline_checkpoint(
     with rt.write_lock:
         env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
         if env.get("ok") is not True:
+            shut_if_unanswered(rt.guard, env, op.name, group)
             return env
         raw = env.get("result")
         result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}

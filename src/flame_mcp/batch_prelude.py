@@ -199,8 +199,15 @@ def _add_clips(batch, reel_name, reel_kind, clips):
                 'SELECTOR_TYPE',
                 'clips[' + str(i) + '] is a ' + type(c).__name__ + ', not a PyClip / PySequence',
             )
-    nodes_before = [_v(n.name) for n in list(batch.nodes)]
     clips_before = _entry_names(reel)
+    if clips_before is None:
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            'the reel ' + repr(reel_name) + ' cannot be read before the copy, so what the copy '
+            'adds could not be checked: nothing was copied',
+        )
+    requested = [_try(lambda c=c: _v(c.name)) for c in clips]
+    nodes_before = [_v(n.name) for n in list(batch.nodes)]
     returned = flame.media_panel.copy(clips[0] if len(clips) == 1 else list(clips), reel)
     nodes_after = [_v(n.name) for n in list(batch.nodes)]
     clips_after = _entry_names(reel)
@@ -214,17 +221,43 @@ def _add_clips(batch, reel_name, reel_kind, clips):
             remaining.remove(n)
         else:
             new_nodes.append(n)
+    applied = None
+    not_applied = None
     added = None
-    if clips_before is not None and clips_after is not None:
+    if clips_after is not None:
         added = len(clips_after) - len(clips_before)
+        left = list(clips_before)
+        applied = []
+        for n in clips_after:
+            if n in left:
+                left.remove(n)
+            else:
+                applied.append(n)
+        wanted = list(requested)
+        for n in applied:
+            if n in wanted:
+                wanted.remove(n)
+        not_applied = wanted
     error = None
-    if added != len(clips):
+    error_code = None
+    if clips_after is None:
         error = (
-            'copy returned without an error but the reel gained '
-            + repr(added)
-            + ' clip(s) / sequence(s), expected '
-            + str(len(clips))
+            'the reel ' + repr(reel_name) + ' cannot be read after the copy, so what it added is '
+            'not known: the copy may have been written'
         )
+        error_code = 'FLAME_API_ERROR'
+    elif added == 0:
+        error = (
+            'copy returned without an error but the reel gained 0 clip(s) / sequence(s), '
+            'expected ' + str(len(clips))
+        )
+        error_code = 'SILENT_NOOP'
+    elif added != len(clips):
+        error = (
+            'partial: copy returned without an error but the reel gained ' + repr(added)
+            + ' clip(s) / sequence(s), expected ' + str(len(clips))
+        )
+        error_code = 'FLAME_API_ERROR'
     expected_nodes = len(clips) if label == 'schematic' else 0
     return {
         'reel': {'name': reel_name, 'kind': label},
@@ -232,6 +265,8 @@ def _add_clips(batch, reel_name, reel_kind, clips):
         'requested': len(clips),
         'returned': len(copied),
         'copied': copied,
+        'applied': applied,
+        'notApplied': not_applied,
         'reelClipsBefore': clips_before,
         'reelClipsAfter': clips_after,
         'clipNodesAdded': new_nodes,
@@ -240,6 +275,7 @@ def _add_clips(batch, reel_name, reel_kind, clips):
         'nodesBefore': len(nodes_before),
         'nodesAfter': len(nodes_after),
         'error': error,
+        'errorCode': error_code,
     }
 
 
@@ -272,6 +308,17 @@ def _organize(batch):
     }
 
 
+def _iteration_is_new(row, before):
+    # a row `before` lacks: by uid when both sides have one, else by number
+    for old in before:
+        if row['uid'] is not None and old['uid'] is not None:
+            if row['uid'] == old['uid']:
+                return False
+        elif row['number'] == old['number']:
+            return False
+    return True
+
+
 def _iterate(batch, index, overwrite):
     before = _iteration_rows(batch)
     numbers = [row['number'] for row in before]
@@ -284,27 +331,61 @@ def _iterate(batch, index, overwrite):
         )
     created = batch.iterate() if index is None else batch.iterate(index=index)
     after = _iteration_rows(batch)
+    fresh = [row for row in after if _iteration_is_new(row, before)]
     number = _try(lambda: _ja(created.iteration_number))
+    after_numbers = [row['number'] for row in after]
     error = None
-    if created is None or number is None:
-        error = 'iterate returned ' + repr(type(created).__name__) + ' without a number'
-    elif index is not None and number != index:
-        error = 'iterate(index=' + str(index) + ') made iteration ' + repr(number)
-    elif number not in [row['number'] for row in after]:
-        error = 'iteration ' + repr(number) + ' is not in batch_iterations afterwards'
-    return {
+    error_code = None
+    notes = []
+    if not fresh and not (overwrites and number == index and index in after_numbers):
+        error = (
+            'iterate returned ' + repr(type(created).__name__) + ' (number ' + repr(number)
+            + ') but batch_iterations gained no iteration (had ' + repr(numbers) + ', now '
+            + repr(after_numbers) + ')'
+        )
+        error_code = 'SILENT_NOOP'
+    elif len(fresh) > 1:
+        error = (
+            'partial: iterate made ' + str(len(fresh)) + ' iterations ' + repr(
+                [row['number'] for row in fresh]
+            ) + ', not one'
+        )
+        error_code = 'FLAME_API_ERROR'
+    elif fresh and index is not None and fresh[0]['number'] != index:
+        error = (
+            'partial: iterate(index=' + str(index) + ') made iteration '
+            + repr(fresh[0]['number']) + ' instead'
+        )
+        error_code = 'FLAME_API_ERROR'
+    elif fresh and number is None:
+        notes.append(
+            'iterate returned ' + repr(type(created).__name__) + ' without a number; the new '
+            'iteration is number ' + repr(fresh[0]['number']) + ' in batch_iterations'
+        )
+    elif fresh and number != fresh[0]['number']:
+        notes.append(
+            'iterate returned iteration ' + repr(number) + ' but the new iteration in '
+            'batch_iterations is number ' + repr(fresh[0]['number'])
+        )
+    shown = fresh[0] if fresh else None
+    out = {
         'iteration': {
-            'name': _try(lambda: _v(created.name)),
-            'number': number,
-            'uid': _try(lambda: _v(created.uid)),
+            'name': _try(lambda: _v(created.name)) if shown is None else shown['name'],
+            'number': number if shown is None else shown['number'],
+            'uid': _try(lambda: _v(created.uid)) if shown is None else shown['uid'],
         },
         'requestedIndex': index,
         'overwrote': overwrites,
         'iterationsBefore': before,
         'iterationsAfter': after,
+        'newIterations': [row['number'] for row in fresh],
         'currentIterationNumber': _try(lambda: _ja(batch.current_iteration_number)),
         'error': error,
+        'errorCode': error_code,
     }
+    if notes:
+        out['degradedNotes'] = notes
+    return out
 
 
 def _setup_files(directory):
@@ -343,6 +424,7 @@ def _save_setup(batch, path, overwrite):
     after = _setup_files(directory)
     written = sorted(p for p in after if p not in before or after[p] != before[p])
     overwritten = [p for p in written if p in before]
+    made_private, not_made_private = _make_files_private(written)
     error = None
     if returned is not True:
         error = 'save_setup returned ' + repr(_ja(returned)) + ' (expected True)'
@@ -359,6 +441,8 @@ def _save_setup(batch, path, overwrite):
         'size': os.path.getsize(written[0]) if len(written) == 1 else None,
         'written': written,
         'overwritten': overwritten,
+        'madePrivate': made_private,
+        'notMadePrivate': not_made_private,
         'saveSetupReturned': _ja(returned),
         'batch': {'uid': _try(lambda: _v(batch.uid)), 'name': _try(lambda: _v(batch.name))},
         'error': error,

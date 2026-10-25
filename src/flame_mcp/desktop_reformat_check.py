@@ -143,10 +143,13 @@ def _stash_advice(view: IntentView) -> str:
     )
 
 
-def _moved_clip(ctx: ServerContext, intent: Mapping[str, Any]) -> dict[str, Any] | None:
+def _moved_clip(
+    ctx: ServerContext, intent: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """`PyClip.reformat` gives the clip a new uid, and a write that ended without an answer left
     no outcome that says which: the one entry of the clip's reel that was not there when the call
-    began and has the clip's name. None when there is not exactly one."""
+    began and has the clip's name. Returns (that entry, or None when there is not exactly one;
+    the failed envelope, when Flame could not be read)."""
     source = intent.get("source") or {}
     parent = source.get("parent") or {}
     env = observe(
@@ -160,13 +163,13 @@ def _moved_clip(ctx: ServerContext, intent: Mapping[str, Any]) -> dict[str, Any]
         },
     )
     if env.get("ok") is not True:
-        return None
+        return None, env
     new = [
         r
         for r in (env.get("result") or {}).get("new") or []
         if isinstance(r, dict) and r.get("name") == source.get("name")
     ]
-    return new[0] if len(new) == 1 else None
+    return (new[0] if len(new) == 1 else None), None
 
 
 def _check_in_place(ctx: ServerContext, view: IntentView) -> CheckVerdict:
@@ -181,13 +184,17 @@ def _check_in_place(ctx: ServerContext, view: IntentView) -> CheckVerdict:
     found = rows.get(str(uid)) or {}
     now: dict[str, Any] | None = None
     if not found.get("found"):
-        now = _moved_clip(ctx, intent)
+        now, unread = _moved_clip(ctx, intent)
+        if unread is not None:
+            return VERDICT_UNKNOWN, str(unread.get("errorCode")), {"error": unread.get("error")}
         if now is not None:
             rows, env = observe_items(
                 ctx,
                 [{"uid": now.get("uid"), "uids": [now.get("uid")], "parent": source.get("parent")}],
             )
-            found = (rows or {}).get(str(now.get("uid"))) or {}
+            if rows is None:
+                return VERDICT_UNKNOWN, str(env.get("errorCode")), {"error": env.get("error")}
+            found = rows.get(str(now.get("uid"))) or {}
     if not found.get("found"):
         return (
             STATE_DIVERGED,

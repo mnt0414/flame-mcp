@@ -2,9 +2,11 @@
 """Real-Flame end-to-end: `plan.run` (run with the `.venv` Python;
 `scripts/run_e2e.sh p2_2b_plan` starts Flame).
 
-Checks: `plan.run`: several writes in one plan share one journal group and one revert; a plan with
-an invalid step runs nothing; a step that fails at run time stops the plan; a plan of reads can
-continue on error; and a read-only server refuses a plan that writes.
+Checks: `plan.run`. Several writes in one plan share one journal group and one revert. A plan with
+an invalid step runs nothing. A step that fails at run time stops the plan. A plan of reads can
+continue on error. A read-only server refuses a plan that writes. A plan of more than ten writes
+answers with `result_detail` `'summary'` by default (every step's `ok` and `brief`; the group
+still reverts as one), while `result_detail` `'full'` keeps each step's result and journal.
 
 Same shape and helpers as scripts/p2_2a_journal_e2e.py (imported from it): a real MCP stdio
 client drives `python -m flame_mcp` against a live Flame + dev bridge; `flame_mcp.transport`
@@ -28,6 +30,11 @@ Stages
      (SELECTOR_EMPTY) and step 3 still runs
   e  a plan with a write and on_error='continue' -> INVALID_ARGS, nothing ran
   f  a READONLY server: a plan with a write is POLICY_DENIED (nothing ran), a plan of reads runs
+  g  eleven set_attributes steps on one node in one plan, result_detail left at its default
+     -> result.detail 'summary', every step carries ok and a brief naming the attribute it
+     applied (and no result, no journal), the node's value read back through transport is the
+     last step's, ONE revert puts it back; the same plan with result_detail='full' -> detail
+     'full', every step carries its result and journal, ONE revert puts the node back again
   z  cross-cutting checks over every envelope (shape, logs/crash; no rider check: every op this
      script calls is a server-side op, whose envelope has no rider); nothing left undecided
 
@@ -72,8 +79,13 @@ from p2_2a_journal_e2e import (
 )
 
 OUTPUT_DIR: Final[Path] = Path.home() / "Library" / "Application Support" / "flame-mcp" / "p2"
-BLUR_NODES: Final[int] = 7  # a: 0-2, b: 3-4, c: 3-4 (again, after b), e: 5, spare: 6
+BLUR_NODES: Final[int] = 7  # a: 0-2, b: 3-4, c: 3-4 (again, after b), e: 5, f and g: 6
 PLAN_LABEL_A: Final[str] = "p2_2b stage a"
+SUMMARY_WRITES: Final[int] = 11  # one more than the writes a plan may hold before 'auto' summarises
+SUMMARY_STEP_KEYS: Final[frozenset[str]] = frozenset({"index", "op", "ok", "errorCode", "brief"})
+FULL_STEP_KEYS: Final[frozenset[str]] = frozenset(
+    {"index", "op", "ok", "errorCode", "error", "result", "journal"}
+)
 
 Results = dict[str, Any]
 
@@ -404,6 +416,83 @@ async def stage_f(ctx: Ctx) -> None:
         rec(ctx, "f_readonly_runs_a_plan_of_reads", reads.get("ok") is True, env=reads)
 
 
+async def stage_g(ctx: Ctx) -> None:
+    node = ctx.ids["nodes"][6]
+    before = await tx_read_pos(ctx, node)
+    wanted = [number_like(before, 100 + i) for i in range(SUMMARY_WRITES)]
+    steps = [set_step(ctx, node, "pos_x", w) for w in wanted]
+    async with server_session(ctx, "g-plain") as session:
+        env = await do(session, ctx, "plan.run", {"steps": steps, "label": "p2_2b stage g"})
+        group = (env.get("journal") or {}).get("group")
+        result = _result_of(env)
+        reported = result.get("steps", [])
+        rec(
+            ctx,
+            "g_a_plan_of_eleven_writes_answers_with_a_summary_by_default",
+            env.get("ok") is True
+            and isinstance(group, str)
+            and result.get("detail") == "summary"
+            and len(reported) == SUMMARY_WRITES
+            and all(set(s) == SUMMARY_STEP_KEYS for s in reported)
+            and [s.get("ok") for s in reported] == [True] * SUMMARY_WRITES
+            and [s.get("index") for s in reported] == list(range(SUMMARY_WRITES))
+            and env.get("partial") == {"done": SUMMARY_WRITES, "failed": 0, "notRun": 0},
+            env=env,
+        )
+        after = await tx_read_pos(ctx, node)
+        rec(
+            ctx,
+            "g_each_brief_names_the_attribute_the_node_now_holds",
+            all(s.get("brief") == {"applied": ["pos_x"]} for s in reported)
+            and same(after, wanted[-1])
+            and len(intents_in(ctx, group)) == SUMMARY_WRITES
+            and state_of(ctx, group) == "landed",
+            viaTransport=after,
+            wanted=wanted[-1],
+            state=state_of(ctx, group),
+        )
+        back = await do(session, ctx, "journal.revert", {"group": group})
+        restored = await tx_read_pos(ctx, node)
+        rec(
+            ctx,
+            "g_one_revert_puts_the_summarised_plan_back",
+            back.get("ok") is True
+            and same(restored, before)
+            and state_of(ctx, group) == "reverted",
+            viaTransport=restored,
+            before=before,
+            env=back,
+        )
+        full = await do(
+            session,
+            ctx,
+            "plan.run",
+            {"steps": steps, "label": "p2_2b stage g full", "result_detail": "full"},
+        )
+        full_group = (full.get("journal") or {}).get("group")
+        full_steps = _result_of(full).get("steps", [])
+        rec(
+            ctx,
+            "g_result_detail_full_keeps_each_steps_result_and_journal",
+            full.get("ok") is True
+            and _result_of(full).get("detail") == "full"
+            and len(full_steps) == SUMMARY_WRITES
+            and all(set(s) == FULL_STEP_KEYS for s in full_steps)
+            and all(isinstance(s.get("result"), dict) for s in full_steps)
+            and all((s.get("journal") or {}).get("group") == full_group for s in full_steps)
+            and same(await tx_read_pos(ctx, node), wanted[-1]),
+            env=full,
+        )
+        undone = await do(session, ctx, "journal.revert", {"group": full_group})
+        rec(
+            ctx,
+            "g_one_revert_puts_the_full_plan_back",
+            undone.get("ok") is True and same(await tx_read_pos(ctx, node), before),
+            before=before,
+            env=undone,
+        )
+
+
 async def stage_z(ctx: Ctx) -> None:
     async with server_session(ctx, "z-plain") as session:
         info = await version_info(session, ctx)
@@ -456,10 +545,11 @@ async def async_main(ctx: Ctx) -> None:
                 ("d", stage_d),
                 ("e", stage_e),
                 ("f", stage_f),
+                ("g", stage_g),
             ):
                 await guarded(ctx, name, stage)
         else:
-            rec(ctx, "prepare_incomplete_stages_a_to_f_skipped", False, ids=ctx.ids)
+            rec(ctx, "prepare_incomplete_stages_a_to_g_skipped", False, ids=ctx.ids)
         await guarded(ctx, "z", stage_z)
     finally:
         cleanup(ctx)

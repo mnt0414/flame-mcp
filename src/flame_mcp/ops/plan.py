@@ -1,6 +1,6 @@
 """`plan` category (thread=server): `plan.run` -- several ops in one call.
 
-The loop runs on the server; every child goes through `ctx.do`, the same door a `flame_do`
+The loop runs on the server; every child goes through `ctx.do`, the same path a `flame_do`
 call uses (policy, argument validation, defaults, the journaled write with its compare-and-swap,
 the fail-closed gate). What the plan adds:
 
@@ -15,10 +15,11 @@ the fail-closed gate). What the plan adds:
 It does not make anything faster (the wait after each Flame call dominates), and it opens no
 undo group: Flame's Python API has none.
 
-A plan that holds a step of a Timeline-checkpointed op (`segment.trim`, slip, replace and
-the effect ops) is one checkpointed write on one sequence / clip instead (`plan_timeline`):
-the segment selectors are resolved up front, the sequence is checkpointed once, the steps run
-without checkpoints of their own and `journal.revert(group)` is one restore. The step's optional
+A plan that holds a step of a checkpointed op is one checkpointed write on one target instead
+(`plan_bundle`): a Timeline-checkpointed op (`segment.trim`, slip, replace and the effect ops) on
+one sequence / clip, or a Batch-checkpointed op (`node.create`, `node.connect`, ...) on one Batch
+group. The selectors are resolved up front, the target is checkpointed once, the steps run without
+checkpoints of their own and `journal.revert(group)` is one restore. The step's optional
 `late: true` leaves a step out of the up-front resolution.
 """
 
@@ -26,12 +27,13 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from flame_mcp import opschema, plan_timeline
+from flame_mcp import opschema, plan_bundle, plan_bundle_batch, plan_bundle_timeline
 from flame_mcp.checkpointed import CheckpointedRun
+from flame_mcp.checkpoints import BATCH_KIND, TIMELINE_KIND
 from flame_mcp.errors import as_error_code
 from flame_mcp.journal import new_id, now_iso
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
@@ -53,26 +55,32 @@ CATEGORY = Category(
     allowed_pacing=frozenset({"none"}),
 )
 
-OWN_GROUP_OPS: Final[frozenset[str]] = frozenset({"batch.load_setup", "journal.restore_checkpoint"})
-"""Ops that checkpoint and journal into a group of their own; a plan cannot revert them. So does
-every op that declares a `CheckpointSpec` (`owns_journal_group`).
+OWN_GROUP_OPS: Final[frozenset[str]] = frozenset(
+    {"batch.load_setup", "journal.restore_checkpoint", "batch.iterate", "batch.create_shelf_reel"}
+)
+"""Ops that checkpoint and journal into a group of their own, or whose result a restore does not
+put back; a plan cannot revert them. A destructive `eval.run` counts too (`owns_journal_group`).
 
-Decision: a plan keeps refusing them (the Batch ones; a Timeline
-checkpointed op is bundled, see `plan_timeline`). A plan's single journal group is
-reverted intent by intent in reverse order, each intent by its previous values; an intent that
-restores a checkpoint would have to be reverted by restoring its own checkpoint (and only while the
-group's fingerprint is the one it left), and a group mixing the two kinds of intent has no
-tested revert. The other way -- one checkpoint per Batch group at the start of the plan, the
-whole plan reverted by restoring it -- would make every `value` write in the plan (whose own
-revert is exact and cheap) share the coarse, fingerprint-blind restore. Each such op is one
-call on its own, each with its own group and its own revert."""
+Decision: a plan keeps refusing them. The other ops that declare a `CheckpointSpec` are bundled
+(see `plan_bundle`): a plan with one of them is one checkpointed write on one sequence / clip /
+Batch group, reverted by one restore. `batch.load_setup` and `journal.restore_checkpoint` are
+restores themselves, each reverted by restoring its own checkpoint; `batch.iterate` and
+`batch.create_shelf_reel` write an iteration / a shelf reel, which are outside a Batch setup, so
+the restore of the plan would leave them (`batch.add_clips` into a shelf reel is refused when the
+step runs, for the same reason). Each such op is one call on its own, with its own group and its
+own revert."""
 
 
-def _connection_refusal(name: str) -> str:
+def _connection_refusal(name: str, *, journaled: bool = False) -> str:
+    journal = (
+        "it journals an intent but takes no checkpoint and has no revert"
+        if journaled
+        else "it runs with no checkpoint and no journal record"
+    )
     return (
-        f"{name} cannot be a plan step: its connections may reach segments of other sequences, it "
-        "runs with no checkpoint and no journal record, and a plan's group would put nothing of "
-        "it back without saying so. Call it on its own"
+        f"{name} cannot be a plan step: its connections may reach segments of other sequences, "
+        f"{journal}, and a plan's group would put nothing of it back without saying so. Call it "
+        "on its own"
     )
 
 
@@ -82,6 +90,12 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "as long as it runs (no MCP call gets through meanwhile) and its output -- files on "
         "disk, a clip in the shelf reel -- cannot be undone, so it has no place in a group "
         "that journal.revert is meant to put back; call it on its own"
+    ),
+    "render.clip": (
+        "render.clip cannot be a plan step: a Foreground render occupies Flame for as long as it "
+        "runs (no MCP call gets through meanwhile) and the Timeline FX it renders cannot be "
+        "undone, so it has no place in a group that journal.revert is meant to put back; call "
+        "it on its own"
     ),
     "desktop.create": (
         "desktop.create cannot be a plan step: it journals a `desktop_create` intent that is "
@@ -98,6 +112,13 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
     "desktop.copy": (
         "desktop.copy cannot be a plan step: it journals a `desktop_copy` intent that is "
         "reverted by deleting the copies it made, and a plan's single group is reverted by "
+        "putting attribute values back -- it would skip such an intent without saying so. Call "
+        "it on its own"
+    ),
+    "desktop.arrange": (
+        "desktop.arrange cannot be a plan step: it journals one `desktop_copy` or `desktop_move` "
+        "intent per item in a group of its own, which are reverted by deleting the copies and "
+        "moving the things back (they get new uids), and a plan's single group is reverted by "
         "putting attribute values back -- it would skip such an intent without saying so. Call "
         "it on its own"
     ),
@@ -154,19 +175,40 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "the duplicate it made, and a plan's single group is reverted by putting attribute "
         "values back -- it would skip such an intent without saying so. Call it on its own"
     ),
-    "segment.create_connection": _connection_refusal("segment.create_connection"),
-    "segment.remove_connection": _connection_refusal("segment.remove_connection"),
-    "segment.sync_connections": _connection_refusal("segment.sync_connections"),
+    "segment.create_connection": _connection_refusal("segment.create_connection", journaled=True),
+    "segment.remove_connection": _connection_refusal("segment.remove_connection", journaled=True),
+    "segment.sync_connections": _connection_refusal("segment.sync_connections", journaled=True),
 }
 """Ops a plan refuses for a reason of their own (not `owns_journal_group`)."""
-BUNDLE_NOTE: Final[str] = (
-    "This plan held a Timeline write, so it ran as ONE checkpointed write on this sequence / "
-    "clip: one stashed copy before the first step (result.timeline.checkpoint, stash), the steps "
-    "without checkpoints of their own, and journal.revert(group) is ONE restore of that copy "
-    "(only while the sequence still has fingerprintAfter; force overrides). The restore also "
-    "brings back the plan's segment.set_attributes steps. The restored sequence has a NEW uid "
-    "and wiretap id and is at the END of its reel."
-)
+BUNDLE_NOTES: Final[Mapping[str, str]] = {
+    TIMELINE_KIND.name: (
+        "This plan held a Timeline write, so it ran as one checkpointed write on this sequence / "
+        "clip: one stashed copy before the first step (result.timeline.checkpoint, stash), the "
+        "steps without checkpoints of their own, and journal.revert(group) is one restore of "
+        "that copy (only while the sequence still has fingerprintAfter; force overrides). The "
+        "restore also brings back the plan's segment.set_attributes steps. A plan that stopped "
+        "before any write ran has nothing to revert. The restored "
+        "sequence has a new uid and wiretap id and is at the end of its reel."
+    ),
+    BATCH_KIND.name: (
+        "This plan held a Batch write, so it ran as one checkpointed write on this Batch group: "
+        "one saved setup before the first step (result.batch.checkpoint, checkpointPath), the "
+        "steps without checkpoints of their own, and journal.revert(group) is one restore of "
+        "that setup (only while the group still has fingerprintAfter; force overrides). The "
+        "restore also brings back the plan's node.set_attributes / action.set_attributes steps. "
+        "The fingerprint does not see attribute values, positions, reels or iterations, so "
+        "`changed` reads false for a plan made only of those and the revert still runs. A plan "
+        "with a node.set_attributes / action.set_attributes step also records, right after the "
+        "run, a fingerprint that covers every node's attribute values, and the revert refuses "
+        "(CONFLICT) while an attribute value of the group differs from it (force overrides); "
+        "values changed by other steps (positions set by batch.organize, node.edit_setup) are "
+        "not watched that way. A plan that stopped before any write ran has nothing to revert. A "
+        "restore gives the group's Clip nodes and reel clips NEW uids and can bring a reel clip "
+        "back without its Timeline FX (result.timelineFxLost of the revert). Shelf reels and "
+        "iterations are not put back, so a plan holds no step that makes them (batch.iterate, "
+        "batch.create_shelf_reel, batch.add_clips into a shelf reel are refused)."
+    ),
+}
 MAX_PLAN_STEPS: Final[int] = 50
 """Most steps one plan may hold."""
 PLAN_STEP_RESULT_BYTES: Final[int] = 4_000
@@ -175,6 +217,37 @@ whole is still held to the response byte budget by `degrade_for_size`)."""
 PLAN_TOTAL_RESULT_BYTES: Final[int] = 30_000
 """All the step results one plan answer may carry together; later ones are left out."""
 _ERROR_TEXT_CHARS: Final[int] = 600
+RESULT_DETAILS: Final[tuple[str, ...]] = ("auto", "full", "summary")
+AUTO_SUMMARY_WRITE_STEPS: Final[int] = 10
+"""A plan with more write steps than this answers with `result_detail='summary'` by default."""
+_POSITION_PATH: Final[tuple[str, ...]] = ("position",)
+_APPLIED_PATH: Final[tuple[str, ...]] = ("applied",)
+_NODE_PATH: Final[tuple[str, ...]] = ("node",)
+BRIEF_PATHS: Final[Mapping[str, tuple[str, ...]]] = {
+    "segment.trim": _POSITION_PATH,
+    "segment.slip": _POSITION_PATH,
+    "segment.replace": _POSITION_PATH,
+    "segment.create_effect": _POSITION_PATH,
+    "segment.delete_effect": _POSITION_PATH,
+    "segment.set_effect": _POSITION_PATH,
+    "segment.effect_load_setup": _POSITION_PATH,
+    "segment.edit_effect_setup": _POSITION_PATH,
+    "segment.set_attributes": _APPLIED_PATH,
+    "node.create": _NODE_PATH,
+    "node.duplicate": _NODE_PATH,
+    "node.edit_setup": _NODE_PATH,
+    "node.set_attributes": _APPLIED_PATH,
+    "batch.set_attributes": _APPLIED_PATH,
+    "action.set_attributes": _APPLIED_PATH,
+    "desktop.set_attributes": _APPLIED_PATH,
+    "desktop.rename": _APPLIED_PATH,
+}
+"""What a step's `brief` takes from its result in a summary: op name -> keys of `result`. An op
+that is not here has no brief (only ok / errorCode)."""
+BRIEF_LIST_LIMIT: Final[int] = 20
+"""Most items of a list value a brief keeps; `<key>Omitted` counts the rest."""
+_DEGRADED_NOTE_CHARS: Final[int] = 200
+"""Longest a step's degraded note is in a plan's summary."""
 _ON_ERROR_VALUES: Final[tuple[str, ...]] = ("abort", "continue")
 _STEP_KEYS: Final[frozenset[str]] = frozenset({"op", "args", "late"})
 
@@ -192,14 +265,12 @@ class _Step:
 
 
 def owns_journal_group(op: RegisteredOperation, args: Mapping[str, Any]) -> bool:
-    """`op` called with `args` takes its own checkpoint and journal group (a destructive eval, an
-    op that declares a Batch `CheckpointSpec`, `OWN_GROUP_OPS`). One that declares a Timeline
-    `CheckpointSpec` does not count: a plan bundles it."""
+    """`op` called with `args` takes its own checkpoint and journal group (a destructive eval,
+    `OWN_GROUP_OPS`). One that declares a `CheckpointSpec` otherwise does not count: a plan
+    bundles it."""
     if op.category == "eval":
         return args.get("effect") != "read"
-    return (
-        op.checkpoint is not None and op.checkpoint.target_kind == "batch"
-    ) or op.name in OWN_GROUP_OPS
+    return op.name in OWN_GROUP_OPS
 
 
 def _check_step(ctx: ServerContext, index: int, raw: Any) -> _Step:
@@ -305,12 +376,58 @@ def _refusal(problems: list[str], checked: list[_Step]) -> ServerOpError | None:
     return None
 
 
+def _brief(op_name: str, result: Any) -> dict[str, Any] | None:
+    """The few facts of `result` that `BRIEF_PATHS` names for `op_name`, or None. A dict value
+    keeps its scalar members only (a position loses its selectors); a list is cut at
+    `BRIEF_LIST_LIMIT`."""
+    keys = BRIEF_PATHS.get(op_name)
+    if keys is None or not isinstance(result, Mapping):
+        return None
+    brief: dict[str, Any] = {}
+    for key in keys:
+        value = result.get(key)
+        if isinstance(value, Mapping):
+            value = {k: v for k, v in value.items() if not isinstance(v, Mapping | list)}
+        elif isinstance(value, list) and len(value) > BRIEF_LIST_LIMIT:
+            brief[f"{key}Omitted"] = len(value) - BRIEF_LIST_LIMIT
+            value = value[:BRIEF_LIST_LIMIT]
+        if value is not None:
+            brief[key] = value
+    return brief or None
+
+
+def _degraded_notes(env: Mapping[str, Any], limit: int | None) -> list[str]:
+    """The step's `degraded` notes (what it did differently from the request without failing),
+    each cut at `limit` characters when one is given."""
+    raw = env.get("degraded")
+    notes = [n for n in raw if isinstance(n, str)] if isinstance(raw, list) else []
+    return [n if limit is None else n[:limit] for n in notes]
+
+
 def _step_summary(
-    step: _Step, env: Mapping[str, Any], used_bytes: int
+    step: _Step, env: Mapping[str, Any], used_bytes: int, detail: str = "full"
 ) -> tuple[dict[str, Any], int, bool]:
-    """One executed step as the plan reports it, with its result left out when it is too big
-    for the plan's answer. Returns (summary, bytes of result kept, was it left out)."""
+    """One executed step as the plan reports it. `detail='full'`: its result, left out when it is
+    too big for the plan's answer. `detail='summary'`: {index, op, ok, errorCode, brief}, and for
+    a failed step its error and its result (under the same size limits, so the reason of a
+    partial application can be read). Returns (summary, bytes of result kept, was it left
+    out)."""
     result = env.get("result")
+    summarised = detail == "summary" and env.get("ok") is True
+    if summarised:
+        short: dict[str, Any] = {
+            "index": step.index,
+            "op": step.op_name,
+            "ok": True,
+            "errorCode": env.get("errorCode"),
+        }
+        brief = _brief(str(step.op_name), result)
+        if brief is not None:
+            short["brief"] = brief
+        notes = _degraded_notes(env, _DEGRADED_NOTE_CHARS)
+        if notes:
+            short["degraded"] = notes
+        return short, 0, False
     size = len(json.dumps(result, default=str)) if result is not None else 0
     omitted = size > PLAN_STEP_RESULT_BYTES or used_bytes + size > PLAN_TOTAL_RESULT_BYTES
     kept: Any = result
@@ -330,6 +447,13 @@ def _step_summary(
         "result": kept,
         "journal": env.get("journal"),
     }
+    notes = _degraded_notes(env, _DEGRADED_NOTE_CHARS if detail == "summary" else None)
+    if notes:
+        summary["degraded"] = notes
+    if detail == "summary":
+        del summary["journal"]
+        if result is None:
+            del summary["result"]
     return summary, 0 if omitted else size, omitted
 
 
@@ -343,9 +467,12 @@ class _Progress:
     undo_steps: int = 0
     failed: int = 0
     used_bytes: int = 0
+    detail: str = "full"
     stopped_at: int | None = None
     fail_closed: dict[str, Any] | None = None
     last_failure: dict[str, Any] | None = None
+    touched: bool = False
+    """A write step ran: it answered ok, or failed without saying it was refused before writing."""
 
 
 def _loop(
@@ -358,11 +485,13 @@ def _loop(
     for step in checked:
         assert step.op is not None and step.op_name is not None
         env = runner(step)
-        summary, kept, was_omitted = _step_summary(step, env, progress.used_bytes)
+        summary, kept, was_omitted = _step_summary(step, env, progress.used_bytes, progress.detail)
         progress.used_bytes += kept
         if was_omitted:
             progress.omitted.append(step.index)
         progress.reports.append(summary)
+        if step.op.effect != "read" and env.get(plan_bundle.SKIPPED_KEY) is not True:
+            progress.touched = True
         progress.affected += int(env.get("affected") or 0)
         progress.undo_steps += int(env.get("undoSteps") or 0)
         if env.get("ok") is True:
@@ -389,15 +518,16 @@ def _bundle_env(progress: _Progress) -> dict[str, Any]:
     rows = [{k: r.get(k) for k in ("index", "op", "ok", "errorCode")} for r in progress.reports]
     env: dict[str, Any] = {"ok": progress.stopped_at is None, "steps": rows}
     env["stoppedAt"] = progress.stopped_at
+    env["touched"] = progress.touched
     if progress.stopped_at is not None and progress.last_failure is not None:
         failing = progress.last_failure["step"]
         env["errorCode"] = failing["errorCode"]
-        env["error"] = f"step {progress.stopped_at} ({failing['op']}): {failing['error']}"
+        env["error"] = f"step {progress.stopped_at} ({failing['op']}): {failing.get('error')}"
     return env
 
 
-def _timeline_result(
-    facts: CheckpointedRun, target: plan_timeline.TimelineTarget
+def _bundle_result(
+    facts: CheckpointedRun, target: plan_bundle.BundleTarget, detail: str
 ) -> dict[str, Any]:
     info: dict[str, Any] = {
         "target": {
@@ -407,13 +537,22 @@ def _timeline_result(
             "selector": target.stable,
         },
         "checkpoint": facts.pre_id,
-        "stash": facts.pre.get("stash"),
-        "fingerprintBefore": facts.fingerprint_before,
-        "fingerprintAfter": facts.fingerprint_after,
-        "changed": facts.changed,
-        "resolved": target.resolved,
-        "note": BUNDLE_NOTE,
     }
+    if target.kind is TIMELINE_KIND:
+        info["stash"] = facts.pre.get("stash")
+    else:
+        info["checkpointPath"] = facts.pre_path
+    info.update(
+        {
+            "fingerprintBefore": facts.fingerprint_before,
+            "fingerprintAfter": facts.fingerprint_after,
+            "changed": facts.changed,
+            "resolved": target.resolved,
+            "note": BUNDLE_NOTES[target.kind.name],
+        }
+    )
+    if detail == "summary":
+        del info["resolved"]
     if facts.after_error is not None:
         info["fingerprintAfterError"] = facts.after_error
     if facts.journal_error is not None:
@@ -424,12 +563,28 @@ def _timeline_result(
     return info
 
 
+@dataclass(frozen=True)
+class _Bundler:
+    """The kind-specific half of a bundled plan: the up-front resolution and the step runner."""
+
+    preresolve: Callable[[ServerContext, Sequence[Any]], plan_bundle.BundleTarget]
+    step_runner: Callable[
+        [ServerContext, plan_bundle.BundleTarget, str], Callable[[Any], dict[str, Any]]
+    ]
+
+
+_BUNDLERS: Final[Mapping[str, _Bundler]] = {
+    TIMELINE_KIND.name: _Bundler(plan_bundle_timeline.preresolve, plan_bundle_timeline.step_runner),
+    BATCH_KIND.name: _Bundler(plan_bundle_batch.preresolve, plan_bundle_batch.step_runner),
+}
+
+
 def _run(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     steps: list[Any] = list(args["steps"])
     on_error = args.get("on_error", "abort")
     label = args.get("label")
     checked = [_check_step(ctx, i, raw) for i, raw in enumerate(steps)]
-    plan_timeline.apply_static_rules(checked)
+    plan_bundle.apply_static_rules(checked)
     problems = _plan_problems(steps, on_error, checked)
     refusal = _refusal(problems, checked)
     if refusal is not None:
@@ -445,14 +600,20 @@ def _run(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
                 result={"ran": False},
                 hint=denial.hint,
             )
-    progress = _Progress()
+    detail = args.get("result_detail", "auto")
+    if detail == "auto":
+        writes = sum(1 for s in checked if s.op is not None and s.op.effect != "read")
+        detail = "summary" if writes > AUTO_SUMMARY_WRITE_STEPS else "full"
+    progress = _Progress(detail=detail)
     group: str | None = None
     facts: CheckpointedRun | None = None
-    target: plan_timeline.TimelineTarget | None = None
+    target: plan_bundle.BundleTarget | None = None
+    kind = plan_bundle.bundle_kind(checked)
+    bundler = _BUNDLERS[kind.name] if kind is not None else None
     lock = ctx.write_lock if has_writes else contextlib.nullcontext()
     with lock:  # nobody else writes (or is classified by journal.check) while the plan runs
-        if plan_timeline.has_timeline_step(checked):
-            target = plan_timeline.preresolve(ctx, checked)  # a refusal: nothing is journaled
+        if bundler is not None:
+            target = bundler.preresolve(ctx, checked)  # a refusal: nothing is journaled
         group = new_id("g") if has_writes else None
         if group is not None:
             try:
@@ -475,14 +636,21 @@ def _run(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
                     result={"ran": False},
                     hint=f"Make {ctx.journal.directory} writable, then retry.",
                 ) from exc
-        if target is not None and group is not None:
+        if bundler is not None and target is not None and group is not None:
 
             def execute(runner: Callable[[_Step], dict[str, Any]]) -> dict[str, Any]:
                 _loop(checked, on_error, progress, runner)
                 return _bundle_env(progress)
 
-            facts = plan_timeline.run_bundled(
-                ctx, target, checked, group=group, label=label, on_error=on_error, execute=execute
+            facts = plan_bundle.run_bundled(
+                ctx,
+                target,
+                checked,
+                group=group,
+                label=label,
+                on_error=on_error,
+                make_runner=bundler.step_runner,
+                execute=execute,
             )
         else:
             _loop(
@@ -504,6 +672,7 @@ def _run(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
         "label": label,
         "onError": on_error,
         "total": len(checked),
+        "detail": detail,
         "stoppedAt": progress.stopped_at,
         "failClosed": progress.fail_closed,
         "steps": progress.reports,
@@ -511,18 +680,19 @@ def _run(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     }
     hint = progress.last_failure["hint"] if progress.last_failure is not None else None
     if facts is not None and target is not None:
-        result["timeline"] = _timeline_result(facts, target)
-        if progress.stopped_at is not None and not facts.unknown_end:
+        result[target.kind.name] = _bundle_result(facts, target, detail)
+        if progress.stopped_at is not None and progress.touched and not facts.unknown_end:
             hint = (
                 f"{hint or ''} The steps before it stay applied: journal.revert(group="
-                f"{group!r}) restores the sequence to what it was before the plan (one restore)."
+                f"{group!r}) restores the {target.kind.subject} to what it was before the plan "
+                "(one restore)."
             ).strip()
     if progress.stopped_at is not None and progress.last_failure is not None:
         failing = progress.last_failure["step"]
         fail_closed = progress.fail_closed
         raise ServerOpError(
             as_error_code(failing["errorCode"]),
-            f"plan stopped at step {progress.stopped_at} ({failing['op']}): {failing['error']}"
+            f"plan stopped at step {progress.stopped_at} ({failing['op']}): {failing.get('error')}"
             + (f" -- {fail_closed['note']}" if fail_closed is not None else ""),
             result=result,
             hint=hint,
@@ -557,51 +727,57 @@ def register(registry: Registry) -> None:
                 "only trouble is policy). Steps then run in order, each through the normal do "
                 "path (policy, defaults, journaled writes with their compare-and-swap). "
                 "on_error='abort' (default) stops at the first failing step: result.stoppedAt, "
-                "every step's {index, op, ok, errorCode, error, result, journal}, "
+                "every step's {index, op, ok, errorCode, error, result, journal} "
+                "(result_detail='summary': {index, op, ok, errorCode, brief}, a failed step "
+                "{index, op, ok, errorCode, error, result}), "
                 "partial = {done, failed, notRun}; steps before it stay applied. "
                 "on_error='continue' is allowed only when every step is a read. If a write "
                 "ends without an answer (TIMEOUT / BRIDGE_LOST / ...) the plan stops at once "
                 "whatever on_error says (result.failClosed) and this server refuses writes "
                 "until journal.check. Ops that take their own checkpoint and journal group (a "
-                "destructive eval.run, batch.load_setup, journal.restore_checkpoint, and every "
-                "Batch write that runs behind an automatic checkpoint: batch.create_reel, "
-                "batch.create_shelf_reel, batch.add_clips, batch.organize, batch.iterate, "
-                "node.create, node.delete, node.connect, node.disconnect, node.duplicate, "
-                "node.load_setup, action.create_node, action.connect) are "
-                "refused as steps -- call them on their own. So is render.batch: a Foreground "
+                "destructive eval.run, batch.load_setup, journal.restore_checkpoint), and "
+                "batch.iterate and batch.create_shelf_reel (shelf reels and iterations are "
+                "outside a Batch setup, so a restore would leave them), are refused as steps -- "
+                "call them on their own. So is render.batch: a "
+                "Foreground "
                 "render occupies Flame for as long as it runs and its output "
-                "(files on disk, clips in the shelf reel) cannot be undone. So are "
+                "(files on disk, clips in the shelf reel) cannot be undone. So is render.clip "
+                "(the Timeline FX it renders cannot be undone either). So are "
                 "desktop.create and desktop.copy: their revert deletes what they made, which a "
                 "plan's group (reverted by putting values back) does not do. Nor can "
-                "mediahub.import, desktop.duplicate, desktop.move, desktop.delete and "
-                "desktop.reformat (deleting / moving back / copying back / restoring a "
-                "stashed copy), segment.copy_to_media_panel and "
+                "mediahub.import, desktop.duplicate, desktop.move, desktop.arrange, "
+                "desktop.delete and desktop.reformat (deleting / moving back / copying back / "
+                "restoring a stashed copy), segment.copy_to_media_panel and "
                 "segment.match (deleting the clip they made), timeline.create_sequence (deleting "
                 "the sequence it made), journal.purge_checkpoints, or "
-                "segment.create_connection / remove_connection / sync_connections (they leave no "
-                "journal record and their connections may reach other sequences). "
+                "segment.create_connection / remove_connection / sync_connections (their "
+                "connections may reach other sequences; each journals an intent but has no "
+                "revert). "
                 "All the plan's writes share one "
                 "journal group "
                 "(envelope journal.group, `label` recorded on it): journal.revert(group) puts "
                 "them all back, in reverse order. "
                 "Timeline writes: a plan that holds a step of a Timeline-checkpointed op "
                 "(segment.trim, segment.slip, segment.replace, segment.create_effect / "
-                "delete_effect / set_effect / effect_load_setup, timeline.overwrite / insert / "
+                "delete_effect / set_effect / effect_load_setup / edit_effect_setup, "
+                "timeline.overwrite / insert / "
                 "cut / create_version / create_track / delete_segments / move_track / shorten) is "
                 "one checkpointed write "
                 "on one sequence / clip instead. Every "
                 "write step must be to that sequence (a Timeline-checkpointed op, or "
                 "segment.set_attributes of one of its segments); a write to another sequence, or "
                 "of another kind (desktop.rename, batch / node writes, timeline.checkpoint ...), "
-                "is refused before anything runs (INVALID_ARGS; the ways of reverting differ: one "
-                "restore could not undo it) -- reads of any sequence are fine. The segment "
+                "is refused before anything runs (INVALID_ARGS: the ways of reverting differ, so "
+                "one restore could not undo it; this includes a Batch write) -- reads of any "
+                "sequence are fine. "
+                "The segment "
                 "selectors of "
                 "every write step are first resolved in one Flame read (index / record_in / "
                 "expect_source_name; the sequence may be given by any selector kind, it is pinned "
                 "by its wiretap id): if one does not resolve nothing runs, nothing is copied and "
                 "nothing is journaled (SELECTOR_EMPTY / CONFLICT, result.preResolution = "
                 "[{index, op, errorCode, error}]). A step may carry `late: true` (next to op and "
-                "args): it is left out of that resolution and resolved when its turn comes -- use "
+                "args): it is left out of that resolution and resolved when the step runs -- use "
                 "it for a step that points at a segment an earlier step makes or moves (a head "
                 "trim without ripple moves record_in); if it does not resolve then, the plan stops "
                 "there and the steps before it stay applied (revertible). The sequence is "
@@ -611,14 +787,66 @@ def register(registry: Registry) -> None:
                 "overrides): it also brings back the plan's segment.set_attributes steps, which "
                 "are not written back value by value. The restored sequence has a new uid and "
                 "wiretap id and is at the end of its reel. result.timeline = {target, checkpoint, "
-                "stash, fingerprintBefore, fingerprintAfter, changed, resolved, note}. A write "
+                "stash, fingerprintBefore, fingerprintAfter, changed, resolved, note}. A plan "
+                "that stopped before any write ran (its first write step's own check refused "
+                "it) is not revertible (PRECONDITION_UNMET). A write "
                 "step that ends without an answer stops the plan as above, and journal.check "
                 "decides the plan's intent from the sequence's fingerprint (before = not_landed, "
                 "anything else = diverged). "
+                "Batch writes: a plan that holds a step of a Batch-checkpointed op (node.create, "
+                "node.delete, node.connect, node.disconnect, node.duplicate, node.load_setup, "
+                "node.edit_setup, "
+                "action.create_node, action.connect, batch.create_reel, "
+                "batch.add_clips, batch.organize) is one "
+                "checkpointed write on one Batch group instead (result.batch). Every write step "
+                "must be to that group (such an op, or node.set_attributes / "
+                "action.set_attributes of one of its nodes); a write to another group, or of "
+                "another kind (a Timeline write, desktop.rename, batch.set_attributes ...), is "
+                "refused before anything runs (INVALID_ARGS). The node selectors of every write "
+                "step are first resolved in one Flame read: if one does not resolve, nothing "
+                "runs, nothing is saved and nothing is journaled (SELECTOR_EMPTY / "
+                "SELECTOR_AMBIGUOUS, result.preResolution), and a node.create `name` that "
+                "another node of the group has is refused the same way unless an earlier step "
+                "deletes or renames a node. A step that points at a node an earlier step makes "
+                "is left to be resolved when the step runs: by itself "
+                "(result.batch.resolved[].late = 'implied') when "
+                "an earlier node.create of the same group, addressed by the same selector, gave "
+                "that node `name`; with `late: true` for a node left to Flame's default name, a "
+                "node.duplicate or a rename. The check each op makes before it writes (type, "
+                "sockets, current group) runs when the step runs, so a step that fails it "
+                "stops the plan there with the earlier steps applied. A node.create that makes "
+                "the node under another name than `name` stops the plan the same way (the hint "
+                "names it: point later steps at it, or use `late: true`). The group is saved "
+                "once (batch.checkpoint), the steps run without checkpoints of their own, and "
+                "journal.revert(group) is one restore of that setup (only while the group still "
+                "has result.batch.fingerprintAfter; force overrides): it also brings back the "
+                "plan's node.set_attributes / action.set_attributes steps, and it is a Batch "
+                "restore with its side effects (new uids for reel clips and Clip nodes; "
+                "result.timelineFxLost); with a value-write step it also refuses (CONFLICT) "
+                "when an attribute value of the group changed after the plan, and a plan that "
+                "stopped before any write ran is not revertible (PRECONDITION_UNMET). A "
+                "batch.add_clips step into a shelf reel is refused "
+                "when the step runs (PRECONDITION_UNMET, nothing written; shelf reels are outside "
+                "a setup, so the revert would leave the clips). A plan of "
+                "node.set_attributes steps alone is not bundled. result.batch = {target, "
+                "checkpoint, checkpointPath, fingerprintBefore, fingerprintAfter, changed, "
+                "resolved, note}. A write step that ends without an answer stops the plan as "
+                "above, and journal.check decides the plan's intent from the group's fingerprint. "
                 "A step's result too big for the answer "
                 "(over "
                 f"{PLAN_STEP_RESULT_BYTES} bytes, or beyond {PLAN_TOTAL_RESULT_BYTES} in "
                 "total) is replaced by {omitted, bytes} (result.resultsOmitted lists them). "
+                "A big plan should use result_detail='summary' (the default 'auto' does so above "
+                f"{AUTO_SUMMARY_WRITE_STEPS} write steps): each step is then only its ok, "
+                "errorCode and a small brief (the position of the segment it changed, the "
+                "attributes it applied, or the node a node.create / node.duplicate made), with "
+                "no per-step result or journal, except that a "
+                "failed step keeps its error and result (result.detail says which was used; "
+                "the timeline / batch block stays, less its `resolved` list, and "
+                "journal.revert(group) works as ever); 'full' keeps every step's result. A "
+                "brief's position is "
+                "{version, track, index, recordIn} without selectors: build a selector from the "
+                "sequence, the track and recordIn. "
                 "A plan buys one up-front check of the whole plan and one group to undo. "
                 "affected and undoSteps are sums over the steps."
             ),
@@ -629,11 +857,13 @@ def register(registry: Registry) -> None:
                     type="array",
                     description="[{op, args, late?}, ...] -- at most "
                     f"{MAX_PLAN_STEPS}; each step's op and args as flame_do takes them. `late: "
-                    "true` leaves a Timeline write out of the up-front resolution of the "
-                    "plan's segment selectors: use it when the step points at a segment an "
-                    "earlier step of the plan makes or moves (it is resolved when its turn "
-                    "comes; if it does not resolve then the plan stops there, the earlier "
-                    "steps stay applied and journal.revert(group) puts the sequence back).",
+                    "true` leaves a Timeline or Batch write out of the up-front resolution of the "
+                    "plan's segment / node selectors: use it when the step points at a segment "
+                    "or node an earlier step of the plan makes or moves (a Batch node left to "
+                    "Flame's default name, a duplicate, a rename; a node an earlier node.create "
+                    "gave `name` needs no `late`). It is resolved when the step runs; if it "
+                    "does not resolve then the plan stops there, the earlier steps stay applied "
+                    "and journal.revert(group) puts the sequence / group back.",
                     required=True,
                     # no item_type: a step that is not an object is reported by the plan's own
                     # check, with the others, as {index, problems}
@@ -644,6 +874,18 @@ def register(registry: Registry) -> None:
                     description="'abort' (default) or 'continue' (only for all-read plans).",
                     required=False,
                     default="abort",
+                ),
+                OperationParam(
+                    name="result_detail",
+                    type="string",
+                    description="'auto' (default): 'summary' when the plan has more than "
+                    f"{AUTO_SUMMARY_WRITE_STEPS} write steps, else 'full'. 'full': every step "
+                    "with its result (cut at a size budget) and journal. 'summary': each step "
+                    "is {index, op, ok, errorCode, brief} only (a failed step: error and result, "
+                    "not brief).",
+                    required=False,
+                    default="auto",
+                    enum=RESULT_DETAILS,
                 ),
                 OperationParam(
                     name="label",

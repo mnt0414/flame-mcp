@@ -1,5 +1,6 @@
 """`render` category: what a Batch group's Write File / Render nodes would write
-(`render.plan`) and the render itself (`render.batch`). Observed on Flame 2025.2.4: a render works
+(`render.plan`) and the render itself (`render.batch`); the render of a clip's Timeline FX
+(`render.clip`) is in `render_clip.py`. Observed on Flame 2025.2.4: a render works
 on a group that is not current, writes as many frames as a Write File's range says (default 1-100)
 and occupies Flame while it runs (Foreground; the bridge may not answer meanwhile). By design
 render.batch provides no undo. The server-side halves are in `render_plan.py` and
@@ -26,8 +27,9 @@ from flame_mcp.types import Category, OperationParam, OperationSpec, Refusal
 CATEGORY = Category(
     name="render",
     description=(
-        "Rendering a Batch group (Write File / Render nodes). Look at what a render would "
-        "write with plan, then run it with batch. The group need not be current."
+        "Rendering. Use render.plan to see what a Batch render would write, render.batch to "
+        "render a Batch group (it need not be current), and render.clip to render the "
+        "Timeline FX of a clip or sequence."
     ),
     default_thread="main",
     default_pacing="none",
@@ -86,6 +88,13 @@ PLAN_REQUIRES = (
     "PyBatch.reels",
     "PyBatch.shelf_reels",
     "PyReel.clips",
+    "PyReel.name",
+    "flame.projects",
+    "PyProject.current_workspace",
+    "PyWorkspace.desktop",
+    "PyDesktop.reel_groups",
+    "PyReelGroup.reels",
+    "PyReelGroup.name",
     "PyNode.sockets",
     "PyNode.attributes",
     "PyWriteFileNode.get_resolved_media_path",
@@ -109,9 +118,18 @@ def register(registry: Registry) -> None:
                 "outputDir, dirExists, defaultPath (/var/tmp and /tmp), plannedFiles, "
                 "firstFile / lastFile and existingPlannedFiles (files a render would overwrite; "
                 "render.batch refuses unless allow_overwrite=true). "
-                "A Render node has no path attribute: `output` says its clip goes into its "
-                "destination reel(s) and cannot be checked on disk. result.reels = the clip "
-                "count of each schematic / shelf reel, result.summary.wouldRefuse = what "
+                "A Render node has no path attribute: its clip goes into the reel "
+                "`destinationReel` names ({kind: shelf | desktop, group, reel, exists, "
+                "clipCount}: a shelf reel of the Batch group, or a reel of the Desktop reel "
+                "group its destination points at -- the reel named by a third element of the "
+                "destination, else `Batch Renders`; groupMissing when that reel group does not "
+                "exist) and cannot be checked on disk. Flame chooses the name of a Desktop reel, "
+                "so destinationReel is a prediction: render.batch's result.newClips says where "
+                "the clips really went. A destination of any other kind is not followed "
+                "(result.destinationUnsupported; unread: true when the destination could not be "
+                "read). result.reels = the clip "
+                "count of each schematic / shelf reel and of each Desktop reel an effective "
+                "Render node writes to, result.summary.wouldRefuse = what "
                 "render.batch would refuse with its defaults, result.summary.busyNote = that a "
                 "render.batch of these frames occupies Flame while it runs."
             ),
@@ -136,7 +154,7 @@ def register(registry: Registry) -> None:
                 "frames written "
                 "are set by each Write File node's range_start / range_end (default 1-100), not "
                 "by the group's duration -- render.plan shows them. render.batch provides no "
-                "undo: the files on disk and the clip put into the shelf reel `Batch Renders` stay "
+                "undo: the files on disk and the clips put into the reels stay "
                 "(undo=unsupported; journal.revert has nothing to restore). "
                 "Refused before anything is written (PRECONDITION_UNMET, nothing journaled; "
                 "result.problems + result.plan): no Write File / Render node that is not "
@@ -148,10 +166,21 @@ def register(registry: Registry) -> None:
                 "Then an intent (planned files, what was already in the directories) is "
                 "journaled, the render runs for at most timeout_s, and the outcome records the "
                 "files really written: result.nodes counts frames per Write File against the "
-                "plan (short = SILENT_NOOP, or FLAME_API_ERROR when render returned False), "
+                "plan (some but not all frames = FLAME_API_ERROR with a message starting "
+                "`partial:`, the frames stay; none = SILENT_NOOP, or FLAME_API_ERROR when render "
+                "returned False), "
                 "otherNewFiles lists what else appeared (the `.clip`), newClips the clips the "
-                "reels gained. Render nodes write clips, not files, so their output is not checked "
-                "on disk (result.verified null when only Render nodes ran). "
+                "reels gained (the Batch group's reels, and the Desktop reel a Render node's "
+                "destination points at, named `<reel group>/<reel>`; newClipsUnknown lists the "
+                "reels whose clips could not be read before the render, which are not "
+                "counted). Flame chooses the name of a Desktop reel, so render.plan's "
+                "destinationReel is a prediction and result.newClips is what shows where the "
+                "clips really went. Render nodes write clips, "
+                "not files, so their output is not checked on disk (result.verified null when "
+                "only Render nodes ran): then the clips the reels gained are the evidence, and "
+                "none gained is SILENT_NOOP (ok with a note in `degraded` when a reel could not "
+                "be read, a destination is not followed or the Desktop reel group is not "
+                "there). "
                 "A TIMEOUT / BRIDGE_LOST is not an answer: the render may still be running "
                 "(a TIMEOUT does not stop it), this server refuses every write until "
                 "journal.check has decided. When the wait ended with the bridge's pending "

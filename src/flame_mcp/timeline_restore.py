@@ -257,7 +257,7 @@ def restore_timeline_checkpoint(
             f"checkpoint {checkpoint_id!r} has no source uid, stash uid or fingerprint: there is "
             "nothing to restore into, or from",
         )
-    refuse_if_denied(ctx, TIMELINE_KIND.needed_ops)
+    refuse_if_denied(ctx, (*TIMELINE_KIND.needed_ops, restore_op()))
     records = ctx.journal.read_all().records
     purge = purge_records(records).get(checkpoint_id)
     if purge is not None:
@@ -585,10 +585,18 @@ def _uid_after(
 
 
 def revert_timeline_group(
-    ctx: ServerContext, index: Index, group: str, view: IntentView, force: bool
+    ctx: ServerContext,
+    index: Index,
+    group: str,
+    view: IntentView,
+    force: bool,
+    *,
+    forced_note: Mapping[str, Any] | None = None,
 ) -> ServerResult:
     """Restore the checkpoint a timeline intent names (an edit: its checkpoint; a restore: its
-    pre-restore checkpoint), but only while the target's fingerprint is the one the run left."""
+    pre-restore checkpoint), but only while the target's fingerprint is the one the run left.
+    `forced_note` is journaled in the restore's intent when the caller forced it past something
+    else (later groups of the same target)."""
     checkpoint_id = view.revert_checkpoint()
     assert checkpoint_id is not None  # the view was picked by it
     record = index.checkpoints.get(checkpoint_id)
@@ -613,6 +621,7 @@ def revert_timeline_group(
         force=force,
         reverts=group,
         reverts_intent=None if covers_group else view.id,
+        forced_note=forced_note,
     )
     body = dict(result.result) if isinstance(result.result, dict) else {}
     body["reverted"] = group

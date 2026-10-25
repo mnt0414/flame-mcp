@@ -1654,6 +1654,179 @@ def test_an_existing_loose_log_and_its_rotations_are_tightened(tmp_path: Path) -
         _close_bridge_logger()
 
 
+def test_a_bridge_started_with_umask_zero_makes_every_new_directory_and_file_private(
+    scratch_dir: Path, loop: FakeMainLoop, umask_zero: None
+) -> None:
+    run_dir = scratch_dir / "fm" / "run"
+    log_path = scratch_dir / "lg" / "fm" / "logs" / "bridge.log"
+    bridge = impl.Bridge(
+        schedule=loop.schedule,
+        flame_module=FakeFlame(),
+        version="9",
+        project_name="proj",
+        run_dir=run_dir,
+        log_path=log_path,
+        make_timer=lambda: FakeTimer(loop),
+    )
+    try:
+        bridge.start()
+        bridge._write_result_file("h1", {"ok": True})
+        bridge._logger.info("line")
+        for handler in bridge._logger.handlers:
+            handler.flush()
+        made = sorted(scratch_dir.rglob("*"))
+        assert run_dir / "results" / "h1.json" in made and log_path in made
+        for path in made:
+            if path.is_dir():
+                assert _mode(path) == 0o700, path
+            else:
+                assert _mode(path) & 0o077 == 0, path
+        assert _mode(run_dir / "results" / "h1.json") == 0o600
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+
+
+def test_a_stale_temp_result_file_does_not_stop_the_result_being_written(
+    bridge_factory: Callable[..., impl.Bridge], umask_zero: None
+) -> None:
+    bridge = bridge_factory()
+    bridge.start()
+    stale = bridge._results_dir / ".h2.json.tmp"
+    stale.write_text("old")
+    stale.chmod(0o666)
+    bridge._write_result_file("h2", {"ok": True})
+    assert json.loads((bridge._results_dir / "h2.json").read_text()) == {"ok": True}
+    assert _mode(bridge._results_dir / "h2.json") == 0o600
+
+
+def _loose(path: Path, mode: int = 0o644) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    path.chmod(mode)
+    return path
+
+
+def _app_bridge(root: Path, loop: FakeMainLoop, **kwargs: Any) -> impl.Bridge:
+    return impl.Bridge(
+        schedule=loop.schedule,
+        flame_module=FakeFlame(),
+        version="9",
+        project_name="proj",
+        run_dir=root / "run",
+        log_path=root / "logs" / "bridge.log",
+        make_timer=lambda: FakeTimer(loop),
+        **kwargs,
+    )
+
+
+def test_start_tightens_the_loose_permissions_under_the_flame_mcp_directory(
+    scratch_dir: Path, loop: FakeMainLoop
+) -> None:
+    root = scratch_dir / "fm"
+    journal_file = _loose(root / "journal" / "checkpoints" / "cp.batch")
+    older_log = _loose(root / "logs" / "bridge.log.1", 0o666)
+    for directory in (root, root / "journal", root / "journal" / "checkpoints", root / "logs"):
+        directory.chmod(0o777)
+    bridge = _app_bridge(root, loop, app_root=root)
+    try:
+        bridge.start()
+        handler = bridge._logger.handlers[0]
+        handler.flush()
+        log_text = (root / "logs" / "bridge.log").read_text()
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+    assert _mode(root) == _mode(root / "journal") == _mode(root / "logs") == 0o700
+    assert _mode(journal_file) == _mode(older_log) == 0o600
+    assert "permissions: fixed" in log_text and "failed 0" in log_text
+
+
+def test_start_tightens_nothing_when_it_is_not_given_the_flame_mcp_directory(
+    scratch_dir: Path, loop: FakeMainLoop
+) -> None:
+    root = scratch_dir / "fm"
+    stray = _loose(root / "journal" / "j.jsonl")
+    (root / "journal").chmod(0o755)
+    bridge = _app_bridge(root, loop)
+    try:
+        bridge.start()
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+    assert _mode(stray) == 0o644 and _mode(root / "journal") == 0o755
+
+
+def test_a_chmod_that_fails_at_start_is_logged_and_the_bridge_still_starts(
+    scratch_dir: Path, loop: FakeMainLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = scratch_dir / "fm"
+    refused = _loose(root / "journal" / "j.jsonl")
+    real_chmod = os.chmod
+
+    def chmod(path: Any, mode: int, **kwargs: Any) -> None:
+        if str(path) == str(refused):
+            raise PermissionError(1, "Operation not permitted", str(path))
+        real_chmod(path, mode, **kwargs)
+
+    bridge = _app_bridge(root, loop, app_root=root)
+    monkeypatch.setattr(os, "chmod", chmod)
+    try:
+        bridge.start()
+        bridge._logger.handlers[0].flush()
+        log_text = (root / "logs" / "bridge.log").read_text()
+        assert bridge._started is True
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+    assert f"could not chmod {refused}" in log_text and "failed 1" in log_text
+
+
+def test_the_module_start_function_tightens_the_default_flame_mcp_directory(
+    scratch_dir: Path, loop: FakeMainLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = scratch_dir / "fm"
+    (root / "run").mkdir(parents=True)
+    root.chmod(0o755)
+    monkeypatch.setattr(impl, "_default_root", lambda: root)
+    monkeypatch.delenv("FLAME_MCP_RUN_DIR", raising=False)
+    bridge = impl.start(
+        schedule=loop.schedule,
+        flame_module=FakeFlame(),
+        version="9",
+        project_name="p",
+        make_timer=lambda: FakeTimer(loop),
+    )
+    try:
+        assert _mode(root) == 0o700
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+
+
+def test_the_module_start_function_with_its_own_directories_tightens_nothing_else(
+    scratch_dir: Path, loop: FakeMainLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = scratch_dir / "fm"
+    root.mkdir()
+    root.chmod(0o755)
+    monkeypatch.setattr(impl, "_default_root", lambda: root)
+    bridge = impl.start(
+        schedule=loop.schedule,
+        flame_module=FakeFlame(),
+        version="9",
+        project_name="p",
+        run_dir=str(scratch_dir / "r"),
+        log_path=str(scratch_dir / "b.log"),
+        make_timer=lambda: FakeTimer(loop),
+    )
+    try:
+        assert _mode(root) == 0o755
+    finally:
+        bridge.stop()
+        _close_bridge_logger()
+
+
 def _wait_closed(conn: socket.socket, timeout: float) -> bool:
     conn.settimeout(timeout)
     try:

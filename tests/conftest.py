@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from flame_mcp import envelope
+from flame_mcp import envelope, setup_work
 from flame_mcp import journal as journal_mod
 
 
@@ -24,3 +24,10 @@ def _no_e2e_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The e2e switches are set by the test that needs them, never by the shell running pytest."""
     monkeypatch.delenv("FLAME_MCP_E2E_FLAME_VERSION", raising=False)
     monkeypatch.delenv("FLAME_MCP_E2E_PROJECT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_setup_work_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`setup_work` keeps the journal directory of the last `Runtime` made: a test that makes none
+    must not pick up the one an earlier test left."""
+    monkeypatch.setattr(setup_work, "_journal_directory", None)

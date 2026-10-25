@@ -52,7 +52,7 @@ Apart from the stub and Flame's own logs, everything is under `~/Library/Applica
 
 The environment variables `FLAME_MCP_RUN_DIR`, `FLAME_MCP_JOURNAL_DIR`, `FLAME_MCP_SPILL_DIR`, and `FLAME_MCP_BRIDGE_DIR` move the `run`, `journal`, `spill`, and `bridge` directories. `FLAME_MCP_BRIDGE_DIR` is for development. The server does not put its own files in `/tmp`.
 
-The modes above apply to files and directories that flame-mcp creates. It does not change the mode of an existing journal, spill, `logs` or checkpoint directory. [safety.md](safety.md#who-can-read-the-files) lists the modes, and [safety.md](safety.md#what-the-server-keeps-and-for-how-long) lists how long each kind of file stays.
+The modes above apply to files and directories that flame-mcp creates. At start-up the server and the bridge also tighten what already exists in the flame-mcp folder; a directory you moved outside that folder with one of the variables above is left alone ([Tightening what is already there](safety.md#tightening-what-is-already-there)). [safety.md](safety.md#who-can-read-the-files) lists the modes, and [safety.md](safety.md#what-the-server-keeps-and-for-how-long) lists how long each kind of file stays.
 
 ## Tools and operations
 
@@ -165,7 +165,7 @@ The stub implements two lifecycle hooks, `app_initialized` and `app_exited`, and
 
 Starting the bridge:
 
-1. Create the `run` directory with mode 0700.
+1. Create the `run` directory with mode 0700 (and any missing parent of it with mode 0700). Then tighten what already exists in the flame-mcp folder ([Who can read the files](safety.md#who-can-read-the-files)).
 2. Probe the socket path by connecting to it. If something answers, another bridge is alive: refuse to start and log the reason. If nothing answers, delete the stale file.
 3. Bind the socket (mode 0600) and start the accept thread.
 4. Start the relay timer on the main thread (see [Threads](#threads)).
@@ -252,7 +252,7 @@ Each operation declares one of three modes.
 | Mode | Runs | Used for |
 | --- | --- | --- |
 | `main` | On the main thread. The caller waits for the result. | Operations that call the Flame API. This is the default. |
-| `main-async` | On the main thread. The caller waits for a limited time and then receives a handle. | Long operations. Only `render.batch` declares it. |
+| `main-async` | On the main thread. The caller waits for a limited time and then receives a handle. | Long operations. `render.batch`, `render.clip` and `desktop.reformat` declare it. |
 | `server` | On the MCP server, never in Flame. | Operations that do not touch Flame, such as `journal.*` and `plan.run`. A server operation reaches Flame only by calling other operations through the same path as `flame_do`. |
 
 A foreground render keeps Flame busy. While it runs, other calls can fail with `BRIDGE_UNAVAILABLE` or `TIMEOUT`, so wait for a render through its handle and do not retry.
@@ -262,7 +262,7 @@ A foreground render keeps Flame busy. While it runs, other calls can fail with `
 | Mode | Default wait | When the wait ends first |
 | --- | --- | --- |
 | `main` | 10 seconds (some operations, such as checkpoints, wait longer) | See below. |
-| `main-async` | 30 seconds (`render.batch` takes its own `timeout_s`) | The call succeeds with `pending.handle`. The result is saved under `run/results/` when the call ends. |
+| `main-async` | 30 seconds (`render.batch` and `render.clip` take their own `timeout_s`; `desktop.reformat` waits up to 180 seconds for each clip) | The call succeeds with `pending.handle`. The result is saved under `run/results/` when the call ends. |
 
 The bridge caps any wait at 600 seconds. The server waits 5 seconds longer than the bridge, so the bridge's answer arrives first.
 
@@ -318,8 +318,8 @@ Every tool returns one shape.
 
 | Field | Meaning |
 | --- | --- |
-| `ok`, `result` | Success flag and the operation's value. A failed operation can still return a `result`, and a call can be `ok` and still carry `partial`. |
-| `affected`, `partial` | How many targets changed. `partial` counts what applied and what failed when only some did. |
+| `ok`, `result` | Success flag and the operation's value. A failed operation can still return a `result`. |
+| `affected`, `partial` | How many targets changed. `partial` counts what applied and what failed when only some did. An `ok` call can carry `partial` too, for example `plan.run` (`{done, failed, notRun}`) and `render.batch` (`{written, expected}`, when it checked the files). |
 | `undoSteps` | Always 0 for writes, because the server does not use Flame's Undo. |
 | `error`, `errorCode`, `hint`, `retryable`, `traceback` | The failure, in words and as a code. |
 | `pending`, `timeoutPhase` | A handle for a call that outlived its wait, and which phase it was in. |

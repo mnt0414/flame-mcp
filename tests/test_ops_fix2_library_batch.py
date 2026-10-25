@@ -299,6 +299,36 @@ def test_copy_a_batch_group_into_a_library(rig: Rig) -> None:
     assert any("nodes" in n for n in result["notes"])
 
 
+def test_a_batch_copy_that_answers_nothing_but_made_the_group_is_recorded(rig: Rig) -> None:
+    make_group(rig)
+    lib = library(rig, "BK")
+    real = rig.flame.media_panel.copy
+
+    def silent(*args: Any, **kwargs: Any) -> list[Any]:
+        real(*args, **kwargs)
+        return []
+
+    rig.flame.media_panel.copy = silent
+    env = copy(rig, [SRC], lib_selector(lib))
+    assert env["ok"] is True, env
+    [row] = env["result"]["copies"]
+    assert row["type"] == "PyBatch" and env["result"]["returned"] == 0
+    assert any("answered 0" in note for note in env["degraded"])
+    assert [c["uid"] for c in rig.records()[-1]["created"]["copies"]] == [row["uid"]]
+    assert env["journal"]["revert"] is not None
+    rig.flame.media_panel.copy = real
+    assert revert(rig, env)["ok"] is True and batches_in(lib) == []
+
+
+def test_a_batch_copy_after_which_the_library_did_not_grow_is_a_silent_noop(rig: Rig) -> None:
+    make_group(rig)
+    lib = library(rig, "BK")
+    rig.flame.media_panel.copy = lambda *args, **kwargs: []
+    env = copy(rig, [SRC], lib_selector(lib))
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    assert rig.records()[-1]["created"] is None and env["journal"]["revert"] is None
+
+
 def test_copy_a_current_batch_group_into_a_library_folder(rig: Rig) -> None:
     group = make_group(rig, current=True)
     folder = library(rig, "BK").create_folder("F1")

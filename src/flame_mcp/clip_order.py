@@ -25,6 +25,7 @@ and `write_copy` / `remove_copy` do the file work; `prepare` ties them together.
 from __future__ import annotations
 
 import html
+import os
 import re
 import shutil
 import tempfile
@@ -35,9 +36,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from flame_mcp.private_fs import make_private_dirs, make_private_tree
+
 ORDERED_DIR_NAME: Final[str] = "ordered"
 """The directory below the checkpoint directory that holds the copies."""
 COPY_PREFIX: Final[str] = "o_"
+COPY_FILE_MODE: Final[int] = 0o600
 SWEEP_AGE_S: Final[float] = 24 * 3600.0
 """A working copy older than this is a leftover (a load that ended without an answer keeps its
 copy) and is removed by the next `prepare`."""
@@ -314,14 +318,18 @@ def plan_order(
 def write_copy(new_text: str, source: Path, work_root: Path) -> OrderedCopy:
     """Write `new_text` as `<source name>` and copy `<source stem>/` beside it, in a new
     directory below `work_root`. Nothing is left behind if it fails."""
-    work_root.mkdir(parents=True, exist_ok=True)
+    make_private_dirs(work_root)
     directory = Path(tempfile.mkdtemp(prefix=COPY_PREFIX, dir=work_root))
     try:
         source_dir = source.parent / source.stem
         if source_dir.is_dir():
-            shutil.copytree(source_dir, directory / source.stem, symlinks=True)
+            copied = directory / source.stem
+            shutil.copytree(source_dir, copied, symlinks=True)
+            make_private_tree(copied)
         batch_path = directory / source.name
-        batch_path.write_bytes(new_text.encode("utf-8"))
+        fd = os.open(batch_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, COPY_FILE_MODE)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new_text.encode("utf-8"))
     except BaseException:
         shutil.rmtree(directory, ignore_errors=True)
         raise

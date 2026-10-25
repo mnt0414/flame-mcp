@@ -122,6 +122,7 @@ def fx_save_setup(self: PyTimelineFX, path: str) -> bool:
     for extension in extensions:
         with open(path + extension, "w", encoding="utf-8") as out:
             out.write(blob)
+        os.chmod(path + extension, 0o666)  # Flame runs with umask 0
     return True
 
 

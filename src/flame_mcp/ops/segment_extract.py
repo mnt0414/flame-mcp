@@ -75,9 +75,9 @@ _COMMON = (
 
 _COPY_DESCRIPTION = (
     "Take one segment out of its sequence as a new clip in a reel (PySegment.copy_to_media_panel): "
-    "the used range with its soft handles and its TimelineFX -- the way to hand a shot on with its "
-    "handles (for example, take it out, then trim the clip's inner segment to the handle length "
-    "with segment.trim). " + _SHAPES + " " + _COMMON + " " + _FROM_CLIP
+    "the used range with its soft handles and its Timeline FX -- the way to hand a shot on "
+    "with its handles (for example, take it out, then trim the clip's inner segment to the "
+    "handle length with segment.trim). " + _SHAPES + " " + _COMMON + " " + _FROM_CLIP
 )
 
 _MATCH_DESCRIPTION = (
@@ -226,7 +226,7 @@ def register(registry: Registry) -> None:
                 OperationParam(
                     name="include_timeline_fx",
                     type="boolean",
-                    description="Keep the segment's TimelineFX on the new clip. Default false.",
+                    description="Keep the segment's Timeline FX on the new clip. Default false.",
                     required=False,
                     default=False,
                 ),

@@ -30,13 +30,29 @@ STUB_SRC="$REPO_ROOT/stub/flame_mcp_bridge.py"
 IMPL_SRC="$REPO_ROOT/src/flame_mcp_bridge/impl.py"
 
 STUB_DST="${FLAME_MCP_STUB_DST:-/opt/Autodesk/shared/python/flame_mcp_bridge.py}"
-BRIDGE_DIR="$HOME/Library/Application Support/flame-mcp/bridge"
+APP_ROOT="$HOME/Library/Application Support/flame-mcp"
+BRIDGE_DIR="$APP_ROOT/bridge"
 IMPL_DST="$BRIDGE_DIR/impl.py"
 
-BACKUPS_DIR="$HOME/Library/Application Support/flame-mcp/backups"
+BACKUPS_DIR="$APP_ROOT/backups"
 
 STUB_MODE=0644
 IMPL_MODE=0600
+
+_make_private_dir() {
+    # $1 = a directory below $APP_ROOT. Makes it and the missing directories above it (down to
+    # $APP_ROOT) one at a time with mode 700: mkdir -p -m applies the mode to the last one only,
+    # and the umask would decide the rest. A directory that already exists is not changed.
+    local dir="$1"
+    [ -d "$dir" ] && return 0
+    if [ "$dir" = "$APP_ROOT" ]; then
+        mkdir -p "$(dirname "$dir")"  # ~/Library/Application Support: not ours to make private
+    else
+        _make_private_dir "$(dirname "$dir")"
+    fi
+    mkdir -m 700 "$dir"
+    chmod 700 "$dir"
+}
 
 FLAME_ANY_VERSION_PATTERN='flame\.app/Contents/MacOS/flame( |$)'
 
@@ -119,7 +135,7 @@ _backup_if_exists() {
         if [ "$DRY_RUN" -eq 1 ]; then
             echo "[dry-run] would back up: $target -> $backup_path"
         else
-            mkdir -p "$BACKUPS_DIR"
+            _make_private_dir "$BACKUPS_DIR"
             cp -p "$target" "$backup_path"
             echo "Backed up: $target -> $backup_path"
         fi
@@ -170,7 +186,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$(dirname "$STUB_DST")"
-    mkdir -p "$BRIDGE_DIR"
+    _make_private_dir "$BRIDGE_DIR"
     chmod go-w "$BRIDGE_DIR"
     _stage "$STUB_SRC" "$STUB_DST" "$STUB_MODE"
     stub_tmp="$STAGED_PATH"

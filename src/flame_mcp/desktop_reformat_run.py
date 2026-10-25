@@ -17,11 +17,13 @@ call per clip, each with an intent and an outcome of its own in one journal grou
                 `PyClip.change_start_frame`, read back) -> outcome with `created`. With
                 duplicate=true the call before it is `flame.duplicate` (`_dm_duplicate`).
                 A call waits up to `REFORMAT_WAIT_S`, and the clips are not sent together.
-  4. answer     `reformatted` / `notReformatted` per clip; some of each = ok with `partial`.
+  4. answer     `reformatted` / `notReformatted` per clip; some of each, or a clip changed but
+                not all as asked = FLAME_API_ERROR `partial:` (what changed stays journaled).
 
 A call that ends without an answer (TIMEOUT / BRIDGE_LOST / BRIDGE_UNAVAILABLE, or a `pending`
 handle: the thread is `main-async`) stops the run at that clip, leaves its intent open and shuts
-the write door (`WriteGuard`) until `journal.check` has decided (`desktop_reformat_revert`).
+the write guard (`WriteGuard`; writes are refused until `journal.check` has decided,
+`desktop_reformat_revert`).
 No clip after it is started.
 
 `created` of an outcome is what `journal.revert` works from:
@@ -54,7 +56,7 @@ from flame_mcp.desktop_reformat_state import (
     elapsed_ms,
     requested_of,
 )
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ
+from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ, pre_read_failure
 from flame_mcp.journal import new_id
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.library_open import merge_into_envelope
@@ -143,13 +145,7 @@ def _aspect_refusal(
 
 
 def _fail_pre_read(op: RegisteredOperation, pre_env: dict[str, Any]) -> dict[str, Any]:
-    failure = dict(pre_env)
-    failure["execution"] = envelope_mod.execution_meta(op)
-    failure["error"] = f"nothing was written: {pre_env.get('error')}"
-    failure["ok"] = False
-    if not failure.get("errorCode"):
-        failure["errorCode"] = "FLAME_API_ERROR"
-    return failure
+    return pre_read_failure(op, pre_env, "written")
 
 
 def _stash_failure(
@@ -197,6 +193,7 @@ def _stash_batch(run: Run, indexes: list[int]) -> dict[str, Any] | None:
         env.get("ok") is True and env.get("pending")
     )
     if unanswered:
+        rt.guard.block_unrecorded(run.group, op.name, str(env.get("errorCode") or "TIMEOUT"))
         return _stash_failure(
             run,
             "nothing was reformatted: the call that copies the clips into the stash ended without "

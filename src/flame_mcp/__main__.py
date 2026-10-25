@@ -20,10 +20,11 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from flame_mcp import envelope, transport
-from flame_mcp.journal import JOURNAL_DIR_ENV, Journal
+from flame_mcp.journal import JOURNAL_DIR_ENV, Journal, default_journal_dir
 from flame_mcp.ops import register_all
 from flame_mcp.opschema import find_non_ascii
 from flame_mcp.policy import Policy, PolicyConfigError
+from flame_mcp.private_fs import default_root, harden_app_dir
 from flame_mcp.registry import Registry
 from flame_mcp.runtime import TestHooks, TestHooksConfigError, warn_if_test_hooks
 from flame_mcp.server import create_server
@@ -63,12 +64,22 @@ def _non_ascii_setting(journal: Journal) -> str | None:
     return None
 
 
-def build_server(*, run_dir: Path | None = None) -> Server[Any]:
+def build_server(*, run_dir: Path | None = None, app_root: Path | None = None) -> Server[Any]:
+    """`app_root` is the flame-mcp directory whose permissions are tightened at startup; `main`
+    passes the real one, a test passes none or its own."""
     try:
         policy = Policy.from_env(os.environ)
     except PolicyConfigError as exc:
         print(f"flame-mcp: invalid policy configuration: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    permissions = None
+    if app_root is not None:
+        in_use = [
+            default_journal_dir(),
+            run_dir if run_dir is not None else transport.default_run_dir(),
+            envelope._default_spill_dir(),
+        ]
+        permissions = harden_app_dir(app_root, extra_dirs=in_use).as_dict()
     # Swept once per startup, before any MCP traffic: a crash-recovery record left
     # by a Flame session that later crashed has no other cleanup path.
     transport.cleanup_stale_inflight(run_dir)
@@ -90,7 +101,9 @@ def build_server(*, run_dir: Path | None = None) -> Server[Any]:
     warn_if_test_hooks(hooks)
     registry = Registry()
     register_all(registry)
-    return create_server(registry, policy, run_dir=run_dir, journal=journal, hooks=hooks)
+    return create_server(
+        registry, policy, run_dir=run_dir, journal=journal, hooks=hooks, permissions=permissions
+    )
 
 
 async def _serve(server: Server[Any]) -> None:
@@ -100,7 +113,7 @@ async def _serve(server: Server[Any]) -> None:
 
 def main() -> None:
     _configure_logging()
-    server = build_server()
+    server = build_server(app_root=default_root())
     anyio.run(_serve, server)
 
 

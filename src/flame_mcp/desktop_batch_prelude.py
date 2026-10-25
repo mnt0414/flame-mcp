@@ -244,18 +244,23 @@ def _dcb_snapshot(dest, sources, known=None):
 
 
 def _dcb_describe(out, dest, src_uid, src_container, copies, existing_uids, current_before):
-    for c in copies:
-        row = dict(_dc_with_selector(c), sourceUid=src_uid)
-        row['state'] = _dcb_state(c)
-        if row['uid'] is None or row['uid'] == src_uid or row['uid'] in existing_uids:
-            out['notNew'].append(row)
-        else:
-            out['copies'].append(row)
+    # What was made is decided by the destination: its Batch groups that were not there before.
+    # The answer is only recorded (returned) and compared with it.
     after = _dcb_container_batches(dest)
     after_uids = [_try(lambda o=o: _v(o.uid)) for o in after]
     out['destinationEntriesAfter'] = _dcb_names_of(after)
-    for row in out['copies']:
+    for c in copies:
+        uid = _try(lambda c=c: _v(c.uid))
+        if uid is None or uid == src_uid or uid in existing_uids:
+            out['notNew'].append(_dc_with_selector(c))
+    for o in after:
+        uid = _try(lambda o=o: _v(o.uid))
+        if uid is None or uid == src_uid or uid in existing_uids:
+            continue
+        row = dict(_dc_with_selector(o), sourceUid=src_uid)
+        row['state'] = _dcb_state(o)
         row['inDestination'] = row['uid'] in after_uids
+        out['copies'].append(row)
     if src_container is not None:
         kept = [_try(lambda o=o: _v(o.uid)) for o in _dcb_container_batches(src_container)]
         out['sourcesRemain'] = src_uid in kept
@@ -271,23 +276,33 @@ def _dcb_describe(out, dest, src_uid, src_container, copies, existing_uids, curr
     out['currentMoved'] = (out['current'] or {}).get('uid') != (current_before or {}).get('uid')
     if out['currentMoved']:
         out['warnings'].append('the current Batch group changed during the copy')
+    if not out['copies']:
+        if out['notNew']:
+            out['error'] = (
+                'copy returned a group that is not new (the source, or one that was there) and '
+                'the destination did not grow (had ' + repr(out['destinationEntriesBefore'])
+                + ', now ' + repr(out['destinationEntriesAfter']) + ')'
+            )
+        else:
+            out['error'] = (
+                'copy returned ' + str(len(copies)) + ' object(s) for 1 Batch group and the '
+                'destination did not grow (had ' + repr(out['destinationEntriesBefore'])
+                + ', now ' + repr(out['destinationEntriesAfter']) + ')'
+            )
+        out['errorCode'] = 'SILENT_NOOP'
+        return
     wrong = [type(c).__name__ for c in copies if type(c).__name__ != 'PyBatch']
-    if len(copies) != 1:
-        out['error'] = 'copy returned ' + str(len(copies)) + ' object(s) for 1 Batch group'
-        out['errorCode'] = 'SILENT_NOOP'
-    elif wrong:
-        out['error'] = 'copy returned a ' + wrong[0] + ', not a PyBatch'
-        out['errorCode'] = 'SILENT_NOOP'
-    elif out['notNew']:
-        out['error'] = 'copy returned a group that is not new (the source, or one that was there)'
-        out['errorCode'] = 'SILENT_NOOP'
-    elif not all(r['inDestination'] for r in out['copies']):
-        out['error'] = (
-            'copy returned without an error but the destination does not list the new group '
-            '(had ' + repr(out['destinationEntriesBefore']) + ', now '
-            + repr(out['destinationEntriesAfter']) + ')'
+    if len(copies) != 1 or wrong or out['notNew']:
+        out['warnings'].append(
+            'copy answered ' + str(len(copies)) + ' object(s) '
+            + repr([type(c).__name__ for c in copies])
+            + ' for 1 Batch group but the destination holds ' + str(len(out['copies']))
+            + ' new group(s): the new groups are recorded as the copies'
         )
-        out['errorCode'] = 'SILENT_NOOP'
+    elif len(out['copies']) > 1:
+        out['warnings'].append(
+            str(len(out['copies'])) + ' new groups appeared in the destination for 1 Batch group'
+        )
 
 
 def _dcb_copy(dest, sources, expected):
@@ -305,6 +320,8 @@ def _dcb_copy(dest, sources, expected):
         'returned': 0,
         'copies': [],
         'notNew': [],
+        'notCopied': [],
+        'partial': False,
         'sources': snapshot['sources'],
         'sourcesRemain': None,
         'destinationEntriesBefore': _dcb_names_of(existing),

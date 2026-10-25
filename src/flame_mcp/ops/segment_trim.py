@@ -52,6 +52,8 @@ _DESCRIPTION = (
     "sourceNotJudgedBecause says why, expectedDeltas.sourceIn / sourceOut null, deltas as read "
     "back); the record side, head and tail are judged as above. Any other segment: "
     "sourceJudged true. "
+    "A head / tail that is 'infinite' before the edit is not judged (result.handleJudged, "
+    "handleNotJudgedBecause says why, expectedDeltas.head / tail null); the record side still is. "
     "result: before / after (the segment's type, sourceName, recordIn / recordOut / sourceIn / "
     "sourceOut / head / tail, PyTime as {timecode, frame}; recordOut / sourceOut are the last "
     "frame (inclusive), not the one after it), deltas (after - before, frames), "

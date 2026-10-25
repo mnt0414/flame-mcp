@@ -33,14 +33,17 @@ from flame_mcp.desktop_delete_prelude import DELETE_HELPER, PURGE_HELPER
 from flame_mcp.desktop_media_prelude import MEDIA_HELPER
 from flame_mcp.desktop_prelude import DESKTOP_HELPER
 from flame_mcp.desktop_reformat_prelude import REFORMAT_HELPER
+from flame_mcp.inspect_prelude import INSPECT_HELPER
 from flame_mcp.library_open import has_refs, library_refs
 from flame_mcp.library_open_prelude import LIBRARY_OPEN_HELPER
 from flame_mcp.node_prelude import ACTION_HELPER, NODE_HELPER
 from flame_mcp.read_prelude import READ_HELPER
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.render_clip_prelude import RENDER_CLIP_HELPER
 from flame_mcp.render_prelude import RENDER_HELPER
 from flame_mcp.segment_connection_prelude import CONNECTION_HELPER
 from flame_mcp.segment_extract_prelude import EXTRACT_HELPER
+from flame_mcp.setup_edit_prelude import SETUP_EDIT_HELPER
 from flame_mcp.timeline_build_prelude import BUILD_HELPER
 from flame_mcp.timeline_compare_prelude import COMPARE_HELPER
 from flame_mcp.timeline_create_prelude import CREATE_HELPER
@@ -495,6 +498,8 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         "",
         READ_HELPER.strip("\n"),
         "",
+        INSPECT_HELPER.strip("\n"),
+        "",
         TIMELINE_HELPER.strip("\n"),
         "",
         TRIM_HELPER.strip("\n"),
@@ -522,6 +527,10 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         PURGE_HELPER.strip("\n"),
         "",
         REFORMAT_HELPER.strip("\n"),
+        "",
+        RENDER_CLIP_HELPER.strip("\n"),
+        "",
+        SETUP_EDIT_HELPER.strip("\n"),
         "",
     ]
 

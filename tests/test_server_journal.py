@@ -56,6 +56,7 @@ async def _run(
     *,
     journal: Journal | None = None,
     hooks: TestHooks | None = None,
+    permissions: dict[str, Any] | None = None,
 ) -> None:
     registry = Registry()
     register_all(registry)
@@ -65,6 +66,7 @@ async def _run(
         run_dir=tmp_path / "run",
         journal=journal if journal is not None else Journal(tmp_path / "journal"),
         hooks=hooks,
+        permissions=permissions,
     )
     async with InMemoryTransport(server, raise_exceptions=True) as (read, write):
         async with ClientSession(read, write) as session:
@@ -130,6 +132,28 @@ def test_version_info_has_a_journal_section(tmp_path: Path) -> None:
         assert journal["dir"] == str(tmp_path / "journal")
         assert journal["unresolvedIntents"] == 0 and journal["writesBlocked"] is False
         assert journal["testHooks"] == [] and journal["blocked"] == []
+
+    anyio.run(_run, tmp_path, body)
+
+
+def test_version_info_reports_how_many_permissions_the_startup_fixed_and_could_not(
+    tmp_path: Path,
+) -> None:
+    report = {"root": "/x", "checked": 9, "fixed": 4, "failed": 1, "skipped": 0, "truncated": False}
+
+    async def body(session: ClientSession) -> None:
+        env = structured(await session.call_tool("flame_version_info", {}))
+        assert env["result"]["permissions"] == report
+
+    anyio.run(partial(_run, tmp_path, body, permissions=report))
+
+
+def test_version_info_has_no_permissions_section_when_nothing_was_tightened(
+    tmp_path: Path,
+) -> None:
+    async def body(session: ClientSession) -> None:
+        env = structured(await session.call_tool("flame_version_info", {}))
+        assert "permissions" not in env["result"]
 
     anyio.run(_run, tmp_path, body)
 

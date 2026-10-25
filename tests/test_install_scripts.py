@@ -266,3 +266,20 @@ def test_uninstall_dry_run_names_the_real_stub_location_without_an_override(env:
 def test_uninstall_rejects_unknown_arguments(env: Env) -> None:
     result = env.run(UNINSTALL, "--force")
     assert result.returncode == 1
+
+
+def test_install_creates_the_flame_mcp_directories_0700_even_with_umask_zero(env: Env) -> None:
+    env.stub_dir.mkdir(parents=True)
+    env.stub.write_text(OLD)
+    result = env.run(INSTALL, umask="0")
+    assert result.returncode == 0, result.stderr
+    for directory in (env.app, env.bridge_dir, env.backups):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    assert stat.S_IMODE(env.impl.stat().st_mode) == 0o600
+
+
+def test_uninstall_creates_the_backups_directory_0700_even_with_umask_zero(env: Env) -> None:
+    env.deploy_old()
+    result = env.run(UNINSTALL, umask="0")
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(env.backups.stat().st_mode) == 0o700

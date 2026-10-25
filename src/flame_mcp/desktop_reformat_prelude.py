@@ -135,61 +135,75 @@ def _rf_conflicts(obj, before, expected):
     return problems
 
 
-def _rf_warnings(kw, after):
-    notes = []
-    for key, attr in (('bit_depth', 'bitDepth'), ('scan_mode', 'scanMode'),
-                      ('frame_rate', 'frameRate')):
-        if key in kw and after[attr] != kw[key]:
-            notes.append(
-                key + ' was asked as ' + repr(kw[key]) + ' and reads back as ' + repr(after[attr])
+def _rf_gaps(spec, after, ran_reformat):
+    # what the clip reads back as that is not what was asked: every value the reformat was to set
+    # (size, ratio, and bit depth / scan mode / frame rate when given) and the start frame
+    kw = spec['reformat']
+    gaps = []
+    if ran_reformat:
+        if after['width'] != kw['width'] or after['height'] != kw['height']:
+            gaps.append(
+                'size asked for ' + str(kw['width']) + 'x' + str(kw['height'])
+                + ', reads back as ' + str(after['width']) + 'x' + str(after['height'])
             )
-    if after['ratio'] is None or abs(after['ratio'] - kw['ratio']) > _RF_RATIO_TOLERANCE:
-        notes.append(
-            'ratio was asked as ' + repr(kw['ratio']) + ' and reads back as ' + repr(after['ratio'])
+        for key, attr in (('bit_depth', 'bitDepth'), ('scan_mode', 'scanMode'),
+                          ('frame_rate', 'frameRate')):
+            if key in kw and after[attr] != kw[key]:
+                gaps.append(
+                    key + ' asked for ' + repr(kw[key]) + ', reads back as ' + repr(after[attr])
+                )
+        if after['ratio'] is None or abs(after['ratio'] - kw['ratio']) > _RF_RATIO_TOLERANCE:
+            gaps.append(
+                'ratio asked for ' + repr(kw['ratio']) + ', reads back as ' + repr(after['ratio'])
+            )
+    wanted = spec.get('start_frame')
+    if wanted is not None and after['startFrame'] != wanted:
+        gaps.append(
+            'start_frame asked for ' + repr(wanted) + ', reads back as ' + repr(after['startFrame'])
         )
-    return notes
+    return gaps
 
 
 def _rf_judge(out, spec, ran_reformat):
+    # nothing changed = SILENT_NOOP; something changed but not all of it as asked, or a call raised
+    # after the clip had changed = FLAME_API_ERROR starting with 'partial:' (the clip is recorded
+    # so a revert puts it back); everything as asked = ok
     kw = spec['reformat']
     before = out['before']
     after = out['after']
-    size = str(kw['width']) + 'x' + str(kw['height'])
-    now = str(after['width']) + 'x' + str(after['height'])
+    changed = after != before
+    out['changed'] = changed
+    raised = None
     if out['reformatError'] is not None:
-        out['error'] = 'PyClip.reformat raised ' + out['reformatError']
-        out['errorCode'] = 'FLAME_API_ERROR'
+        raised = 'PyClip.reformat raised ' + out['reformatError']
     elif out['startFrameError'] is not None:
-        out['error'] = 'PyClip.change_start_frame raised ' + out['startFrameError']
-        out['errorCode'] = 'FLAME_API_ERROR'
-    elif ran_reformat and (after['width'] != kw['width'] or after['height'] != kw['height']):
-        if after == before:
+        raised = 'PyClip.change_start_frame raised ' + out['startFrameError']
+    gaps = _rf_gaps(spec, after, ran_reformat)
+    if raised is not None:
+        if changed:
             out['error'] = (
-                'PyClip.reformat answered ' + repr(out['reformatReturned']) + ' without an error '
-                'but the clip is still ' + now + ' (asked for ' + size + ')'
+                'partial: ' + raised + ', but the clip had changed (now ' + repr(after) + ')'
             )
-            out['errorCode'] = 'SILENT_NOOP'
         else:
-            out['error'] = (
-                'asked for ' + size + ', the clip reads back as ' + now + ' after PyClip.reformat'
-            )
-            out['errorCode'] = 'FLAME_API_ERROR'
-    elif ran_reformat and after == before:
+            out['error'] = raised
+        out['errorCode'] = 'FLAME_API_ERROR'
+    elif gaps and not changed:
+        out['error'] = (
+            'PyClip.reformat / change_start_frame answered without an error but nothing about '
+            'the clip changed (asked for ' + repr(kw) + ': ' + '; '.join(gaps) + ')'
+        )
+        out['errorCode'] = 'SILENT_NOOP'
+    elif gaps:
+        out['error'] = (
+            'partial: the clip changed but not all as asked: ' + '; '.join(gaps)
+        )
+        out['errorCode'] = 'FLAME_API_ERROR'
+    elif ran_reformat and not changed:
         out['error'] = (
             'PyClip.reformat answered ' + repr(out['reformatReturned']) + ' without an error but '
             'nothing about the clip changed (asked for ' + repr(kw) + ')'
         )
         out['errorCode'] = 'SILENT_NOOP'
-    elif spec.get('start_frame') is not None and after['startFrame'] != spec['start_frame']:
-        out['error'] = (
-            'start_frame was asked as ' + repr(spec['start_frame']) + ' and PyClip.change_start_'
-            'frame answered without an error, but the clip reads back as '
-            + repr(after['startFrame'])
-        )
-        out['errorCode'] = 'FLAME_API_ERROR'
-    elif ran_reformat:
-        out['warnings'] = _rf_warnings(kw, after)
-    out['changed'] = after != before
 
 
 def _rf_write(obj, spec, expected):

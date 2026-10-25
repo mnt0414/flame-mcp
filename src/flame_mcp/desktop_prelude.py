@@ -285,7 +285,13 @@ def _dc_describe_created(out, kind, parent, made, uids, opts):
         out['currentMoved'] = out['current'] is not None and (
             out['current'].get('uid') == entry['uid']
         )
-        out['warnings'] = _dc_mismatches(kind, out, opts)
+        gaps = _dc_mismatches(kind, out, opts)
+        if gaps:
+            out['error'] = (
+                'partial: the Batch group was made but not all as asked (read back): '
+                + '; '.join(gaps) + '. It is recorded: journal.revert deletes it'
+            )
+            out['errorCode'] = 'FLAME_API_ERROR'
     elif kind == 'reel_group':
         out['reelRows'] = _dc_reel_rows(list(made.reels))
     elif kind == 'library':
@@ -297,6 +303,27 @@ def _dc_describe_created(out, kind, parent, made, uids, opts):
             want = 'Sequences' if opts.get('sequence') else 'Reel'
             if out['type'] != want:
                 out['warnings'].append('type ' + repr(out['type']) + ', expected ' + repr(want))
+
+
+def _dc_salvage_created(out, kind, made, uids):
+    # the read-back raised before `created` was set: what the call returned is recorded when it
+    # is a thing of the right type whose uid was not in the list before
+    try:
+        if type(made).__name__ != _DC_TYPES[kind]:
+            return False
+        entry = _dc_with_selector(made)
+        if entry['uid'] is None or entry['uid'] in uids:
+            return False
+        state = _dc_state(kind, made)
+    except BaseException:
+        return False
+    out['created'] = entry
+    out['uid'] = entry['uid']
+    out['selector'] = entry['selector']
+    out['name'] = entry['name']
+    out['renamed'] = entry['name'] != out['requestedName']
+    out['state'] = state
+    return True
 
 
 def _dc_create(kind, parent, name, allow_rename, opts, expected):
@@ -333,9 +360,17 @@ def _dc_create(kind, parent, name, allow_rename, opts, expected):
         _dc_describe_created(out, kind, parent, made, uids, opts)
     except BaseException as exc:
         if out['error'] is None:
+            known = out['created'] is not None or _dc_salvage_created(out, kind, made, uids)
             out['error'] = (
                 'the ' + kind + ' was made but reading it back failed: '
                 + type(exc).__name__ + ': ' + str(exc)
+                + (
+                    ''
+                    if known
+                    else '. It may have been written, but what the call returned is not known '
+                    'to be a new ' + kind + ', so nothing is recorded and journal.revert has '
+                    'nothing to put back'
+                )
             )
             out['errorCode'] = 'FLAME_API_ERROR'
     return out
@@ -543,17 +578,61 @@ def _dc_copy_snapshot(dest, sources, known=None, batch=False):
     }
 
 
+def _dc_pair_copies(source_rows, copies, new):
+    # each source with the new entry of the destination that is its copy: the one Flame answered
+    # at its place (by uid), else the first of its type and name. Unpaired new entries follow.
+    by_uid = {}
+    for o in new:
+        by_uid[_dm_uid(o)] = o
+    claimed = []
+    made_of = [None] * len(source_rows)
+    for i, row in enumerate(source_rows):
+        made = None
+        if i < len(copies):
+            cand = _dm_uid(copies[i])
+            if cand in by_uid and cand not in claimed:
+                made = by_uid[cand]
+        if made is None:
+            for o in new:
+                if (
+                    _dm_uid(o) not in claimed
+                    and type(o).__name__ == row['type']
+                    and _try(lambda o=o: _v(o.name)) == row['name']
+                ):
+                    made = o
+                    break
+        if made is not None:
+            claimed.append(_dm_uid(made))
+            made_of[i] = made
+    return made_of, [o for o in new if _dm_uid(o) not in claimed]
+
+
 def _dc_describe_copies(out, dest, sources, copies, source_uids, existing_uids):
-    for i, c in enumerate(copies):
-        row = dict(_dc_with_selector(c), sourceUid=source_uids[i] if i < len(source_uids) else None)
-        row['state'] = _dm_state(c)
-        if row['uid'] is None or row['uid'] in source_uids or row['uid'] in existing_uids:
-            out['notNew'].append(row)
-        else:
-            out['copies'].append(row)
+    # What was made is decided by the destination, never by the answer: its entries that were not
+    # there before (a source that now sits in it is not a copy). The answer pairs them with their
+    # sources; a destination that does not list (a library, a folder) falls back on the answered
+    # clips that are new and can be found by uid.
     after = _dc_dest_entries(dest)
-    after_uids = [_try(lambda o=o: _v(o.uid)) for o in after]
     out['destinationEntriesAfter'] = _dc_names(after)
+    new = []
+    for o in after:
+        uid = _dm_uid(o)
+        if uid is None or uid in existing_uids:
+            continue
+        if uid in source_uids:
+            out['notNew'].append(_dc_with_selector(o))
+        else:
+            new.append(o)
+    unlisted = False
+    if not new and type(dest).__name__ != 'PyReel':
+        new = [o for o in _dm_unlisted(copies, existing_uids) if _dm_uid(o) not in source_uids]
+        unlisted = len(new) > 0
+    for c in copies:
+        uid = _dm_uid(c)
+        if uid is None or uid in source_uids or uid in existing_uids:
+            row = _dc_with_selector(c)
+            if row['uid'] not in [n['uid'] for n in out['notNew']]:
+                out['notNew'].append(row)
     out['sourcesRemain'] = all(
         u is not None and _dc_find_by_uid(u) is not None for u in source_uids
     )
@@ -561,28 +640,63 @@ def _dc_describe_copies(out, dest, sources, copies, source_uids, existing_uids):
         out['warnings'].append(
             'a source is not found by its uid after the copy: the call moved it or deleted it'
         )
-    listed = [c['uid'] in after_uids for c in out['copies']]
-    for row, flag in zip(out['copies'], listed):
-        row['inDestination'] = flag
-    if len(copies) != len(sources):
-        out['error'] = (
-            'copy returned ' + str(len(copies)) + ' clip(s) for ' + str(len(sources))
-            + ' source(s)'
-        )
-        out['errorCode'] = 'SILENT_NOOP'
-    elif out['notNew']:
-        out['error'] = 'copy returned a clip that is not new (a source, or one that was there)'
-        out['errorCode'] = 'SILENT_NOOP'
-    elif type(dest).__name__ == 'PyReel' and not all(listed):
-        out['error'] = (
-            'copy returned without an error but the reel does not list every new clip '
-            '(had ' + repr(out['destinationEntriesBefore']) + ', now '
-            + repr(out['destinationEntriesAfter']) + ')'
-        )
-        out['errorCode'] = 'SILENT_NOOP'
-    elif not all(listed):
+    made_of, extra = _dc_pair_copies(out['sources'], copies, new)
+    after_uids = [_dm_uid(o) for o in after]
+    for i, made in enumerate(made_of):
+        if made is None:
+            out['notCopied'].append(out['sources'][i])
+            continue
+        row = dict(_dc_with_selector(made), sourceUid=source_uids[i])
+        row['state'] = _dm_state(made)
+        row['inDestination'] = row['uid'] in after_uids
+        out['copies'].append(row)
+    for made in extra:
+        row = dict(_dc_with_selector(made), sourceUid=None)
+        row['state'] = _dm_state(made)
+        row['inDestination'] = row['uid'] in after_uids
+        out['copies'].append(row)
+    if unlisted:
         out['warnings'].append(
-            'the destination (' + type(dest).__name__ + ') does not list every new clip'
+            'the destination (' + type(dest).__name__ + ') does not list the new clips; they '
+            'are taken from what Flame answered and found by uid'
+        )
+    made = len(out['copies'])
+    if made == 0:
+        if out['notNew']:
+            out['error'] = (
+                'copy returned a clip that is not new (a source, or one that was there) and the '
+                'destination did not grow (had ' + repr(out['destinationEntriesBefore'])
+                + ', now ' + repr(out['destinationEntriesAfter']) + ')'
+            )
+        else:
+            out['error'] = (
+                'copy returned ' + str(len(copies)) + ' clip(s) for ' + str(len(sources))
+                + ' source(s) and the destination did not grow (had '
+                + repr(out['destinationEntriesBefore']) + ', now '
+                + repr(out['destinationEntriesAfter']) + ')'
+            )
+        out['errorCode'] = 'SILENT_NOOP'
+        return
+    if len(out['notCopied']) > 0:
+        out['partial'] = True
+        out['error'] = (
+            'partial: ' + str(len(made_of) - len(out['notCopied'])) + ' of ' + str(len(sources))
+            + ' source(s) have a copy in the destination; no copy found for (notCopied): '
+            + repr([r['name'] for r in out['notCopied']])
+            + '. What was copied is in result.copies and journal.revert deletes it'
+        )
+        out['errorCode'] = 'FLAME_API_ERROR'
+        return
+    if len(copies) != len(sources) or out['notNew']:
+        out['warnings'].append(
+            'copy answered ' + str(len(copies)) + ' clip(s) for ' + str(len(sources))
+            + ' source(s) but the destination holds ' + str(made) + ' new entr(ies): the new '
+            'entries are recorded as the copies'
+        )
+    elif extra:
+        out['warnings'].append(
+            str(len(extra)) + ' new entr(ies) of the destination could not be matched with a '
+            'source'
         )
 
 
@@ -598,6 +712,8 @@ def _dc_copy(dest, sources, expected):
         'returned': 0,
         'copies': [],
         'notNew': [],
+        'notCopied': [],
+        'partial': False,
         'sources': snapshot['sources'],
         'sourcesRemain': None,
         'destinationEntriesBefore': _dc_names(existing),

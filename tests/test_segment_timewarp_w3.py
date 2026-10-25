@@ -422,6 +422,163 @@ def test_effects_that_cannot_be_read_stop_everything_before_anything_is_written(
     assert seg_row(seg_a(rig)) == A_ROW
 
 
+# A head / tail that is 'infinite' before the edit is not judged; the record side still is.
+
+
+def set_infinite(seg: PySegment, edge: str) -> None:
+    setattr(seg, edge, "infinite")
+
+
+def becomes_a_number(monkeypatch: pytest.MonkeyPatch, method: str, edge: str, value: int) -> None:
+    """Flame gives an 'infinite' handle a number once the segment is edited."""
+    original = getattr(PySegment, method)
+
+    def odd(self: PySegment, *args: Any, **kwargs: Any) -> bool:
+        original(self, *args, **kwargs)
+        setattr(self, edge, value)
+        return False
+
+    monkeypatch.setattr(PySegment, method, odd)
+
+
+def test_a_tail_trim_with_an_infinite_tail_is_ok_and_says_the_tail_was_not_judged(
+    rig: Rig,
+) -> None:
+    set_infinite(seg_a(rig), "tail")
+    env = trim(rig, a_seg(), "tail", 5)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert seg_row(seg_a(rig))[:3] == ["clip1", 10, 28]
+    assert result["handleJudged"] == {"head": True, "tail": False}
+    assert result["handleNotJudgedBecause"] == "tail was 'infinite' before the edit"
+    assert result["deltas"]["recordOut"] == -5 and result["deltas"]["recordIn"] == 0
+    assert result["expectedDeltas"]["tail"] is None and result["expectedDeltas"]["head"] == 0
+
+
+def test_a_tail_trim_whose_infinite_tail_becomes_a_number_is_ok(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_infinite(seg_a(rig), "tail")
+    becomes_a_number(monkeypatch, "_trim", "tail", 5)
+    env = trim(rig, a_seg(), "tail", 5)
+    assert env["ok"] is True, env
+    assert env["result"]["handleJudged"] == {"head": True, "tail": False}
+    assert env["result"]["deltas"]["tail"] is None
+
+
+def test_a_head_trim_with_an_infinite_head_is_ok_and_says_the_head_was_not_judged(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_infinite(seg_a(rig), "head")
+    becomes_a_number(monkeypatch, "_trim", "head", 5)
+    env = trim(rig, a_seg(), "head", 5)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert seg_row(seg_a(rig))[:3] == ["clip1", 15, 33]
+    assert result["handleJudged"] == {"head": False, "tail": True}
+    assert result["handleNotJudgedBecause"] == "head was 'infinite' before the edit"
+    assert result["deltas"]["recordIn"] == 5 and result["deltas"]["recordOut"] == 0
+    assert result["expectedDeltas"]["head"] is None and result["expectedDeltas"]["tail"] == 0
+
+
+def test_a_trim_with_both_handles_infinite_names_both_in_the_reason(rig: Rig) -> None:
+    set_infinite(seg_a(rig), "head")
+    set_infinite(seg_a(rig), "tail")
+    env = trim(rig, a_seg(), "tail", 5)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["handleJudged"] == {"head": False, "tail": False}
+    assert result["handleNotJudgedBecause"] == (
+        "head was 'infinite' before the edit; tail was 'infinite' before the edit"
+    )
+
+
+def test_a_trim_with_numeric_handles_judges_head_and_tail_and_says_so(rig: Rig) -> None:
+    env = trim(rig, a_seg(), "tail", 3)
+    assert env["ok"] is True, env
+    assert env["result"]["handleJudged"] == {"head": True, "tail": True}
+    assert env["result"]["handleNotJudgedBecause"] is None
+
+
+def test_a_numeric_handle_that_moves_wrongly_is_still_an_error_beside_an_infinite_one(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_infinite(seg_a(rig), "tail")
+    original = PySegment._trim
+
+    def odd(self: PySegment, edge: str, offset: int, ripple: bool) -> bool:
+        original(self, edge, offset, ripple)
+        self.head = int(self.head) + 1
+        return False
+
+    monkeypatch.setattr(PySegment, "_trim", odd)
+    env = trim(rig, a_seg(), "tail", 5)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR"
+    assert env["result"]["handleJudged"] == {"head": True, "tail": False}
+    assert env["result"]["deltas"]["head"] == 1
+
+
+@pytest.mark.parametrize("edge", ["head", "tail"])
+def test_an_infinite_handle_does_not_hide_a_record_side_that_moves_wrongly(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, edge: str
+) -> None:
+    set_infinite(seg_a(rig), edge)
+    original = PySegment._trim
+
+    def odd(self: PySegment, e: str, offset: int, ripple: bool) -> bool:
+        original(self, e, offset, ripple)
+        self._set_record(self.record_in.frame, self.record_out.frame + 1)  # one frame too many
+        return False
+
+    monkeypatch.setattr(PySegment, "_trim", odd)
+    env = trim(rig, a_seg(), edge, 5)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR"
+    assert "not the way" in env["error"]
+    assert env["result"]["handleJudged"][edge] is False
+    assert env["result"]["deltas"]["recordOut"] != env["result"]["expectedDeltas"]["recordOut"]
+    assert env["journal"]["revert"]["op"] == "journal.revert"
+
+
+def test_a_slip_with_an_infinite_head_that_becomes_a_number_is_ok(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_infinite(seg_a(rig), "head")
+    becomes_a_number(monkeypatch, "slip", "head", 3)
+    env = slip(rig, 2)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["handleJudged"] == {"head": False, "tail": True}
+    assert result["handleNotJudgedBecause"] == "head was 'infinite' before the edit"
+    assert result["deltas"]["recordIn"] == 0 and result["deltas"]["recordOut"] == 0
+    assert result["expectedDeltas"]["head"] is None and result["expectedDeltas"]["tail"] == 2
+
+
+def test_a_slip_with_numeric_handles_says_both_were_judged(rig: Rig) -> None:
+    env = slip(rig, 2)
+    assert env["ok"] is True, env
+    assert env["result"]["handleJudged"] == {"head": True, "tail": True}
+    assert env["result"]["handleNotJudgedBecause"] is None
+
+
+def test_a_slip_with_an_infinite_head_still_errors_when_the_record_moves(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_infinite(seg_a(rig), "head")
+    original = PySegment.slip
+
+    def odd(self: PySegment, offset: int, *args: Any, **kwargs: Any) -> bool:
+        original(self, offset)
+        self.head = 3
+        self._set_record(self.record_in.frame + 1, self.record_out.frame + 1)
+        return False
+
+    monkeypatch.setattr(PySegment, "slip", odd)
+    env = slip(rig, 2)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR"
+    assert "slip must not move the record" in env["error"]
+    assert env["result"]["handleJudged"] == {"head": False, "tail": True}
+
+
 def test_the_api_error_hint_allows_for_a_result_that_differed_from_the_measured_one() -> None:
     hint = hint_for("FLAME_API_ERROR")
     assert "or what Flame did differed" in hint and "traceback" in hint

@@ -39,13 +39,31 @@ def _journal_ref(run: Run, *, revertable: bool) -> dict[str, Any] | None:
     }
 
 
+def _is_partial(run: Run) -> bool:
+    """Some of the work was done and some was not: a clip reformatted next to one that was not, or
+    a clip that changed but not all as asked."""
+    return bool(run.reformatted and run.failed) or any(f.get("touched") for f in run.failed)
+
+
+def _partial_counts(run: Run) -> dict[str, int]:
+    return {"reformatted": len(run.reformatted), "notReformatted": len(run.failed)}
+
+
+def _reasons(failed: list[dict[str, Any]]) -> str:
+    return "; ".join(
+        f"targets[{f['index']}] ({(f.get('from') or {}).get('name')!r}): "
+        f"{str(f.get('reason')).removeprefix('partial: ')}"
+        for f in failed
+    )
+
+
 def _result_body(run: Run) -> dict[str, Any]:
     body: dict[str, Any] = {
         "requested": len(run.rows),
         "mode": DUPLICATE if run.duplicate else IN_PLACE,
         "reformatted": run.reformatted,
         "notReformatted": run.failed,
-        "partial": bool(run.reformatted and run.failed),
+        "partial": _is_partial(run),
         "warnings": run.warnings,
         "notes": [],
     }
@@ -103,31 +121,33 @@ def finish(run: Run, started: float) -> dict[str, Any]:
             ),
             **common,
         )
-    elif run.reformatted:
-        partial = (
-            {"reformatted": len(run.reformatted), "notReformatted": len(run.failed)}
-            if run.failed
-            else None
-        )
+    elif run.reformatted and not run.failed:
         env = envelope_mod.build_envelope(
             ok=True,
-            partial=partial,
             journal=_journal_ref(run, revertable=True),
             **common,
         )
-        if partial is not None:
-            env["degraded"] = [
-                f"{len(run.failed)} of {len(run.rows)} clip(s) were not reformatted "
-                "(result.notReformatted)"
-            ]
-    else:
-        reasons = "; ".join(
-            f"targets[{f['index']}] ({(f.get('from') or {}).get('name')!r}): {f.get('reason')}"
-            for f in run.failed
-        )
+    elif _is_partial(run):
         env = envelope_mod.build_envelope(
             ok=False,
-            error=f"nothing was reformatted: {reasons}",
+            error=(
+                f"partial: {len(run.reformatted)} of {len(run.rows)} clip(s) were reformatted as "
+                f"asked; the rest were not (result.notReformatted): {_reasons(run.failed)}"
+            ),
+            error_code="FLAME_API_ERROR",
+            partial=_partial_counts(run),
+            journal=_journal_ref(run, revertable=True),
+            hint_override=(
+                "What changed is recorded: journal.revert(group) puts the clips back."
+                if run.created_any
+                else None
+            ),
+            **common,
+        )
+    else:
+        env = envelope_mod.build_envelope(
+            ok=False,
+            error=f"nothing was reformatted: {_reasons(run.failed)}",
             error_code=_error_code_of(run.failed),
             journal=_journal_ref(run, revertable=True),
             hint_override=(

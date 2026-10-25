@@ -18,6 +18,8 @@ from fake_media_tree import (
     PyNode,
     PyReel,
     PyReelGroup,
+    PyRenderNode,
+    PyWriteFileNode,
 )
 from flame_mcp import selectors
 from flame_mcp.ops import register_all
@@ -486,3 +488,54 @@ def test_batch_list_with_no_current_group_has_no_error() -> None:
     result = run_op(registry, "batch.list", {"limit": 50}, flame)
     assert result["value"]["currentError"] is None
     assert result["value"]["items"][0]["isCurrent"] is False
+
+
+def _outputs_world() -> FakeFlame:
+    writer = PyWriteFileNode("wf1", media_path="/var/tmp/out/")
+    writer.bypass.set_value(True)
+    renderer = PyRenderNode("render1")
+    group = PyBatch("OUT", "u-out", nodes=[PyNode("blur1", "Blur"), writer, renderer])
+    plain = PyBatch("PLAIN", "u-plain", nodes=[PyNode("blur1", "Blur")])
+    return FakeFlame(desktop=PyDesktop(batch_groups=[group, plain]))
+
+
+def test_batch_list_does_not_read_outputs_by_default() -> None:
+    result = run_op(make_registry(), "batch.list", {"limit": 50}, _outputs_world())
+    assert result["opError"] is None
+    assert all("outputs" not in item for item in result["value"]["items"])
+
+
+def test_batch_list_outputs_summarises_render_and_write_file_nodes() -> None:
+    result = run_op(make_registry(), "batch.list", {"limit": 50, "outputs": True}, _outputs_world())
+    assert result["opError"] is None
+    out, plain = result["value"]["items"]
+    assert out["outputs"] == [
+        {"name": "wf1", "kind": "write_file", "bypass": True, "mediaPath": "/var/tmp/out/"},
+        {
+            "name": "render1",
+            "kind": "render",
+            "bypass": False,
+            "destination": ["Batch Reels", "Batch Renders"],
+        },
+    ]
+    assert plain["outputs"] == []
+    assert "nodeCount" not in out
+
+
+def test_batch_list_outputs_value_is_null_when_an_attribute_cannot_be_read() -> None:
+    flame = _outputs_world()
+    writer = flame.projects.current_project.current_workspace.desktop.batch_groups[0].nodes[1]
+    del writer.media_path
+    result = run_op(make_registry(), "batch.list", {"limit": 50, "outputs": True}, flame)
+    assert result["opError"] is None
+    assert result["value"]["items"][0]["outputs"][0]["mediaPath"] is None
+
+
+def test_batch_list_outputs_stops_after_the_time_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    value, reads = _run_with_clock(
+        monkeypatch, {"limit": 50, "outputs": True}, count=4, seconds_per_read=3.0
+    )
+    assert reads == ["G0", "G1"]
+    assert [i["outputs"] for i in value["items"]] == [[], []]
+    assert value["truncated"] is True and value["nextOffset"] == 2
+    assert value["stoppedEarly"] == {"reason": "time budget", "budgetS": 5.0, "read": 2}

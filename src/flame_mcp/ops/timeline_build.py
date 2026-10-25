@@ -79,7 +79,13 @@ _PUT_RESULT = (
     "`layout` ([type, recordIn, recordOut, sourceName] of the segments around `at`, "
     "layoutWindowed when only part is listed) on the target track, startFrame {before, after, "
     "changed}, placed (the position of the media segment now at `at`, with a 'segment' selector "
-    "for the next edit), changed, returned, warnings."
+    "for the next edit), placement {expectedName, foundName, expectedLength, foundLength}, "
+    "changed, returned, warnings. After the put the track is read back: a media segment must "
+    "start at `at`, carry the clip's name as source_name and be as long as the clip's used "
+    "range (the marked range, else the whole clip); when the sequence changed but not that way "
+    "the call is FLAME_API_ERROR with a message starting `partial:` (the change stays, "
+    "result.after shows it, journal.revert puts the sequence back). If the length of the clip "
+    "cannot be read it is not compared and a warning says so."
 )
 
 _OVERWRITE_DESCRIPTION = (
@@ -132,9 +138,10 @@ _CUT_DESCRIPTION = (
     "version, track, type, recordIn, recordOut), " + _STATE + ", with "
     "`layout` around `at` (the target track, or every track for scope='all'), split (scope="
     "'track': whether a segment now ends at at - 1 beside one that starts at `at`; scope='all': "
-    "the tracks that were cut), changed, returned, audio, warnings. "
-    + _AUDIO_JUDGED
-    + _CHECKPOINTED_AUDIO
+    "the tracks that were cut, and notSplit, the tracks willCut lists that were not), changed, "
+    "returned, audio, warnings. With scope='all', when the video changed but some track of "
+    "willCut was not split, the call is FLAME_API_ERROR with a message starting `partial:` "
+    "(journal.revert puts the sequence back). " + _AUDIO_JUDGED + _CHECKPOINTED_AUDIO
 )
 _CREATE_VERSION_DESCRIPTION = (
     "Add a version to a sequence. "
@@ -393,7 +400,12 @@ def _phase_code(args: Mapping[str, Any], check_call: str, write_call: str, *reso
         return build_source(
             *resolve, f"_result = {check_call}", raise_on_error_src(), "_affected = 0"
         )
-    return build_source(*resolve, f"_result = {write_call}", raise_on_error_src(), "_affected = 1")
+    return build_source(
+        *resolve,
+        f"_result = {write_call}",
+        "_affected = 0 if _result['error'] is not None and not _result.get('changed') else 1",
+        raise_on_error_src(),
+    )
 
 
 def _put_to_python(mode: str) -> Callable[[Mapping[str, Any]], str]:
@@ -551,6 +563,9 @@ _PUT_REQUIRES = (
     "PySegment.source_name",
     "PySegment.record_in",
     "PySegment.record_out",
+    "PyClip.in_mark",
+    "PyClip.out_mark",
+    "PyClip.duration",
     "flame.PyTime",
 )
 

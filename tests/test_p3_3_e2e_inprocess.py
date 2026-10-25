@@ -3,7 +3,7 @@
 The script runs end to end (tests/e2e_inprocess.py). NOT evidence about a real Flame: it shows
 that the stages, selectors and judgements of the script hang together and agree with what the fake
 does, and that the pure parts (the dry run) compile. The fake is modelled on Flame 2025.2.4
-measurements of segment slip, replace, TimelineFX and extraction (copy_to_media_panel, match)."""
+measurements of segment slip, replace, Timeline FX and extraction (copy_to_media_panel, match)."""
 
 from __future__ import annotations
 

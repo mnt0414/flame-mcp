@@ -16,8 +16,14 @@ What it encodes (measured on Flame 2025.2.4):
   - what the Timeline shows may change when something is moved out of a reel or the shown
     sequence is deleted (observed; no rule is known for when), so what is shown is read before and
     after, the sequence shown before being opened again when it changed (`_tl_display_fix`).
-  - only a clip and a sequence are deleted: stashing and putting back a container (a reel, a reel
-    group, a folder, a library, a Batch group) was not measured.
+  - a clip and a sequence are deleted, and a reel of a Desktop reel group that holds no clip and no
+    sequence (`_dd_check_target`). A reel with anything in it is not deleted, because deleting
+    a reel of a Batch group also deletes the Clip nodes that use its clips. An empty reel has
+    nothing to stash: a revert makes a new empty reel of the same name and type with
+    `create_reel` (which adds at the end and numbers a taken name, so a taken name is a
+    CONFLICT); the old place, the colour and other attributes do not come back. Stashing and
+    putting back any other container (a reel group, a folder, a library, a Batch group) is
+    refused.
   - nothing inside a library is deleted (`_dd_check_target`, before anything is copied): library
     contents are never deleted by this server. `PURGE_HELPER` is the one exception, for the copies
     the journal recorded in the checkpoint library.
@@ -34,6 +40,37 @@ an error into `_OpError` so the partial result stays in the envelope.
 from __future__ import annotations
 
 DELETE_HELPER = """
+_DD_TARGET_TYPES = ('PyClip', 'PySequence', 'PyReel')
+
+
+def _dd_reel_counts(reel):
+    counts = []
+    for attr in ('clips', 'sequences', 'children'):
+        try:
+            counts.append(len(list(getattr(reel, attr))))
+        except BaseException as exc:
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                'the reel ' + repr(_try(lambda: _v(reel.name))) + ' could not be listed ('
+                + type(exc).__name__ + ': ' + str(exc) + '), so it is not known to be empty',
+            )
+    return counts
+
+
+def _dd_fingerprint(obj):
+    if type(obj).__name__ != 'PyReel':
+        return _tl_fingerprint(obj)
+    clips, sequences, children = _dd_reel_counts(obj)
+    empty = clips == 0 and sequences == 0 and children == 0
+    return {
+        'fingerprint': 'empty-reel' if empty else 'reel:' + repr([clips, sequences, children]),
+        'segmentCount': 0,
+        'effectCount': 0,
+        'versions': 0,
+        'unreadable': 0,
+    }
+
+
 def _dd_inside_library(obj, library_name):
     for parent in _tl_chain(obj):
         if type(parent).__name__ != 'PyLibrary':
@@ -45,15 +82,21 @@ def _dd_inside_library(obj, library_name):
 
 def _dd_check_target(obj, label, library_name):
     kind = type(obj).__name__
-    if kind not in _DC_ENTRY_TYPES:
+    if kind not in _DD_TARGET_TYPES:
         raise _OpError(
             'PRECONDITION_UNMET',
-            label + ' is a ' + kind + ', not a PyClip / PySequence: a container (a reel, a reel '
-            'group, a folder, a library, a Batch group) is not deleted here, only a clip or a '
-            'sequence is',
+            label + ' is a ' + kind + ', not a PyClip / PySequence / PyReel: a container (a reel '
+            'group, a folder, a library, a Batch group) is not deleted here, only a clip, a '
+            'sequence or an empty reel is',
+        )
+    if _dc_is_batch_reel(obj):
+        raise _OpError(
+            'INVALID_ARGS',
+            label + ' is a reel of a Batch group: a Batch group is not deleted from here',
         )
     parent = _dm_parent(obj, label)
-    if _dc_is_batch_reel(parent) or _tl_location(obj) == 'batch':
+    where = _tl_location(obj)
+    if _dc_is_batch_reel(parent) or where == 'batch':
         raise _OpError(
             'INVALID_ARGS',
             label + ' is inside a reel of a Batch group: a Batch group is not deleted from here',
@@ -65,10 +108,38 @@ def _dd_check_target(obj, label, library_name):
             'there is cleaned up with journal.purge_checkpoints, which only deletes what the '
             'journal records',
         )
-    if _tl_location(obj) == 'library':
+    if where == 'library':
         raise _OpError(
             'PRECONDITION_UNMET',
             label + ' is inside a library: library contents are never deleted by this server',
+        )
+    if kind == 'PyReel':
+        if type(parent).__name__ != 'PyReelGroup':
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                label + ' is a reel in a ' + type(parent).__name__ + ', not in a reel group of the '
+                'Desktop',
+            )
+        clips, sequences, children = _dd_reel_counts(obj)
+        if clips or sequences or children:
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                label + ' is a reel that holds ' + str(clips) + ' clip(s), ' + str(sequences)
+                + ' sequence(s) and ' + str(children) + ' entry(ies) in all: only an empty reel '
+                'is deleted (deleting a reel may also delete the Clip nodes that use its clips)',
+            )
+        if not isinstance(_try(lambda: _ja(obj.type)), str):
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                label + ' is a reel whose type could not be read, so it could not be made again '
+                'as the same kind of reel by a revert',
+            )
+    if where != 'desktop':
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is not found to be on the Desktop (its parents are '
+            + repr(_tl_chain_types(obj)) + '): nothing is deleted that cannot be put back, and '
+            'what may be inside a library is never deleted',
         )
     return parent
 
@@ -90,8 +161,10 @@ def _dd_snapshot(targets, library_name):
         if row['uid'] in seen:
             raise _OpError('INVALID_ARGS', label + ' is listed twice')
         seen.append(row['uid'])
-        fp = _tl_fingerprint(obj)
+        fp = _dd_fingerprint(obj)
         row['parent'] = parent_row
+        if type(obj).__name__ == 'PyReel':
+            row['reelType'] = _try(lambda o=obj: _ja(o.type))
         row['fingerprint'] = fp['fingerprint']
         row['segmentCount'] = fp['segmentCount']
         row['effectCount'] = fp['effectCount']
@@ -117,6 +190,21 @@ def _dd_stash(targets, library_name, reel_name):
         'errorCode': None,
     }
     for i, obj in enumerate(targets):
+        if type(obj).__name__ == 'PyReel':
+            fp = _dd_fingerprint(obj)
+            out['stashes'].append(
+                {
+                    'index': i,
+                    'source': _tl_ident(obj),
+                    'stash': None,
+                    'fingerprint': fp['fingerprint'],
+                    'segmentCount': 0,
+                    'effectCount': 0,
+                    'displayed': False,
+                    'display': None,
+                }
+            )
+            continue
         try:
             res = _tl_stash_copy(obj, library_name, reel_name)
         except BaseException as exc:
@@ -156,7 +244,7 @@ def _dd_delete_conflicts(targets, uids, snapshot, expected):
         info = snapshot.get(uid)
         if info is None:
             problems.append(repr(name) + ' (uid ' + str(uid) + ') has no stashed copy on record')
-        elif _tl_fingerprint(obj)['fingerprint'] != info['fingerprint']:
+        elif _dd_fingerprint(obj)['fingerprint'] != info['fingerprint']:
             problems.append(
                 repr(name) + ' (uid ' + str(uid) + ') changed between the read and the write'
             )
@@ -167,6 +255,8 @@ def _dd_delete_one(obj, uid, info, shown_before):
     parent = _try(lambda: obj.parent)
     origin = _dc_with_selector(obj)
     origin['parent'] = _dc_with_selector(parent) if parent is not None else None
+    if origin['type'] == 'PyReel':
+        origin['reelType'] = _try(lambda: _ja(obj.type))
     try:
         returned = flame.delete(obj, confirm=False)
         error = None
@@ -179,6 +269,7 @@ def _dd_delete_one(obj, uid, info, shown_before):
             'name': origin['name'],
             'type': origin['type'],
             'uid': uid,
+            'reelType': origin.get('reelType'),
         },
         'checkpoint': info.get('checkpoint'),
         'stash': info.get('stash'),
@@ -187,6 +278,30 @@ def _dd_delete_one(obj, uid, info, shown_before):
         'wasDisplayed': shown_before is not None and shown_before['uid'] == uid,
         'deleteReturned': _ja(returned),
         'deleteError': error,
+    }
+    return still is None, row, still
+
+
+def _dd_unread_one(obj, uid, info, shown_before, exc):
+    # a read before flame.delete raised: the target is looked up by uid to see whether it is
+    # still there; its old parent was not read, so a revert cannot put it back if it is gone
+    still = _dc_find_by_uid(uid)
+    row = {
+        'from': {
+            'parent': None,
+            'name': _try(lambda: _v(obj.name)),
+            'type': type(obj).__name__,
+            'uid': uid,
+            'reelType': None,
+        },
+        'checkpoint': info.get('checkpoint'),
+        'stash': info.get('stash'),
+        'fingerprint': info.get('fingerprint'),
+        'segmentCount': info.get('segmentCount'),
+        'wasDisplayed': shown_before is not None and shown_before['uid'] == uid,
+        'deleteReturned': None,
+        'deleteError': None,
+        'readError': type(exc).__name__ + ': ' + str(exc),
     }
     return still is None, row, still
 
@@ -215,7 +330,10 @@ def _dd_delete(targets, snapshot, expected):
     shown_before = _tl_shown()
     out['shownBefore'] = shown_before
     for obj, uid in zip(targets, uids):
-        gone, row, still = _dd_delete_one(obj, uid, snapshot[uid], shown_before)
+        try:
+            gone, row, still = _dd_delete_one(obj, uid, snapshot[uid], shown_before)
+        except BaseException as exc:
+            gone, row, still = _dd_unread_one(obj, uid, snapshot[uid], shown_before, exc)
         if gone:
             out['deleted'].append(row)
             if row['deleteReturned'] is not True:
@@ -226,11 +344,16 @@ def _dd_delete(targets, snapshot, expected):
         else:
             row['stillThere'] = True
             out['notDeleted'].append(row)
-    fix = _tl_display_fix(shown_before, False, None)
-    out['shownAfterDelete'] = fix['afterStep']
-    out['reshown'] = fix['reshown']
-    out['reshownNote'] = fix['note']
-    out['shownAfter'] = fix['after']
+    display_error = None
+    try:
+        fix = _tl_display_fix(shown_before, False, None)
+        out['shownAfterDelete'] = fix['afterStep']
+        out['reshown'] = fix['reshown']
+        out['reshownNote'] = fix['note']
+        out['shownAfter'] = fix['after']
+    except BaseException as exc:
+        display_error = type(exc).__name__ + ': ' + str(exc)
+        out['warnings'].append('reading what the Timeline shows after the delete failed')
     if not out['deleted']:
         out['error'] = (
             'flame.delete left every one of the ' + str(len(targets)) + ' target(s) where it was '
@@ -241,10 +364,20 @@ def _dd_delete(targets, snapshot, expected):
         return out
     out['partial'] = len(out['notDeleted']) > 0
     if out['partial']:
-        out['warnings'].append(
-            str(len(out['notDeleted'])) + ' of ' + str(len(targets)) + ' target(s) are still '
-            'there (notDeleted)'
+        out['error'] = (
+            'partial: ' + str(len(out['deleted'])) + ' of ' + str(len(targets)) + ' target(s) '
+            'were deleted; still there (notDeleted): '
+            + repr([r['from']['name'] for r in out['notDeleted']])
+            + '. What was deleted is in result.deleted and journal.revert puts it back'
         )
+        out['errorCode'] = 'FLAME_API_ERROR'
+    if display_error is not None:
+        note = (
+            'the delete may have been written beyond what is listed: reading what the Timeline '
+            'shows afterwards failed (' + display_error + ')'
+        )
+        out['error'] = note if out['error'] is None else out['error'] + '; ' + note
+        out['errorCode'] = 'FLAME_API_ERROR'
     return out
 
 
@@ -259,8 +392,61 @@ def _dd_revert_problem(item, stash):
     return None
 
 
+def _dd_revert_reel(item):
+    origin = item.get('from') or {}
+    base = {'from': origin, 'checkpoint': None, 'stash': None}
+    name = origin.get('name')
+    parent = _dm_container(origin.get('parent'))
+    problem = None
+    if parent is None:
+        problem = (
+            'its original reel group ' + repr((origin.get('parent') or {}).get('name')) + ' is gone'
+        )
+    elif type(parent).__name__ != 'PyReelGroup':
+        problem = 'its original parent is a ' + type(parent).__name__ + ', not a reel group'
+    elif name in [_try(lambda r=r: _v(r.name)) for r in list(parent.reels)]:
+        problem = 'the reel group already has a reel named ' + repr(name)
+    if problem is not None:
+        return None, dict(base, reason=problem, errorCode='CONFLICT')
+    try:
+        made = parent.create_reel(name, sequence=origin.get('reelType') == 'Sequences')
+    except BaseException as exc:
+        reason = 'the reel could not be made again: ' + type(exc).__name__ + ': ' + str(exc)
+        return None, dict(base, reason=reason, errorCode='FLAME_API_ERROR')
+    if made is None:
+        reason = 'create_reel answered None for the name ' + repr(name)
+        return None, dict(base, reason=reason, errorCode='FLAME_API_ERROR')
+    made_name = _try(lambda: _v(made.name))
+    if made_name != name:
+        made_row = _dc_with_selector(made)
+        made_uid = made_row['uid']
+        try:
+            flame.delete(made, confirm=False)
+        except BaseException:
+            pass
+        reason = (
+            'create_reel made a reel named ' + repr(made_name) + ', not ' + repr(name) + '; '
+        )
+        row = dict(base, errorCode='FLAME_API_ERROR')
+        if made_uid is not None and _dc_find_by_uid(made_uid) is None:
+            row['reason'] = reason + 'it was deleted again'
+        else:
+            row['reason'] = reason + 'it could not be deleted and is still there (leftover)'
+            row['leftover'] = made_row
+        return None, row
+    row = dict(
+        base,
+        to=_dc_with_selector(made),
+        fingerprintMatches=_dd_fingerprint(made)['fingerprint'] == item.get('fingerprint'),
+        wasDisplayed=False,
+    )
+    return made, row
+
+
 def _dd_revert_one(item):
     origin = item.get('from') or {}
+    if origin.get('type') == 'PyReel':
+        return _dd_revert_reel(item)
     stash_row = item.get('stash') or {}
     stash = _dc_find_by_uid(stash_row.get('uid')) if stash_row.get('uid') else None
     problem = _dd_revert_problem(item, stash)
@@ -411,9 +597,12 @@ def _tp_scan(library_name, candidates, known):
 
 
 def _tp_delete_one(item, by_uid):
+    # (deleted row, skipped row, failed row): skipped = a copy that is not the recorded one (gone,
+    # renamed) and is left alone on purpose; failed = the delete was called and the copy is still
+    # there, which is not a skip
     found = by_uid.get(item['uid'])
     if found is None:
-        return None, {'id': item['id'], 'reason': 'not in the checkpoint library (any more)'}
+        return None, {'id': item['id'], 'reason': 'not in the checkpoint library (any more)'}, None
     entry, reel = found
     name = _try(lambda: _v(entry.name))
     if item.get('name') is not None and name != item['name']:
@@ -421,19 +610,27 @@ def _tp_delete_one(item, by_uid):
             'id': item['id'],
             'reason': 'its name is ' + repr(name) + ', the journal recorded ' + repr(item['name'])
             + ': it is not deleted',
-        }
+        }, None
     try:
         returned = flame.delete(entry, confirm=False)
         error = None
     except BaseException as exc:
         returned, error = None, type(exc).__name__ + ': ' + str(exc)
     if _dc_find_by_uid(item['uid']) is not None:
-        return None, {
+        return None, None, {
             'id': item['id'],
+            'uid': item['uid'],
+            'name': name,
             'reason': 'flame.delete answered ' + repr(_ja(returned)) + ' / ' + repr(error)
             + ' and it is still there',
         }
-    return {'id': item['id'], 'uid': item['uid'], 'name': name, 'reel': reel}, None
+    row = {'id': item['id'], 'uid': item['uid'], 'name': name, 'reel': reel}
+    if returned is not True:
+        row['warning'] = (
+            'flame.delete answered ' + repr(_ja(returned)) + ' / ' + repr(error)
+            + ' but the copy is gone'
+        )
+    return row, None, None
 
 
 def _tp_delete_empty_reels(lib, reels, prefix):
@@ -455,7 +652,14 @@ def _tp_delete_empty_reels(lib, reels, prefix):
 
 
 def _tp_purge(library_name, items, prefix):
-    out = {'deleted': [], 'skipped': [], 'reelsDeleted': [], 'error': None, 'errorCode': None}
+    out = {
+        'deleted': [],
+        'skipped': [],
+        'notDeleted': [],
+        'reelsDeleted': [],
+        'error': None,
+        'errorCode': None,
+    }
     lib = _tl_find_library(library_name)
     if lib is None:
         for item in items:
@@ -468,10 +672,12 @@ def _tp_purge(library_name, items, prefix):
         by_uid[_dm_uid(entry)] = (entry, reel)
     touched = []
     for item in items:
-        done, skipped = _tp_delete_one(item, by_uid)
+        done, skipped, failed = _tp_delete_one(item, by_uid)
         if done is not None:
             out['deleted'].append(done)
             touched.append(done['reel'])
+        elif failed is not None:
+            out['notDeleted'].append(failed)
         else:
             out['skipped'].append(skipped)
     out['reelsDeleted'] = _tp_delete_empty_reels(lib, touched, prefix)

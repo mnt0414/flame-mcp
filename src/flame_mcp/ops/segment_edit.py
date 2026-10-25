@@ -48,6 +48,8 @@ _SLIP_DESCRIPTION = (
     "sourceNotJudgedBecause says why, expectedDeltas.sourceIn / sourceOut null, deltas as read "
     "back); the record side, head and tail are judged as above. Any other segment: "
     "sourceJudged true. "
+    "A head / tail that is 'infinite' before the edit is not judged (result.handleJudged, "
+    "handleNotJudgedBecause says why, expectedDeltas.head / tail null); the record side still is. "
     "result: before / after (type, sourceName, recordIn / recordOut / sourceIn / sourceOut / "
     "head / tail / recordDuration, PyTime as {timecode, frame}; recordOut / sourceOut are the "
     "last frame (inclusive)), requested, moved, deltas "
@@ -62,8 +64,8 @@ _SLIP_DESCRIPTION = (
 
 _REPLACE_DESCRIPTION = (
     "Replace the media of one segment with another clip, keeping the segment's place on the "
-    "timeline. mode 'media' (default) = PySegment.smart_replace_media (the segment's TimelineFX "
-    "stay); 'media_and_fx' = PySegment.smart_replace (the segment's TimelineFX are dropped "
+    "timeline. mode 'media' (default) = PySegment.smart_replace_media (the segment's Timeline FX "
+    "stay); 'media_and_fx' = PySegment.smart_replace (the segment's Timeline FX are dropped "
     "when the clip has none of its own: result.effects shows them before and after; a Resize "
     "that Flame added by itself because of a bit depth difference stays, measured on Flame "
     "2026.2.3). `source` "
@@ -212,8 +214,8 @@ def register(registry: Registry) -> None:
                     name="mode",
                     type="string",
                     description=(
-                        "'media' (default): smart_replace_media, the segment's TimelineFX stay. "
-                        "'media_and_fx': smart_replace, the TimelineFX do not stay when the clip "
+                        "'media' (default): smart_replace_media, the segment's Timeline FX stay. "
+                        "'media_and_fx': smart_replace, the Timeline FX do not stay when the clip "
                         "has none of its own."
                     ),
                     required=False,

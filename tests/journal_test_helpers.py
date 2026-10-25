@@ -245,4 +245,5 @@ def make_rig(
 TREE_REEL_ID = "/projects/p/ws/P1O/R1"  # the Library reel of fake_media_tree's default tree
 BG1 = {"kind": "batch", "name": "BG1"}
 COMP = {"kind": "node", "batch": BG1, "name": "comp1"}
-REEL_WIRETAP = {"kind": "wiretap", "id": TREE_REEL_ID}
+DESKTOP_REEL_ID = "/wt/RG/Reel 1"  # a reel of the Desktop: what the rename tests write to
+REEL_WIRETAP = {"kind": "wiretap", "id": DESKTOP_REEL_ID}

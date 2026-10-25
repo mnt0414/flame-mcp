@@ -28,6 +28,7 @@ from flame_mcp.applog import (
     crash_lines_since,
     shell_log_path,
 )
+from flame_mcp.private_fs import default_root, make_private_dirs
 from flame_mcp.types import ErrorCode, Thread
 from flame_mcp_bridge.impl import BRIDGE_ABI, FEATURE_CLIENT_HANDLE
 
@@ -57,7 +58,7 @@ def _default_run_dir() -> Path:
     override = os.environ.get(RUN_DIR_ENV)
     if override:
         return Path(override)
-    return Path.home() / "Library" / "Application Support" / "flame-mcp" / "run"
+    return default_root() / "run"
 
 
 def default_run_dir() -> Path:
@@ -298,7 +299,7 @@ def probe_features(run_dir: Path | None = None) -> tuple[str, ...]:
 
 def _inflight_dir(run_dir: Path) -> Path:
     d = run_dir / "inflight"
-    os.makedirs(d, mode=INFLIGHT_DIR_MODE, exist_ok=True)
+    make_private_dirs(d)
     os.chmod(d, INFLIGHT_DIR_MODE)
     return d
 

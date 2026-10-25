@@ -224,7 +224,15 @@ def register(registry: Registry) -> None:
             "A revert that puts back a name another node of the group has is not refused by "
             "this server, but Flame refused it in every case measured (Clip nodes, current and "
             "non-current group): renaming one of several nodes that share a name may not be "
-            "undoable with journal.revert."
+            "undoable with journal.revert. "
+            "A resolution attribute is written as {width, height, bit_depth, frame_ratio, "
+            "scan_mode}, any of them (the others keep their value; scan_mode can only be given "
+            "with the value it already has). "
+            "When only part of it takes effect the call ends in FLAME_API_ERROR: result.after "
+            "holds what was read back, result.failed the fields that did not take, and "
+            "journal.revert still puts the changed fields back. A Colour Source takes bit_depth "
+            "8 / 16 / 32 only (10 and 12 become 16); a Clip node does not take a bit_depth, it "
+            "follows the clip."
         ),
         requires=attribute_requires("PyNode.attributes", "PyBatch.nodes", "PyBatch.uid"),
     )

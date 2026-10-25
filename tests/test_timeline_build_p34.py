@@ -211,7 +211,7 @@ def test_an_overwrite_that_changes_nothing_is_a_silent_noop(
     assert view.state() == "failed" and env["journal"]["revert"]["op"] == "journal.revert"
 
 
-def test_a_change_that_is_not_at_the_frame_is_reported_as_a_warning(
+def test_a_change_that_is_not_at_the_frame_is_a_partial_flame_api_error(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original = PySequence.overwrite
@@ -221,8 +221,11 @@ def test_a_change_that_is_not_at_the_frame_is_reported_as_a_warning(
 
     monkeypatch.setattr(PySequence, "overwrite", late)
     env = put(rig, OVERWRITE, S1, 20)
-    assert env["ok"] is True and env["result"]["placed"] is None
-    assert "no media segment starts at 20" in env["result"]["warnings"][0]
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and "no media segment starts at 20" in env["error"]
+    assert env["result"]["placed"] is None and env["result"]["changed"] is True
+    [view] = Index(rig.records()).groups[env["journal"]["group"]]
+    assert view.state() == "partial" and env["journal"]["revert"]["op"] == "journal.revert"
 
 
 def test_a_revert_puts_the_sequence_back_with_the_fingerprint_it_had(rig: Rig) -> None:

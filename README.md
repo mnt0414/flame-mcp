@@ -7,7 +7,9 @@ English | [日本語](./README.ja.md)
 flame-mcp connects an MCP client, such as Claude Code, to Flame while Flame is running. Describe the task in natural language. The assistant finds a matching operation (op) and runs it in Flame. flame-mcp records each operation that it runs, and you can undo most changes later. Some changes can't be undone (see [Undo](#undo)).
 
 > [!NOTE]
-> **Status: pre-release.** flame-mcp has been tested with **Flame 2025.2.4 and 2026.2.3 on macOS**. It also starts on other Flame versions and shows a warning, but those versions haven't been tested. This is an independent project by one person. It isn't made, endorsed, or supported by Autodesk, and it isn't related to [abrahamADSK/flame-mcp](https://github.com/abrahamADSK/flame-mcp), which has the same name.
+> **Status: beta.** flame-mcp is ready to try, and reports from real work decide when it leaves beta. Try it on a test project first. To look inside a project without changing anything, use [read-only mode](#read-only-mode). A short report is welcome even when nothing went wrong (see [Questions, requests, and bug reports](#questions-requests-and-bug-reports)).
+>
+> flame-mcp has been tested with **Flame 2025.2.4 and 2026.2.3 on macOS**. It also starts on other Flame versions and shows a warning, but those versions haven't been tested. This is an independent project by one person. It isn't made, endorsed, or supported by Autodesk, and it isn't related to [abrahamADSK/flame-mcp](https://github.com/abrahamADSK/flame-mcp), which has the same name.
 
 [What it does](#what-it-does) · [Before you start](#before-you-start) · [Quick start](#quick-start) · [Safety and privacy](#safety-and-privacy) · [Undo](#undo) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [How it works](#how-it-works) · [Documentation](#documentation) · [Questions, requests, and bug reports](#questions-requests-and-bug-reports)
 
@@ -19,11 +21,11 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 | --- | --- |
 | Read | List libraries, reels, clips, and sequences. Read segments (video and audio), Batch nodes, and their attributes. Compare two sequences. |
 | Organize | Create, duplicate, move, and rename reels, clips, and sequences. Delete clips and sequences. |
-| Edit | Trim, slip, replace, and delete segments (closing the gap or leaving it). Cut, insert, and overwrite. Move video tracks. Shorten a sequence. Read and set segment connections. Add and set up TimelineFX. |
+| Edit | Trim, slip, replace, and delete segments (closing the gap or leaving it). Cut, insert, and overwrite. Move video tracks. Shorten a sequence. Read and set segment connections. Add and set up Timeline FX. |
 | Batch | Create, connect, and set up nodes. Save and load setups. Render. |
 | Multi-step plans | Run several operations as one procedure (`plan.run`). |
 
-There are 93 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
+There are 98 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
 
 ## Before you start
 
@@ -184,7 +186,7 @@ The bridge accepts connections only from the user who started Flame, and it runs
 
 ### Stored files and retention periods
 
-flame-mcp creates its files on disk so that only the user who started Flame can read them (files 0600, folders 0700). It doesn't change the permissions of folders that already exist.
+flame-mcp creates its files on disk so that only the user who started Flame can read them (files 0600, folders 0700). At start-up, flame-mcp also tightens the permissions of what already exists in its own folder (see [docs/safety.md](docs/safety.md#tightening-what-is-already-there)).
 
 | What | Where | How long |
 | --- | --- | --- |
@@ -205,7 +207,7 @@ Changes made in one `plan.run` are undone together.
 
 The following can't be undone. The description of each operation in [docs/ops.md](docs/ops.md) says whether it can be undone.
 
-- Files written by a render, and the clips that the render created
+- Files written by a render, the clips that the render created, and the Timeline FX that `render.clip` rendered
 - Saved setup files
 - Shelf reels and Batch iterations that were created
 - Copies saved for undo that were deleted with `journal.purge_checkpoints`
@@ -312,7 +314,15 @@ Report security vulnerabilities as described in [SECURITY.md](.github/SECURITY.m
 
 ## Limitations
 
-- Not supported: transitions, markers, deleting reels or folders, and Linux.
+- Not supported:
+  - exporting media (Flame's Export)
+  - saving a frame as an image for the assistant to look at
+  - markers
+  - transitions
+  - editing keyframes
+  - saving the Desktop or the project
+  - deleting folders, and deleting reels that hold anything (an empty Desktop reel can be deleted)
+  - Linux
 - You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays).
 - A sequence or clip that's restored by an undo goes to the end of its reel. Flame's API has no way to set the order of items in a reel. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
 - The `flame_context` tool lists known pitfalls in its `pitfalls` field.
@@ -354,7 +364,7 @@ The unit tests in `tests/` run without Flame. The regression tests on a real Fla
 
 ## Questions, requests, and bug reports
 
-Ask questions, make requests, and report bugs in GitHub Issues. To propose a code change, discuss it in an issue before you open a pull request. For how to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Ask questions, make requests, and report bugs in GitHub Issues. A usage report helps too, even when nothing went wrong: the Flame version, the kind of work, and what was missing. One line is enough, and you can write in any language. To propose a code change, discuss it in an issue before you open a pull request. For how to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgments
 

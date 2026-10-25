@@ -238,12 +238,17 @@ def test_a_move_that_moves_only_some_is_partial_and_its_revert_puts_back_only_th
     rig.flame.media_panel.move = lambda source, destination: real(source[0], destination)
     [second] = desk_clips(rig, "d1")
     env = mv(rig, [C1, second], reel2_selector(rig))
-    assert env["ok"] is True, env
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:")
     result = env["result"]
     assert result["partial"] is True and env["partial"] == {"moved": 1, "notMoved": 1}
     assert [m["from"]["name"] for m in result["moved"]] == ["c1"]
     assert [m["from"]["name"] for m in result["notMoved"]] == ["d1"]
-    assert any("notMoved" in note for note in env["degraded"])
+    assert env["affected"] == 1 and env["journal"]["revert"] is not None
+    _intent, outcome = rig.records()
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert [m["from"]["name"] for m in outcome["created"]["moves"]] == ["c1"]
+    assert states(rig)[env["journal"]["group"]] == "partial"
     assert "d1" in names(rig.handles["reel3"])
     rig.flame.media_panel.move = real
     out = revert(rig, env)
@@ -251,6 +256,48 @@ def test_a_move_that_moves_only_some_is_partial_and_its_revert_puts_back_only_th
     assert len(out["result"]["reverted"]) == 1 and names(rig.handles["reel_group"].reels[0]) == [
         "c1"
     ]
+
+
+def test_a_moved_thing_that_arrives_under_another_name_is_not_lost_from_the_revert(
+    rig: Rig,
+) -> None:
+    real = rig.flame.media_panel.move
+
+    def renaming_and_silent(source: Any, destination: Any) -> list[Any]:
+        for made in real(source, destination):
+            made.name.set_value(str(made.name.get_value()) + " 1")
+        return []
+
+    rig.flame.media_panel.move = renaming_and_silent
+    env = mv(rig, [C1], reel2_selector(rig))
+    assert env["ok"] is True, env
+    [moved] = env["result"]["moved"]
+    assert moved["from"]["name"] == "c1" and moved["to"]["name"] == "c1 1"
+    assert env["result"]["notMoved"] == [] and env["journal"]["revert"] is not None
+    assert any("by position" in note for note in env["degraded"])
+    rig.flame.media_panel.move = real
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert names(rig.handles["reel_group"].reels[0]) == ["c1 1"]
+
+
+def test_a_source_that_vanished_without_reaching_the_destination_is_listed_as_gone(
+    rig: Rig,
+) -> None:
+    real = rig.flame.media_panel.move
+    [second] = desk_clips(rig, "d1")
+    lost = rig.handles["reel3"].children[0]
+
+    def swallowing(source: Any, destination: Any) -> list[Any]:
+        done: list[Any] = real(source[0], destination)
+        rig.flame.delete(lost, confirm=False)
+        return done
+
+    rig.flame.media_panel.move = swallowing
+    env = mv(rig, [C1, second], reel2_selector(rig))
+    assert env["ok"] is False and env["error"].startswith("partial:")
+    assert env["result"]["notMoved"][0]["uidGone"] is True
+    assert [m["from"]["name"] for m in env["result"]["moved"]] == ["c1"]
 
 
 def test_two_sources_with_the_same_name_are_paired_by_what_flame_answered(rig: Rig) -> None:

@@ -1,10 +1,11 @@
 """Tests `segment.connections`, `segment.create_connection`, `segment.remove_connection`,
 `segment.sync_connections` and the connected-segment notice of `segment.replace`.
 
-The writes run with no checkpoint and no journal record (the Timeline checkpoint would cover
-only the target's sequence), so what is tested is the read-back (a count that did not move is a
-warning, never an error), the presumed inverse call in result.inverse, the notices, and that
-nothing is copied or journaled. Run through the real Runtime with a scripted `transport.exec` over
+The writes run with no checkpoint (the Timeline checkpoint would cover only the target's
+sequence) and each is an intent in the journal, so what is tested is the read-back (a count that
+did not move is SILENT_NOOP, one that moved the wrong way FLAME_API_ERROR; the journal side is in
+test_segment_connection_journal.py), the presumed inverse call in result.inverse, the notices, and
+that nothing is copied. Run through the real Runtime with a scripted `transport.exec` over
 the fake Flame tree (fake_selection_connections.py: what a connection is made of is INVENTED
 there; that a replace is propagated to the connected segments, and that journal.revert does not
 put those back, was measured on Flame 2025.2.4)."""
@@ -27,6 +28,7 @@ from timeline_p32a_helpers import (
     S2_WT,
     S3,
     a_seg,
+    add_sequence,
     library_copy,
     make_timeline_rig,
     media,
@@ -192,9 +194,9 @@ def test_create_connection_reads_the_count_back_and_hands_back_the_inverse(rig: 
     assert len(seg_a(rig).connected_segments()) == 2  # the list holds the segment itself too
     [notice] = result["notices"]
     assert "other sequences" in notice and "journal.revert" in notice
-    assert env["journal"] is None  # no journal record, no checkpoint
-    assert [c.label for c in rig.exec.calls] == [CREATE]
-    assert untouched_world(rig)
+    assert env["journal"]["group"]  # an intent, no checkpoint
+    assert [c.label for c in rig.exec.calls] == [CREATE, CREATE]  # the check read, the write
+    assert not rig.flame.media_panel.copy_calls
 
 
 def test_the_presumed_inverse_the_result_names_takes_it_back(rig: Rig) -> None:
@@ -208,14 +210,13 @@ def test_the_presumed_inverse_the_result_names_takes_it_back(rig: Rig) -> None:
     assert again["op"] == CREATE and again["args"]["target"]["record_in"] == 10
 
 
-def test_a_create_that_leaves_the_count_alone_is_a_warning_not_an_error(rig: Rig) -> None:
+def test_a_create_that_leaves_the_count_alone_is_a_silent_noop(rig: Rig) -> None:
     env = rig.do(CREATE, {"target": a_seg()})  # nothing shares its source: the fake connects none
-    assert env["ok"] is True and env["errorCode"] is None, env
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
     result = env["result"]
     assert result["connected"] == {"before": 0, "after": 0} and result["inverse"] is None
-    [warning] = result["warnings"]
-    assert "create_connection() returned None" in warning and "answers 0 segment(s)" in warning
-    assert "lists the segment itself (measured)" in warning
+    assert "create_connection() returned None" in env["error"]
+    assert "answers 0 other segment(s)" in env["error"]
 
 
 def test_remove_connection_reads_the_count_back(rig: Rig) -> None:
@@ -225,17 +226,17 @@ def test_remove_connection_reads_the_count_back(rig: Rig) -> None:
     assert env["result"]["connected"] == {"before": 1, "after": 0}
     assert env["result"]["inverse"]["op"] == CREATE
     assert s2_seg(rig).connected_segments() == [s2_seg(rig)]
-    assert "other sequences" in env["result"]["notices"][0] and env["journal"] is None
+    assert "other sequences" in env["result"]["notices"][0] and env["journal"]["group"]
 
 
-def test_a_remove_that_leaves_as_many_is_a_warning_not_an_error(rig: Rig) -> None:
+def test_a_remove_that_leaves_as_many_is_a_silent_noop(rig: Rig) -> None:
     env = rig.do(REMOVE, {"target": a_seg()})
-    assert env["ok"] is True, env
-    [warning] = env["result"]["warnings"]
-    assert "remove_connection() returned None" in warning and env["result"]["inverse"] is None
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    assert "remove_connection() returned None" in env["error"]
+    assert env["result"]["inverse"] is None
 
 
-def test_a_count_that_moves_the_wrong_way_is_a_warning_too(
+def test_a_count_that_moves_the_wrong_way_is_a_flame_api_error(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     link(rig)
@@ -243,19 +244,21 @@ def test_a_count_that_moves_the_wrong_way_is_a_warning_too(
         PySegment, "create_connection", lambda self: fsc.seg_remove_connection(self)
     )
     env = rig.do(CREATE, {"target": a_seg()})
-    assert env["ok"] is True and env["result"]["connected"] == {"before": 1, "after": 0}
-    assert len(env["result"]["warnings"]) == 1 and env["result"]["inverse"] is None
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["result"]["connected"] == {"before": 1, "after": 0}
+    assert env["result"]["inverse"] is None
 
 
-def test_sync_reports_the_count_and_the_answer_and_judges_nothing(rig: Rig) -> None:
+def test_sync_reports_the_count_and_the_answer_and_judges_by_the_segments(rig: Rig) -> None:
     link(rig)
     env = rig.do(SYNC, {"target": a_seg()})
     assert env["ok"] is True, env
     result = env["result"]
     assert result["action"] == "sync" and result["connected"] == {"before": 1, "after": 1}
     assert result["returned"] is None and result["inverse"] is None
+    assert result["syncedSegments"] == 1
     assert "other sequences" in result["notices"][0]
-    assert env["journal"] is None and untouched_world(rig)
+    assert env["journal"]["group"] and not rig.flame.media_panel.copy_calls
 
 
 @pytest.mark.parametrize("op", WRITES)
@@ -305,8 +308,10 @@ def test_the_writes_are_declared_as_unsupported_undo_with_no_checkpoint(rig: Rig
         op = rig.registry.get(name)
         assert op is not None
         assert (op.effect, op.undo, op.category) == ("destructive", "unsupported", "segment")
-        assert op.checkpoint is None and op.journal is None and op.wrap is None
-        assert op.accepts == ("segment",) and [p.name for p in op.params] == ["target"]
+        assert op.checkpoint is None and op.journal is None
+        assert op.wrap is not None  # every write is an intent in the journal
+        wanted = ["target", "targets"] if name == REMOVE else ["target"]
+        assert op.accepts == ("segment",) and [p.name for p in op.params] == wanted
         flat = " ".join(op.description.split())
         for word in (
             "other sequences",
@@ -322,7 +327,7 @@ def test_the_writes_are_declared_as_unsupported_undo_with_no_checkpoint(rig: Rig
     assert read is not None and read.effect == "read" and read.default_limit == 20
     assert [p.name for p in read.params] == ["target", "limit", "offset"]
     sync, create, remove = (" ".join(described(rig, n).split()) for n in (SYNC, CREATE, REMOVE))
-    assert "sync_connected_segments" in sync and "makes no judgement of its own" in sync
+    assert "sync_connected_segments" in sync and "SILENT_NOOP" in sync
     assert "inverse" in create and "segment.remove_connection" in create
     assert "segment.create_connection" in remove
 
@@ -379,3 +384,104 @@ def test_the_other_side_of_a_connection_is_listed_the_other_way_round(rig: Rig) 
     [item] = rig.do(CONNECTIONS, {"target": seg_sel(S2, 0, index=0)})["result"]["items"]
     assert item["sequence"]["name"] == "S1" and item["recordIn"]["frame"] == 10
     assert item["selector"] == seg_sel(S1, 0, index=1) and S3 != S2
+
+
+LIST = "timeline.list_segments"
+
+
+def test_list_segments_does_not_read_connections_by_default(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link(rig)
+    reads: list[int] = []
+    original = PySegment.connected_segments
+
+    def counting(self: PySegment) -> list[PySegment]:
+        reads.append(1)
+        return original(self)
+
+    monkeypatch.setattr(PySegment, "connected_segments", counting)
+    items = rig.do(LIST, {"target": S1})["result"]["items"]
+    assert reads == []
+    assert all("connections" not in item for item in items)
+
+
+def test_list_segments_include_connections_counts_the_other_segments(rig: Rig) -> None:
+    link(rig)
+    env = rig.do(LIST, {"target": S1, "include_connections": True})
+    assert env["ok"] is True, env
+    counts = [item["connections"] for item in env["result"]["items"]]
+    assert counts[1] == 1  # A is connected to S2's segment; connected_segments() lists A itself too
+    assert counts[3] == 0  # B is not connected: connected_segments() answers [self]
+
+
+def test_list_segments_connections_is_null_when_connected_segments_raises(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: PySegment) -> list[PySegment]:
+        raise RuntimeError("scripted failure")
+
+    monkeypatch.setattr(PySegment, "connected_segments", broken)
+    env = rig.do(LIST, {"target": S1, "include_connections": True})
+    assert env["ok"] is True, env
+    items = env["result"]["items"]
+    assert len(items) == 4 and all(item["connections"] is None for item in items)
+
+
+def test_list_segments_include_connections_is_refused_for_audio(rig: Rig) -> None:
+    env = rig.do(LIST, {"target": S1, "media": "audio", "include_connections": True})
+    assert env["errorCode"] == "INVALID_ARGS" and "include_connections" in env["error"]
+
+
+def test_list_segments_connections_counts_two_or_more_other_segments(rig: Rig) -> None:
+    fsc.connect(seg_a(rig), s2_seg(rig), s3_seg(rig))
+    items = rig.do(LIST, {"target": S1, "include_connections": True})["result"]["items"]
+    assert [i["connections"] for i in items] == [0, 2, 0, 0]
+
+
+def test_list_segments_connections_falls_back_when_the_position_is_not_unique(rig: Rig) -> None:
+    twin = media("clip1", 10, 33)  # same record_in as A: A cannot be told apart by position
+    track = rig.handles["s1"]._versions[0]._tracks[0]
+    track._segments.append(twin)
+    twin.parent = track
+    link(rig)
+    items = rig.do(LIST, {"target": S1, "include_connections": True})["result"]["items"]
+    assert items[1]["connections"] == 1  # one is taken off the length: [A, S2's segment]
+    assert items[4]["connections"] == 0
+
+
+def test_list_segments_connections_stop_after_the_time_budget(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [1000.0]
+    original = PySegment.connected_segments
+
+    def slow(self: PySegment) -> list[PySegment]:
+        clock[0] += 3.0
+        return original(self)
+
+    monkeypatch.setattr(PySegment, "connected_segments", slow)
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    result = rig.do(LIST, {"target": S1, "include_connections": True})["result"]
+    counts = [i["connections"] for i in result["items"]]
+    assert counts == [0, 0, None, None]  # 3 s after the first, 6 s (> 5 s) after the second
+    assert result["connectionsStoppedEarly"] == {"reason": "time budget", "budgetS": 5.0, "read": 2}
+
+
+def test_list_segments_connections_no_stop_marker_when_all_are_read(rig: Rig) -> None:
+    result = rig.do(LIST, {"target": S1, "include_connections": True})["result"]
+    assert "connectionsStoppedEarly" not in result
+
+
+def test_containers_without_a_wiretap_id_do_not_share_a_position_table(rig: Rig) -> None:
+    reel = rig.handles["reel"]
+    twice = add_sequence(
+        reel, "DUP", [[media("clip1", 0, 23)], [media("clip1", 0, 23)]], wiretap=""
+    )
+    once = add_sequence(reel, "DUP", [[media("clip1", 0, 23)]], wiretap="")
+    fsc.connect(
+        seg_a(rig), twice.versions[0].tracks[0].segments[0], once.versions[0].tracks[0].segments[0]
+    )
+    items = rig.do(CONNECTIONS, {"target": a_seg()})["result"]["items"]
+    by_ambiguous = [(i["sequence"]["name"], i["selector"], i["ambiguous"]) for i in items]
+    assert by_ambiguous == [("DUP", None, True), ("DUP", None, False)]

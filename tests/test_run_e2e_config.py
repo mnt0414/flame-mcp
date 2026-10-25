@@ -152,7 +152,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(stages a-f, z; each stage starts a flame_mcp subprocess)",
+        "(stages a-g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p2_2c_checkpoint_eval",
@@ -200,7 +200,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages a-f, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages a-h, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p2_3d_desktop",
@@ -212,7 +212,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages a-d, f, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages a-f, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p2_3r_reel_fidelity",
@@ -260,7 +260,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages a-g, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages a-f, h, i, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p3_1b_write",
@@ -347,6 +347,66 @@ OLD_CONFIGS: list[OldConfig] = [
         "(setup, stages d, m, a, s, q, c, y, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
+        "p5_batch_fx_loss",
+        "scripts/p5_batch_fx_loss_e2e.py",
+        "p3",
+        "p5_batch_fx_loss_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages f, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p5_render_clip",
+        "scripts/p5_render_clip_e2e.py",
+        "p3",
+        "p5_render_clip_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages r, t, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p5_plan_batch",
+        "scripts/p5_plan_batch_e2e.py",
+        "p3",
+        "p5_plan_batch_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages b, a, n, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p5_setup_edit",
+        "scripts/p5_setup_edit_e2e.py",
+        "p3",
+        "p5_setup_edit_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages c, p, n, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p6_list_all",
+        "scripts/p6_list_all_e2e.py",
+        "p3",
+        "p6_list_all_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages l, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
         "w3_timewarp",
         "scripts/w3_timewarp_e2e.py",
         "p3",
@@ -356,7 +416,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         W3_SETUP_UNSET,
         "600",
-        "(setup, stages t, r, n, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages t, r, n, i, z; each stage starts a flame_mcp subprocess)",
     ),
 ]
 
@@ -475,12 +535,12 @@ def test_only_the_two_p2_4_e2es_take_extra_args_and_crash_check() -> None:
     assert names == {c.name for c in OLD_CONFIGS if c.crash_check == "yes"}
 
 
-def test_list_names_the_26_folded_e2es_and_the_3_dedicated_ones(tmp_path: Path) -> None:
+def test_list_names_the_27_folded_e2es_and_the_3_dedicated_ones(tmp_path: Path) -> None:
     proc = bash([str(RUN_E2E), "--list"], base_env(tmp_path))
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.split()
     assert sorted(names) == sorted(ALL_NAMES)
-    assert len(names) == 29
+    assert len(names) == 34
 
 
 @pytest.mark.parametrize("name", DEDICATED)

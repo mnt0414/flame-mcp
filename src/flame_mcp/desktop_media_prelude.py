@@ -485,11 +485,18 @@ def _dm_move_snapshot(dest, sources):
                 'INVALID_ARGS',
                 label + ' is inside a reel of a Batch group: a Batch group is not moved from here',
             )
-        if _tl_location(c) == 'library':
+        where = _tl_location(c)
+        if where == 'library':
             raise _OpError(
                 'PRECONDITION_UNMET',
                 label + ' is inside a library: library contents are not moved by this server '
                 '(use desktop.copy to take something out of a library)',
+            )
+        if where != 'desktop':
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                label + ' is not found to be on the Desktop (its parents are '
+                + repr(_tl_chain_types(c)) + '): nothing is moved that may be inside a library',
             )
         parent_row = _dc_with_selector(parent)
         if row['uid'] is None or row['selector'] is None or parent_row['selector'] is None:
@@ -518,9 +525,13 @@ def _dm_move_snapshot(dest, sources):
 
 
 def _dm_pair_moves(rows, got, new):
+    # each source with the new entry of the destination that is it: the one Flame answered at its
+    # place (by uid), else the first one of its type and name, else (its old uid finds nothing
+    # any more, so it did go somewhere) the next one of its type, only when no other source of
+    # that type is unmatched
     claimed = []
-    moved = []
-    not_moved = []
+    made_of = [None] * len(rows)
+    by_position = [False] * len(rows)
     by_uid = {}
     for o in new:
         by_uid[_dm_uid(o)] = o
@@ -539,18 +550,72 @@ def _dm_pair_moves(rows, got, new):
                 ):
                     made = o
                     break
+        if made is not None:
+            claimed.append(_dm_uid(made))
+            made_of[i] = made
+    # position is used only for the one unmatched source of its type: with two or more of a type
+    # the order they landed in says nothing, and a wrong pair would make a revert move a thing
+    # into the wrong parent
+    unmatched = {}
+    for i, row in enumerate(rows):
+        if made_of[i] is None and _dc_find_by_uid(row['uid']) is None:
+            unmatched[row['type']] = unmatched.get(row['type'], 0) + 1
+    for i, row in enumerate(rows):
+        if made_of[i] is not None or _dc_find_by_uid(row['uid']) is not None:
+            continue
+        if unmatched[row['type']] > 1:
+            continue
+        for o in new:
+            if _dm_uid(o) not in claimed and type(o).__name__ == row['type']:
+                claimed.append(_dm_uid(o))
+                made_of[i] = o
+                by_position[i] = True
+                break
+    moved = []
+    not_moved = []
+    for i, row in enumerate(rows):
         origin = {
             'parent': row['parent'],
             'name': row['name'],
             'type': row['type'],
             'uid': row['uid'],
         }
-        if made is None:
-            not_moved.append({'from': origin})
-        else:
-            claimed.append(_dm_uid(made))
-            moved.append({'from': origin, 'to': _dc_with_selector(made)})
+        to = None
+        read_error = None
+        if made_of[i] is not None:
+            try:
+                to = _dc_with_selector(made_of[i])
+            except BaseException as exc:
+                read_error = type(exc).__name__ + ': ' + str(exc)
+        if to is None:
+            gone = _dc_find_by_uid(row['uid']) is None
+            entry = {'from': origin, 'uidGone': gone}
+            if read_error is not None:
+                entry['readError'] = read_error
+            not_moved.append(entry)
+            continue
+        item = {'from': origin, 'to': to}
+        if by_position[i]:
+            item['pairedBy'] = 'position'
+        moved.append(item)
     return moved, not_moved, [o for o in new if _dm_uid(o) not in claimed]
+
+
+def _dm_unread_rows(rows):
+    # the sources when the destination could not be read after the move: only the old uid says
+    # whether a source went somewhere
+    return [
+        {
+            'from': {
+                'parent': row['parent'],
+                'name': row['name'],
+                'type': row['type'],
+                'uid': row['uid'],
+            },
+            'uidGone': _dc_find_by_uid(row['uid']) is None,
+        }
+        for row in rows
+    ]
 
 
 def _dm_move_objects(dest, rows, objs):
@@ -558,22 +623,33 @@ def _dm_move_objects(dest, rows, objs):
     before_uids = [_dm_uid(o) for o in before]
     returned = flame.media_panel.move(objs[0] if len(objs) == 1 else list(objs), dest)
     got = list(returned) if isinstance(returned, (list, tuple)) else []
-    after = _dm_media_children(dest)
-    new = _dm_new_entries(before_uids, after)
-    unlisted = False
-    if not new and type(dest).__name__ != 'PyReel':
-        new = _dm_unlisted(got, before_uids)
-        unlisted = len(new) > 0
-    moved, not_moved, extra = _dm_pair_moves(rows, got, new)
-    return {
-        'unlisted': unlisted,
+    done = {
+        'unlisted': False,
         'returned': len(got),
-        'moved': moved,
-        'notMoved': not_moved,
-        'extra': extra,
+        'moved': [],
+        'notMoved': [],
+        'extra': [],
         'before': _dc_names(before),
-        'after': _dc_names(after),
+        'after': None,
+        'readBackError': None,
     }
+    try:
+        after = _dm_media_children(dest)
+        done['after'] = _dc_names(after)
+        new = _dm_new_entries(before_uids, after)
+        unlisted = False
+        if not new and type(dest).__name__ != 'PyReel':
+            new = _dm_unlisted(got, before_uids)
+            unlisted = len(new) > 0
+        moved, not_moved, extra = _dm_pair_moves(rows, got, new)
+        done['unlisted'] = unlisted
+        done['moved'] = moved
+        done['notMoved'] = not_moved
+        done['extra'] = extra
+    except BaseException as exc:
+        done['readBackError'] = type(exc).__name__ + ': ' + str(exc)
+        done['notMoved'] = _dm_unread_rows(rows)
+    return done
 
 
 def _dm_display_after(out, shown_before, moves):
@@ -627,8 +703,43 @@ def _dm_move(dest, sources, expected):
     out['moved'] = done['moved']
     out['notMoved'] = done['notMoved']
     out['destinationEntriesAfter'] = done['after']
-    _dm_display_after(out, shown_before, done['moved'])
-    if not done['moved']:
+    display_error = None
+    try:
+        _dm_display_after(out, shown_before, done['moved'])
+    except BaseException as exc:
+        display_error = type(exc).__name__ + ': ' + str(exc)
+        out['warnings'].append('reading what the Timeline shows after the move failed')
+    lost = [r for r in done['notMoved'] if r['uidGone']]
+    if done['readBackError'] is not None:
+        out['error'] = (
+            'the move ran and may have been written, but reading the destination back failed: '
+            + done['readBackError'] + '. Where the things went is unknown, so nothing is '
+            'recorded and journal.revert has nothing to put back. No longer found by their old '
+            'uid (moved, new place unknown): ' + repr([r['from']['name'] for r in lost])
+            + '; still found at their old place: '
+            + repr([r['from']['name'] for r in done['notMoved'] if not r['uidGone']])
+        )
+        out['errorCode'] = 'FLAME_API_ERROR'
+        return out
+    if done['unlisted']:
+        out['warnings'].append(_dm_unlisted_warning(dest))
+    if done['extra']:
+        out['warnings'].append(
+            str(len(done['extra'])) + ' new entr(ies) of the destination could not be matched with '
+            'a source: ' + repr(_dc_names(done['extra']))
+        )
+    by_position = [m for m in done['moved'] if m.get('pairedBy') == 'position']
+    if by_position:
+        out['warnings'].append(
+            str(len(by_position)) + ' moved thing(s) were matched with their source by position: '
+            'neither the answer nor the name found them'
+        )
+    gone = [_dc_find_by_uid(m['from']['uid']) is None for m in done['moved']]
+    if not all(gone):
+        out['warnings'].append(
+            'a source is still found by its old uid after the move (Flame did not change it)'
+        )
+    if not done['moved'] and not lost:
         out['error'] = (
             'media_panel.move returned ' + str(done['returned']) + ' object(s) for '
             + str(len(sources)) + ' source(s) and no source reached the destination (had '
@@ -636,24 +747,31 @@ def _dm_move(dest, sources, expected):
         )
         out['errorCode'] = 'SILENT_NOOP'
         return out
-    if done['unlisted']:
-        out['warnings'].append(_dm_unlisted_warning(dest))
     out['partial'] = len(done['notMoved']) > 0
     if out['partial']:
-        out['warnings'].append(
-            str(len(done['notMoved'])) + ' of ' + str(len(sources)) + ' source(s) did not reach '
-            'the destination (notMoved)'
+        out['error'] = (
+            'partial: ' + str(len(done['moved'])) + ' of ' + str(len(sources)) + ' source(s) '
+            'reached the destination; not moved (notMoved): '
+            + repr([r['from']['name'] for r in done['notMoved']])
+            + (
+                '; gone from their old place and not matched with a new entry of the destination '
+                '(not recorded, so journal.revert cannot put them back): '
+                + repr([r['from']['name'] for r in lost])
+                if lost else ''
+            )
+            + (
+                '. What moved is in result.moved and journal.revert puts it back'
+                if done['moved'] else ''
+            )
         )
-    if done['extra']:
-        out['warnings'].append(
-            str(len(done['extra'])) + ' new entr(ies) of the destination could not be matched with '
-            'a source: ' + repr(_dc_names(done['extra']))
+        out['errorCode'] = 'FLAME_API_ERROR'
+    if display_error is not None:
+        note = (
+            'the move may have been written beyond what is listed: reading what the Timeline '
+            'shows afterwards failed (' + display_error + ')'
         )
-    gone = [_dc_find_by_uid(m['from']['uid']) is None for m in done['moved']]
-    if not all(gone):
-        out['warnings'].append(
-            'a source is still found by its old uid after the move (Flame did not change it)'
-        )
+        out['error'] = note if out['error'] is None else out['error'] + '; ' + note
+        out['errorCode'] = 'FLAME_API_ERROR'
     return out
 
 
@@ -705,6 +823,7 @@ def _dm_revert_moves(created):
         out['errorCode'] = 'CONFLICT'
         return out
     shown_before = _tl_shown()
+    read_failed = False
     dest_entry = created.get('destination')
     groups = []
     for obj, parent, origin, to in plan:
@@ -729,17 +848,29 @@ def _dm_revert_moves(created):
             )
             continue
         out['reverted'] += done['moved']
-        for row in done['notMoved']:
+        name = _try(lambda p=g['parent']: _v(p.name))
+        if done['readBackError'] is not None:
+            read_failed = True
             out['errors'].append(
-                repr(row['from']['name']) + ' did not reach ' + repr(
-                    _try(lambda p=g['parent']: _v(p.name))
-                )
+                'moving back into ' + repr(name) + ' ran and may have been written, but reading '
+                'the reel back failed: ' + done['readBackError']
             )
+            continue
+        for row in done['notMoved']:
+            out['errors'].append(repr(row['from']['name']) + ' did not reach ' + repr(name))
     _dm_display_after(out, shown_before, out['reverted'])
     if out['errors']:
-        out['error'] = (
+        problems = (
             str(len(out['errors'])) + ' problem(s) while moving back: ' + '; '.join(out['errors'])
         )
-        out['errorCode'] = 'SILENT_NOOP'
+        if out['reverted']:
+            out['error'] = (
+                'partial: ' + str(len(out['reverted'])) + ' of ' + str(len(plan))
+                + ' moved back; ' + problems
+            )
+            out['errorCode'] = 'FLAME_API_ERROR'
+        else:
+            out['error'] = problems
+            out['errorCode'] = 'FLAME_API_ERROR' if read_failed else 'SILENT_NOOP'
     return out
 """

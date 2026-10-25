@@ -1,5 +1,6 @@
 """Prelude source for the segment connection ops (`ops/segment_connect.py`): `segment.connections`,
-`segment.create_connection`, `segment.remove_connection` and `segment.sync_connections`, and for
+`segment.create_connection`, `segment.remove_connection` (also with `targets`) and
+`segment.sync_connections`, and for
 the connected-segment notices of `segment.replace` and `timeline.delete_segments`.
 
 Like `timeline_edit_prelude`: real Python source that `execution.build_exec_code` places ahead of an
@@ -25,9 +26,14 @@ What it encodes (Flame 2025.2 Python API; measured on Flame 2025.2.4):
   - a PySegment has no uid and no wiretap id: a connected segment is placed by walking its parents
     (PyTrack -> PyVersion -> PySequence / PyClip) to its container and counting the container's
     segments with the same record range, source name and source_in (`read_prelude._rp_shared_item`).
-  - what the three write calls return was NOT recorded. The writes have no journal, so a count
-    that did not move the expected way is a warning, never an error (a false SILENT_NOOP is the
-    worst case); the inverse call named in the result is presumed, not measured.
+  - the answers of the three write calls are not used. Each call is judged by reading back.
+    create_connection must leave more other segments connected, remove_connection fewer. No
+    change is SILENT_NOOP; the other way is FLAME_API_ERROR. sync_connected_segments cannot be
+    judged by a count, so the facts of every segment that connected_segments() lists are read
+    before and after, and no change in them is SILENT_NOOP. A read-back that raised leaves
+    what the call did unknown (`readBackFailed`: the server keeps the intent open).
+  - every write is an intent in the journal (`segment_remove_run`, written before the call).
+    There is no revert. `result.inverse` is a presumed inverse call, not a checked one.
 
 Every function answers a dict with `error` / `errorCode` (None when fine); the op's own code turns
 an error into `_OpError` so the partial result stays in the envelope.
@@ -43,16 +49,14 @@ _SC_CALLS = {
 }
 _SC_INVERSE = {'create': 'segment.remove_connection', 'remove': 'segment.create_connection'}
 _SC_AFFECTS = (
-    'The connections of this segment may reach segments in other sequences: this op leaves no '
-    'journal record and no checkpoint, and journal.revert does not undo it. result.inverse is '
+    'The connections of this segment may reach segments in other sequences: this op has no '
+    'checkpoint, and journal.revert does not undo it. result.inverse is '
     'a presumed inverse call'
 )
-_SC_UNMEASURED = (
-    'connected_segments() lists the segment itself (measured), so the count leaves it out'
-)
+_SC_WRONG_WAY = {'create': 'fewer', 'remove': 'more'}
 
 
-def _sc_others(seg, parent, version, track, cache):
+def _sc_count(seg, target_id, target_pos, cache):
     # (the number of OTHER segments connected_segments() answers, an error text); the count is
     # None when the call raised. The call lists the segment itself too (measured: a connected pair
     # answers 2, a segment with no connection answers [self]), so the entry that is the target is
@@ -60,9 +64,6 @@ def _sc_others(seg, parent, version, track, cache):
     # When none can be told to be the target, one is taken off the length.
     try:
         listed = list(seg.connected_segments())
-        tsel = _wiretap_selector(parent)
-        target_id = None if tsel is None else tsel['id']
-        target_pos = _rp_position(parent, version, track, seg)
         flagged = 0
         if target_pos is not None:
             for s in listed:
@@ -71,6 +72,45 @@ def _sc_others(seg, parent, version, track, cache):
         return len(listed) - (flagged if flagged else min(len(listed), 1)), None
     except BaseException as exc:
         return None, type(exc).__name__ + ': ' + str(exc)
+
+
+def _sc_others(seg, parent, version, track, cache):
+    try:
+        tsel = _wiretap_selector(parent)
+        target_id = None if tsel is None else tsel['id']
+        target_pos = _rp_position(parent, version, track, seg)
+    except BaseException as exc:
+        return None, type(exc).__name__ + ': ' + str(exc)
+    return _sc_count(seg, target_id, target_pos, cache)
+
+
+def _sc_page_counts(parent, version, track, all_segs, page, budget):
+    # the counts of `page` (a slice of `all_segs`) for timeline.list_segments: the track's
+    # record_in frames are read once, not once per segment, and the page stops after `budget`
+    # seconds (the first segment is always read); the rest are None and `stopped` says where.
+    import time as _time
+    started = _time.monotonic()
+    try:
+        by_frame = {}
+        for i, s in enumerate(all_segs):
+            by_frame.setdefault(s.record_in.frame, []).append(i)
+        tsel = _wiretap_selector(parent)
+        target_id = None if tsel is None else tsel['id']
+    except BaseException:
+        return [None] * len(page), None
+    cache = {}
+    counts = []
+    for seg in page:
+        if counts and _time.monotonic() - started > budget:
+            stopped = {'reason': 'time budget', 'budgetS': budget, 'read': len(counts)}
+            return counts + [None] * (len(page) - len(counts)), stopped
+        try:
+            hits = by_frame.get(seg.record_in.frame, [])
+            pos = (version, track, hits[0]) if len(hits) == 1 else None
+        except BaseException:
+            pos = None
+        counts.append(_sc_count(seg, target_id, pos, cache)[0])
+    return counts, None
 
 
 def _sc_replace_notice(count):
@@ -165,22 +205,82 @@ def _sc_write_check(seg, parent, action, version, track):
             'FLAME_API_ERROR',
             'connected_segments() raised ' + problem + ': nothing was changed',
         )
+    out['stable'] = _sc_stable(parent, version, track, out['before']['recordIn']['frame'])
     return out
+
+
+def _sc_stable(parent, version, track, record_in):
+    # the address a journal record keeps: the sequence by wiretap id and the segment by its
+    # record_in (and source name), not the caller's `selection` / `path`, which can move. None
+    # when the sequence has no wiretap id or no segment starts at record_in.
+    position = _te_position(parent, version, track, record_in)
+    if position is None or position['selector']['parent'] is None:
+        return None
+    return position['selector']
+
+
+def _sc_snapshot(seg):
+    # (the facts of every segment connected_segments() lists, the segment itself included, in the
+    # order listed; an error text). Sync is judged by whether these changed.
+    try:
+        return [_tl_seg_facts(s) for s in list(seg.connected_segments())], None
+    except BaseException as exc:
+        return None, type(exc).__name__ + ': ' + str(exc)
 
 
 def _sc_judge(out, action, call, before, after):
-    # create should leave more connected segments than before, remove fewer; sync is not judged.
-    # A count that did not move that way is a warning: nothing here is undone by a journal, so a
-    # false error is worse than a missing one.
-    moved = (action == 'create' and after > before) or (action == 'remove' and after < before)
-    if action == 'sync' or moved:
+    # create must leave more other segments connected than before, remove fewer: a count that did
+    # not move is SILENT_NOOP, one that moved the other way FLAME_API_ERROR. Sync is judged by
+    # _sc_judge_sync.
+    if action == 'sync':
         return out
-    out['warnings'].append(
+    if (action == 'create' and after > before) or (action == 'remove' and after < before):
+        return out
+    seen = (
         call + '() returned ' + repr(out['returned']) + ' and connected_segments() answers '
-        + str(after) + ' segment(s) (it answered ' + str(before) + ' before): whether the '
-        'connection changed is not known; ' + _SC_UNMEASURED
+        + str(after) + ' other segment(s) (it answered ' + str(before) + ' before)'
     )
+    if after == before:
+        return _te_fail(out, 'SILENT_NOOP', seen + ': the connection did not change')
+    return _te_fail(
+        out,
+        'FLAME_API_ERROR',
+        seen + ': ' + _SC_WRONG_WAY[action] + ' segments are connected than the call should leave',
+    )
+
+
+def _sc_judge_sync(out, snap_before, snap_after):
+    changed = 0
+    for i, facts in enumerate(snap_after):
+        if i >= len(snap_before) or facts != snap_before[i]:
+            changed += 1
+    changed += max(0, len(snap_before) - len(snap_after))
+    out['syncedSegments'] = changed
+    if changed == 0:
+        return _te_fail(
+            out,
+            'SILENT_NOOP',
+            'sync_connected_segments() returned ' + repr(out['returned']) + ' and none of the '
+            + str(len(snap_after)) + ' segment(s) connected_segments() lists (this one included) '
+            'changed (type, source, record and source range, head, tail): nothing was synced',
+        )
     return out
+
+
+def _sc_read_back(seg, parent, version, track, record_in, out, snap):
+    # reads the target and its connections back after the call; an error text, or None when read
+    out['position'] = _te_position(parent, version, track, record_in)
+    index, found = _tl_find_at(parent, version, track, record_in)
+    out['after'] = None if found is None else _tl_seg_facts(found)
+    count, problem = _sc_others(found if found is not None else seg, parent, version, track, {})
+    out['connected']['after'] = count
+    if count is None:
+        return problem
+    if snap is not None:
+        out['snapshotAfter'], problem = _sc_snapshot(found if found is not None else seg)
+        if out['snapshotAfter'] is None:
+            return problem
+    return None
 
 
 def _sc_write(seg, parent, version, track, action):
@@ -189,6 +289,15 @@ def _sc_write(seg, parent, version, track, action):
         return out
     record_in = out['before']['recordIn']['frame']
     call = _SC_CALLS[action]
+    snap_before = None
+    if action == 'sync':
+        snap_before, problem = _sc_snapshot(seg)
+        if snap_before is None:
+            return _te_fail(
+                out,
+                'FLAME_API_ERROR',
+                'connected_segments() raised ' + problem + ': nothing was changed',
+            )
     out.update(
         ran=True,
         after=None,
@@ -197,25 +306,89 @@ def _sc_write(seg, parent, version, track, action):
         inverse=None,
         notices=[_SC_AFFECTS],
         warnings=[],
+        readBackFailed=False,
     )
     out['returned'] = _ja(getattr(seg, call)())
-    out['position'] = _te_position(parent, version, track, record_in)
-    index, found = _tl_find_at(parent, version, track, record_in)
-    out['after'] = None if found is None else _tl_seg_facts(found)
-    count, problem = _sc_others(found if found is not None else seg, parent, version, track, {})
-    out['connected']['after'] = count
-    if count is None:
+    try:
+        problem = _sc_read_back(seg, parent, version, track, record_in, out, snap_before)
+    except BaseException as exc:
+        problem = type(exc).__name__ + ': ' + str(exc)
+    if problem is not None:
+        out.pop('snapshotAfter', None)
+        out['readBackFailed'] = True
         return _te_fail(
             out,
             'FLAME_API_ERROR',
-            call + '() returned ' + repr(out['returned']) + ' but connected_segments() raised '
-            + problem + ': what it did is not known',
+            call + '() returned ' + repr(out['returned']) + ' but reading the connections back '
+            'raised ' + problem + ': what it did is not known',
         )
-    out = _sc_judge(out, action, call, out['connected']['before'], count)
-    if not out['warnings'] and action in _SC_INVERSE and out['position'] is not None:
+    snap_after = out.pop('snapshotAfter', None)
+    if action == 'sync':
+        out = _sc_judge_sync(out, snap_before, snap_after)
+    else:
+        out = _sc_judge(out, action, call, out['connected']['before'], out['connected']['after'])
+    if out['error'] is None and action in _SC_INVERSE and out['position'] is not None:
         out['inverse'] = {
             'op': _SC_INVERSE[action],
             'args': {'target': out['position']['selector']},
         }
     return out
+
+
+def _sc_remove_check_many(items):
+    # items = [(segment, sequence, version, track)]. Every target is checked before the server
+    # removes any connection (a Gap, a library, connected_segments() raising): a refusal here
+    # leaves every connection as it was. Nothing is written.
+    out = {
+        'action': 'remove',
+        'requested': len(items),
+        'ran': False,
+        'items': [],
+        'notices': [],
+        'error': None,
+        'errorCode': None,
+    }
+    for i, (seg, parent, version, track) in enumerate(items):
+        check = _sc_write_check(seg, parent, 'remove', version, track)
+        if check['error'] is not None:
+            out['items'] = [dict(check, index=i)]
+            return _te_fail(
+                out,
+                check['errorCode'],
+                'targets[' + str(i) + ']: ' + check['error'] + ': nothing was changed',
+            )
+        out['items'].append({
+            'index': i,
+            'before': check['before'],
+            'connected': check['connected'],
+            'stable': check['stable'],
+        })
+    out['notices'] = [_SC_AFFECTS]
+    return out
+
+
+def _sc_remove_step(seg, parent, version, track):
+    # one target of a `targets` call, in a call of its own. Removing the connection of one segment
+    # also removes it from the segment it was connected to (a pair, measured), so a target with no
+    # other connected segment left when its turn comes is not called: alreadyDisconnected.
+    now, problem = _sc_others(seg, parent, version, track, {})
+    if problem is None and now == 0:
+        return {
+            'ran': False,
+            'alreadyDisconnected': True,
+            'connected': {'before': 0, 'after': 0},
+            'inverse': None,
+            'error': None,
+            'errorCode': None,
+        }
+    try:
+        row = _sc_write(seg, parent, version, track, 'remove')
+    except BaseException as exc:
+        row = {
+            'ran': False,
+            'error': type(exc).__name__ + ': ' + str(exc),
+            'errorCode': 'FLAME_API_ERROR',
+        }
+    row['alreadyDisconnected'] = False
+    return row
 """

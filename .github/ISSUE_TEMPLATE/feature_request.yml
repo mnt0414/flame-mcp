@@ -1,0 +1,34 @@
+name: Request
+description: Something you wanted to do in Flame that flame-mcp could not do.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Only the first box is required: one line is enough. You can write in any language.
+
+        Remove anything that you don't want to make public, such as project names, file paths, and client names.
+  - type: textarea
+    id: wanted
+    attributes:
+      label: What you wanted to do
+      description: The task in Flame, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: How you do it now
+      description: By hand in Flame, with `eval.run`, with your own script, or not at all.
+    validations:
+      required: false
+  - type: dropdown
+    id: flame-version
+    attributes:
+      label: Flame version
+      options:
+        - "2025.2.4"
+        - "2026.2.3"
+        - Other
+    validations:
+      required: false

@@ -81,7 +81,10 @@ RESTORE_SIDE_EFFECTS = (
     "(reelTidy.skipped). Force: a restore with force=true (journal.revert of a group whose "
     "nodes changed since) also loses everything added to the group after the checkpoint -- "
     "nodes, reels and the clips in those reels (load_setup does not create a reel the setup "
-    "lacks)."
+    "lacks). Timeline FX on the clips in the group's reels are not part of a Batch setup, so a "
+    "restore can bring a clip back without them (clips whose Timeline FX were changed or "
+    "rendered while they were in the group came back without them); result.timelineFxLost lists "
+    "the clips that lost theirs and result.timelineFxUnchecked the clips it could not compare."
 )
 """The side effects of every restore, worded once for the descriptions of everything that
 restores a checkpoint (journal.revert, journal.restore_checkpoint, batch.load_setup, a
@@ -181,12 +184,14 @@ class CheckpointedRun:
         }
 
 
-def refuse_if_denied(ctx: ServerContext, names: tuple[str, ...]) -> None:
+def refuse_if_denied(ctx: ServerContext, names: tuple[str | RegisteredOperation, ...]) -> None:
     """Raise `ServerOpError` (POLICY_DENIED / UNKNOWN_OPERATION) when an op the engine (or its
     caller) is about to call through `ctx.do` is denied: better to know before anything is
-    written than half way."""
-    for name in names:
-        op = ctx.registry.get(name)
+    written than half way. An entry can also be an op of a registry of the engine's own (an
+    internal op that is run directly, such as `timeline.restore`), which is judged as it is."""
+    for entry in names:
+        name = entry if isinstance(entry, str) else entry.name
+        op = ctx.registry.get(entry) if isinstance(entry, str) else entry
         if op is None:
             raise ServerOpError("UNKNOWN_OPERATION", f"'{name}' is not registered")
         denial = deny_operation(op, ctx.policy)
@@ -330,6 +335,7 @@ def run_checkpointed(
         "fingerprintAfterError": facts.after_error,
         "changed": facts.changed,
         **outcome_fields(checkpoint_kind, after_env),
+        **({"verdict": "partial"} if _ended_partial(judgement) else {}),
     }
     if outcome_extra is not None:
         outcome.update(outcome_extra(env, facts.fingerprint_after))
@@ -339,6 +345,12 @@ def run_checkpointed(
         facts.journal_error = str(exc)
         ctx.guard.block(intent_id, group_id, op_name, "JOURNAL_OUTCOME_NOT_WRITTEN")
     return facts
+
+
+def _ended_partial(judgement: Judgement) -> bool:
+    """The run changed part of what it was asked to (its message starts with `partial:`): the
+    outcome says so, so the intent's state is `partial` (`IntentView.state`) and not `failed`."""
+    return not judgement.ok and (judgement.failed or "").startswith("partial:")
 
 
 def note_unresolved(ctx: ServerContext, intent_id: str, group: str, env: Mapping[str, Any]) -> None:

@@ -268,6 +268,58 @@ def _tb_put_check(parent, version, track, clip, at, mode):
     return out
 
 
+def _tb_mark(clip, key):
+    # (frame or None, readable): a clip's in / out mark as a frame number
+    try:
+        value = _v(getattr(clip, key))
+    except BaseException:
+        return None, False
+    if value is None:
+        return None, True
+    if type(value).__name__ == 'PyTime':
+        return value.frame, True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value, True
+    return None, False
+
+
+def _tb_expected_length(clip):
+    # the frames a put brings in: the marked range (out mark not included), else the whole clip;
+    # None when that cannot be told (a mark that cannot be read, or only one of the two set)
+    in_mark, in_ok = _tb_mark(clip, 'in_mark')
+    out_mark, out_ok = _tb_mark(clip, 'out_mark')
+    if not in_ok or not out_ok:
+        return None
+    if in_mark is not None and out_mark is not None:
+        return out_mark - in_mark
+    if in_mark is None and out_mark is None:
+        return _try(lambda: clip.duration.frame)
+    return None
+
+
+def _tb_placement_problem(parent, version, track, at, name, length):
+    # why the clip is not in the track as asked (None when it is): a media segment must start at
+    # `at`, carry the clip's name as source_name and be as long as the clip's used range
+    index, found = _tl_find_at(parent, version, track, at)
+    if found is None or _j(found.type) == 'Gap':
+        return None, 'no media segment starts at ' + str(at) + ' in track ' + str(track)
+    found_name = _v(found.source_name)
+    found_length = found.record_out.frame - found.record_in.frame + 1
+    row = {'expectedName': name, 'foundName': found_name, 'expectedLength': length,
+           'foundLength': found_length}
+    if name is not None and found_name != name:
+        return row, (
+            'the segment at ' + str(at) + ' has source_name ' + repr(found_name) + ', not '
+            + repr(name)
+        )
+    if length is not None and found_length != length:
+        return row, (
+            'the segment at ' + str(at) + ' is ' + str(found_length) + ' frame(s) long, the '
+            'clip brings ' + str(length)
+        )
+    return row, None
+
+
 def _tb_placed(parent, version, track, at):
     # the media segment that starts at `at` in the track, as the position the next edit can use
     index, found = _tl_find_at(parent, version, track, at)
@@ -283,8 +335,8 @@ def _tb_put(parent, version, track, clip, at, mode):
     fp_before = _tl_fingerprint(parent)['fingerprint']
     audio_before = _tb_audio_read(parent)
     start_before = out['before']['startFrame']
-    out.update(after=None, returned=None, changed=None, placed=None, startFrame=None,
-               audio=None, warnings=[], ran=True)
+    out.update(after=None, returned=None, changed=None, placed=None, placement=None,
+               startFrame=None, audio=None, warnings=[], ran=True)
     trk = list(list(parent.versions)[version].tracks)[track]
     stamp = _tb_time(parent, at)
     if mode == 'overwrite':
@@ -309,10 +361,22 @@ def _tb_put(parent, version, track, clip, at, mode):
         )
     _tb_audio_only(out, video_changed or start_before != start_after, audio_changed)
     out['placed'] = _tb_placed(parent, version, track, at)
-    if out['placed'] is None:
+    length = _tb_expected_length(clip)
+    out['placement'], problem = _tb_placement_problem(
+        parent, version, track, at, out['source']['name'], length
+    )
+    if problem is not None:
+        return _tb_fail(
+            out,
+            'FLAME_API_ERROR',
+            'partial: ' + mode + ' changed the sequence but the clip is not in track ' + str(track)
+            + ' as asked: ' + problem + ' (read result.after.tracks to see what changed; '
+            'journal.revert puts the sequence back)',
+        )
+    if length is None:
         out['warnings'].append(
-            'the sequence changed but no media segment starts at ' + str(at) + ' in track '
-            + str(track) + ': read result.after.tracks to see where the clip went'
+            'the length of the put segment was not checked: the in / out marks or the duration '
+            'of the clip could not be read'
         )
     return out
 
@@ -407,8 +471,8 @@ def _tb_cut(parent, version, track, at, scope):
         return out
     fp_before = _tl_fingerprint(parent)['fingerprint']
     audio_before = _tb_audio_read(parent)
-    out.update(after=None, returned=None, changed=None, split=None, audio=None, warnings=[],
-               ran=True)
+    out.update(after=None, returned=None, changed=None, split=None, notSplit=None, audio=None,
+               warnings=[], ran=True)
     stamp = _tb_time(parent, at)
     if scope == 'track':
         trk = list(list(parent.versions)[version].tracks)[track]
@@ -449,6 +513,20 @@ def _tb_cut(parent, version, track, at, scope):
                     if [r for r in rows if r[2] == at - 1] and [r for r in rows if r[1] == at]:
                         cut.append({'version': t['version'], 'track': t['track']})
         out['split'] = cut
+        done = [(c['version'], c['track']) for c in cut]
+        out['notSplit'] = [
+            {'version': hit['version'], 'track': hit['track']}
+            for hit in out['willCut'] if (hit['version'], hit['track']) not in done
+        ]
+        if video_changed and out['notSplit']:
+            return _tb_fail(
+                out,
+                'FLAME_API_ERROR',
+                'partial: cut at ' + str(at) + ' (all) split ' + str(len(cut)) + ' of '
+                + str(len(out['willCut'])) + ' track(s) it should have cut; not split: '
+                + repr(out['notSplit']) + ' (read result.after.tracks; journal.revert puts the '
+                'sequence back)',
+            )
     return out
 
 

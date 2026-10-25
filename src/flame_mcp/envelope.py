@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Final, cast, get_args
 
 from flame_mcp import errors
+from flame_mcp.private_fs import default_root, make_private_dirs
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import BridgeResult, CrashInfo
 from flame_mcp.types import ErrorCode
@@ -29,7 +30,6 @@ LOGS_TAIL_LINES: Final[int] = 20
 
 SPILL_DIR_ENV: Final[str] = "FLAME_MCP_SPILL_DIR"
 SPILL_FILE_MODE: Final[int] = 0o600
-SPILL_DIR_MODE: Final[int] = 0o700
 SPILL_MAX_AGE_S: Final[float] = 7 * 24 * 60 * 60
 _SPILL_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}\.json")
 
@@ -46,7 +46,7 @@ def _default_spill_dir() -> Path:
     override = os.environ.get(SPILL_DIR_ENV)
     if override:
         return Path(override)
-    return Path.home() / "Library" / "Application Support" / "flame-mcp" / "spill"
+    return default_root() / "spill"
 
 
 def notices_from_logs(logs: Sequence[str]) -> list[str]:
@@ -346,9 +346,11 @@ def from_bridge_result(
             logs_note=logs_note,
         )
 
-    return build_envelope(
+    value = raw.get("value")
+    notes = take_degraded_notes(value)
+    env = build_envelope(
         ok=True,
-        result=raw.get("value"),
+        result=value,
         affected=affected,
         undo_steps=undo_steps,
         partial=partial,
@@ -358,6 +360,21 @@ def from_bridge_result(
         logs=logs,
         logs_note=logs_note,
     )
+    if notes:
+        env["degraded"] = notes
+    return env
+
+
+def take_degraded_notes(value: object) -> list[str]:
+    """The notes an op's Flame-side code left under `degradedNotes` of its result (what it did
+    differently from the request without failing), taken out of the result: they belong in the
+    envelope's `degraded`."""
+    if not isinstance(value, dict):
+        return []
+    notes = value.pop("degradedNotes", None)
+    if not isinstance(notes, list):
+        return []
+    return [note for note in notes if isinstance(note, str)]
 
 
 def _byte_len(envelope: Mapping[str, Any]) -> int:
@@ -423,7 +440,7 @@ def degrade_for_size(
         return out
 
     effective_spill_dir = spill_dir if spill_dir is not None else _default_spill_dir()
-    effective_spill_dir.mkdir(parents=True, exist_ok=True, mode=SPILL_DIR_MODE)
+    make_private_dirs(effective_spill_dir)
     spill_path = effective_spill_dir / f"{uuid.uuid4().hex}.json"
     spill_note = "response exceeded the byte budget; full envelope spilled to disk"
     degraded.append(spill_note)

@@ -646,6 +646,28 @@ def test_a_private_body_is_loaded(
     assert stub_module._state["bridge"] is not None
 
 
+def test_the_real_body_is_loaded_after_the_startup_tightening_made_it_0600_in_a_0700_directory(
+    stub_module: Any, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from flame_mcp_bridge import impl
+
+    root = bridge_dir / "app"
+    body_dir = root / "bridge"
+    body_dir.mkdir(parents=True)
+    (body_dir / "impl.py").write_text(Path(impl.__file__).read_text(encoding="utf-8"))
+    (body_dir / "impl.py").chmod(0o644)
+    for directory in (root, body_dir):
+        directory.chmod(0o777)
+    impl._harden_app_dir(root, logging.getLogger("test"))
+    assert (os.stat(root).st_mode & 0o777, os.stat(body_dir).st_mode & 0o777) == (0o700, 0o700)
+    assert os.stat(body_dir / "impl.py").st_mode & 0o777 == 0o600
+    monkeypatch.setenv("FLAME_MCP_BRIDGE_DIR", str(body_dir))
+
+    module = stub_module._load_impl()
+
+    assert module.BRIDGE_ABI == stub_module._EXPECTED_BRIDGE_ABI
+
+
 def test_reload_refuses_a_body_that_became_group_writable_and_keeps_the_old_bridge(
     stub_module: Any, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

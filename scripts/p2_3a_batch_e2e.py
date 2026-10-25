@@ -955,6 +955,16 @@ async def stage_d(ctx: Ctx) -> None:
             env=env,
             glob=files,
         )
+        rec(
+            ctx,
+            "d_the_saved_setup_file_is_0600_and_listed_in_made_private",
+            (os.stat(plain + ".batch").st_mode & 0o777) == 0o600
+            and result.get("madePrivate") == [plain + ".batch"]
+            and not result.get("notMadePrivate"),
+            mode=oct(os.stat(plain + ".batch").st_mode & 0o777),
+            madePrivate=result.get("madePrivate"),
+            notMadePrivate=result.get("notMadePrivate"),
+        )
         observe(
             ctx,
             "d_the_sibling_directory_save_setup_wrote",

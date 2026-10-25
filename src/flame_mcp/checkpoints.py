@@ -8,7 +8,9 @@ nodes and wiring, read-only to compute) at that moment.
 The record also carries the group's schematic reel inventory (`reels`: name, empty or not, clip and
 sequence names, in order) and the fingerprint over all sections with its data (`fingerprintFull`,
 `sectionData`), read right before `save_setup`: what a restore needs to put the reels back
-(`reel_fidelity`). A record without `reels` is an older checkpoint.
+(`reel_fidelity`). A record without `reels` is an older checkpoint. It also carries `clipFx`: the
+Timeline FX types of every reel clip, which a restore compares with
+(`timeline_fx_loss`); a record without it is an older checkpoint too.
 
 `batch.checkpoint` runs in Flame (`checkpoint_prelude._save_checkpoint`); the server picks
 the file name and directory, and records what came back. The directory is
@@ -22,7 +24,7 @@ Files are not cleaned up here: cleanup is a human, explicit act.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -31,6 +33,7 @@ from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
 from flame_mcp.journal import Journal, new_id, now_iso
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime, ServerContext
@@ -51,6 +54,10 @@ FINGERPRINT_SECTIONS: Final[tuple[str, ...]] = (
     "iterations",
     "attributes",
 )
+ATTRIBUTES_SECTION: Final[str] = "attributes"
+FX_ARG: Final[str] = "_clip_fx"
+"""Reserved args key for `batch.load_setup`'s `to_python` (restore path only): when true, the clip
+FX of the reels are read right after `load_setup` (`timeline_fx_loss`)."""
 REELS_ARG: Final[str] = "_reels"
 """Reserved args key carrying a checkpoint's recorded reel inventory into `batch.load_setup`'s
 `to_python` (restore path only): with it, the reels are tidied right after `load_setup`."""
@@ -123,6 +130,7 @@ def run_checkpoint(
     with rt.write_lock:
         env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
         if env.get("ok") is not True:
+            shut_if_unanswered(rt.guard, env, op.name, group)
             return env
         raw = env.get("result")
         result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
@@ -143,6 +151,8 @@ def run_checkpoint(
             "unreadableNodes": result.get("unreadableNodes"),
             "reels": result.get("reels"),
             "reelsError": result.get("reelsError"),
+            "clipFx": result.pop("clipFx", None),
+            "clipFxError": result.get("clipFxError"),
             "fingerprintFull": result.get("fingerprintFull"),
             "fingerprintFullSections": result.get("fingerprintFullSections"),
             "sectionData": result.pop("sectionData", None),
@@ -184,10 +194,19 @@ def take_checkpoint(
 
 
 def read_fingerprint(
-    ctx: ServerContext, target: Mapping[str, Any], kind: CheckpointKind = BATCH_KIND
+    ctx: ServerContext,
+    target: Mapping[str, Any],
+    kind: CheckpointKind = BATCH_KIND,
+    *,
+    sections: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """`batch.fingerprint` (or the kind's own) through the normal do path; the envelope."""
-    return ctx.do(kind.fingerprint_op, {"target": dict(target)})
+    """`batch.fingerprint` (or the kind's own) through the normal do path; the envelope. With
+    `sections` (a Batch group's), the hash covers those parts too (the server's default
+    otherwise)."""
+    args: dict[str, Any] = {"target": dict(target)}
+    if sections is not None:
+        args["sections"] = list(sections)
+    return ctx.do(kind.fingerprint_op, args)
 
 
 def stable_subject(

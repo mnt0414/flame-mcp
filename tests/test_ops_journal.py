@@ -260,7 +260,7 @@ def test_revert_restores_a_rename(rig: Rig) -> None:
     env = rig.do("desktop.rename", {"target": REEL_WIRETAP, "name": "R1b"})
     back = rig.do("journal.revert", {"group": env["journal"]["group"]})
     assert back["ok"] is True, back
-    assert rig.handles["tree_reel"].name.get_value() == "R1"
+    assert rig.handles["reel"].name.get_value() == "Reel 1"
 
 
 def test_revert_of_a_renamed_node_finds_it_under_its_new_name(rig: Rig) -> None:
@@ -317,7 +317,9 @@ def test_a_revert_can_itself_be_reverted(rig: Rig) -> None:
 def test_revert_refuses_a_group_that_applied_nothing(rig: Rig) -> None:
     env = set_values(rig, {"blend_type": "NoSuchMode"})
     back = rig.do("journal.revert", {"group": env["journal"]["group"]})
-    assert back["errorCode"] == "PRECONDITION_UNMET" and "applied no key" in back["error"]
+    assert (
+        back["errorCode"] == "PRECONDITION_UNMET" and "applied or changed no key" in back["error"]
+    )
 
 
 def test_revert_of_an_undecided_group_asks_for_a_check_first(rig: Rig) -> None:

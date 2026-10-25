@@ -3,8 +3,11 @@
 the `.venv` Python; `scripts/run_e2e.sh p2_3c_render` starts Flame).
 
 Checks: The `render` ops (`render.plan`, `render.batch`): the planned frames and the resolved path,
-the rendered files on disk, the journal record, and the refusals made before anything is written
-(default output path, too many frames).
+the rendered files on disk, the journal record, the refusals made before anything is written
+(default output path, too many frames), the clip a Render node aimed at a Desktop reel group
+puts into that group's reel (`Batch Renders` when the destination reads back as 2 elements,
+the reel its 3rd element names when it reads back as 3), and the `outputs` that `batch.list`
+lists for the Write File and Render nodes of these groups.
 
 Same shape and helpers as scripts/p2_3b_node_action_e2e.py (imported from p2_2a / p1): a real MCP
 stdio client drives `python -m flame_mcp` against a live Flame + dev bridge; `flame_mcp.transport`
@@ -12,7 +15,8 @@ is scaffolding only (create the groups and the library, and READ EVERY STATE BAC
 the ops under test: the resolved path, the directory, the shelf reel's clips). The rendered files
 are read by this client process directly (the same machine) AND by Flame's own Python. Everything
 happens in the probe project `flame_mcp_probe`, in Batch groups that are NOT current (the decoy
-group is created last, so it is the current one). The journal directory is this run's own
+group is created last, so it is the current one; stage g, the last group-building stage, makes
+its own group the current one). The journal directory is this run's own
 (`p2/journal_p23c_e2e_<ts>/`, never the production one). No test hook is set for any server.
 
 The groups are built with the ops themselves (batch.add_clips of a LIBRARY clip into the group's
@@ -57,10 +61,33 @@ Stages
      the intent's handle and holding Flame's answer (returned True), the writes resume. If it
      finished in time, JUDGED: the result file the bridge kept under the handle was removed by
      the server's clean-up poll. The note attribute this stage writes is put back.
+  g  group G, created by the stage itself as the last Batch group, which makes it the current one
+     (a Render node's destination takes a new reel group only in the current Batch group, so
+     stage g builds and uses its own group last; it records that the group is current). Group G
+     is a Clip node -> a Render node whose destination is set to ['Reel Groups', <this run's own
+     Desktop reel group>] through transport and read back: JUDGED, the read-back is those 2
+     elements or those 2 plus a reel name (Flame 2026.2.3 gives 3). The reel is the 3rd element
+     when there is one, else `Batch Renders`; the read-back is kept for stage h. render.plan's
+     destinationReel agrees with a transport read of that Desktop reel of the group (exists, clip
+     count) before the render; render.batch is ok and result.newClips holds the one clip, named
+     after the Render node, in `<group>/<reel>`; the Desktop reel
+     (transport) gained exactly that clip; reelsBefore / reelsAfter carry the Desktop row; the
+     plan after the render says the reel exists with one more clip. Observed: elapsed time, what
+     `returned` was, the reels of the group before and after.
+  h  batch.list(outputs=true), paged with limit / offset (after a `stoppedEarly` the next page
+     starts at offset + stoppedEarly.read) until the groups of this run are all found. JUDGED:
+     group A lists exactly its Write File `write_a` (kind write_file, bypass false, mediaPath
+     equal to a transport read of the node's media_path); group E lists exactly one write_file
+     with bypass true; group G lists exactly the Render node (kind render, destination equal to a
+     transport read of the node's destination, which must also equal the read-back kept in
+     stage g, and must be a list: a stage g that ended early leaves none). Observed: the
+     outputs of groups C, D and F, the number of pages, every stoppedEarly, the elapsed time, and
+     the current group before and after (the call is not expected to change it).
   z  cross-cutting checks over every envelope; nothing left undecided
 
-Cleanup: no Batch group is deleted (flame.delete on a PyBatch is not used); rendered files and the
-library are kept; then flame.exit().
+Cleanup: this run's own Desktop reel group (`P23C_RG_<ts>`) is deleted and checked gone; no Batch
+group is deleted (flame.delete on a PyBatch is not used); rendered files and the library are kept;
+then flame.exit().
 """
 
 from __future__ import annotations
@@ -86,6 +113,7 @@ from p1_mcp_e2e import (
     check_logs_and_crash,
 )
 from p2_2a_journal_e2e import (
+    V_PRELUDE,
     Ctx,
     do,
     guarded,
@@ -110,6 +138,12 @@ WRITERS: Final[dict[str, str]] = {
     "F": "write_f",
 }
 DEFAULT_DIR: Final[str] = "/var/tmp"
+RENDER_GROUP: Final[str] = "G"
+RENDER_NODE: Final[str] = "render_g"
+RENDER_RANGE: Final[tuple[int, int]] = (1, 8)
+DESKTOP_REEL: Final[str] = "Batch Renders"
+LIST_PAGE: Final[int] = 20
+LIST_MAX_PAGES: Final[int] = 100
 RANGES: Final[dict[str, tuple[int | None, int | None]]] = {
     "A": (1, 8),
     "C": (1, 2),
@@ -163,6 +197,16 @@ async def tx_resolved(ctx: Ctx, uid: str, node: str) -> Any:
     return await tx_scaffold(ctx, uid, body, "p23c_resolved")
 
 
+async def tx_destination(ctx: Ctx, uid: str, node: str) -> Any:
+    body = "\n".join(
+        [
+            f"_n = [n for n in _bg.nodes if _v(n.name) == {node!r}][0]",
+            "_result = {'destination': list(_v(_n.destination)), 'bypass': _v(_n.bypass)}",
+        ]
+    )
+    return await tx_scaffold(ctx, uid, body, "p23c_destination")
+
+
 async def tx_list_dir(ctx: Ctx, path: str) -> Any:
     code = (
         "import os\n"
@@ -172,6 +216,34 @@ async def tx_list_dir(ctx: Ctx, path: str) -> Any:
     )
     br = await tx(ctx, code, label="p23c_ls")
     return br.result if br.ok else f"<transport error {br.error_code}: {br.error}>"
+
+
+async def tx_desktop_reel(ctx: Ctx, group: str, reel: str) -> Any:
+    """The Desktop reel group `group` and its reel `reel`, read directly from Flame."""
+    code = "\n".join(
+        [
+            "_ws = flame.projects.current_project.current_workspace",
+            f"_g = [g for g in _ws.desktop.reel_groups if _v(g.name) == {group!r}]",
+            f"_r = [r for r in _g[0].reels if _v(r.name) == {reel!r}] if _g else []",
+            "_result = {'groupFound': bool(_g),",
+            "           'reelFound': bool(_r),",
+            "           'reels': [_v(r.name) for r in _g[0].reels] if _g else None,",
+            "           'clips': [_v(c.name) for c in _r[0].clips] if _r else []}",
+        ]
+    )
+    br = await tx(ctx, code, label="p23c_desktop_reel")
+    return br.result if br.ok else f"<transport error {br.error_code}: {br.error}>"
+
+
+async def tx_set_destination(ctx: Ctx, uid: str, node: str, value: list[str]) -> Any:
+    body = "\n".join(
+        [
+            f"_n = [n for n in _bg.nodes if _v(n.name) == {node!r}][0]",
+            f"_ret = _n.destination.set_value({tuple(value)!r})",
+            "_result = {'returned': _ret, 'now': list(_v(_n.destination))}",
+        ]
+    )
+    return await tx_scaffold(ctx, uid, body, "p23c_set_destination")
 
 
 async def tx_shelf(ctx: Ctx, uid: str) -> Any:
@@ -280,6 +352,7 @@ async def prepare(ctx: Ctx) -> None:
 
     lines = [
         "desktop = flame.projects.current_project.current_workspace.desktop",
+        f"reel_group = desktop.create_reel_group('P23C_RG_{ctx.ts}')",
         "groups = {}",
     ]
     for group in GROUPS:
@@ -291,13 +364,17 @@ async def prepare(ctx: Ctx) -> None:
     lines += [
         # created last: it becomes the current group, so none of the test groups is current
         f"decoy = desktop.create_batch_group('P23C_DECOY_{ctx.ts}', nb_reels=1, nb_shelf_reels=1)",
-        "_result = {'groups': groups, 'decoyUid': _v(decoy.uid)}",
+        "_result = {'groups': groups, 'decoyUid': _v(decoy.uid), 'reelGroup': _v(reel_group.name)}",
     ]
     br = await tx(ctx, "\n".join(lines), label="p23c_prepare_groups", timeout_s=90.0)
     rec(ctx, "prepare_groups_and_decoy", br.ok, resp=_br_dict(br))
     if not (br.ok and isinstance(br.result, dict)):
         return
-    ctx.ids.update(groups=br.result["groups"], decoyUid=br.result["decoyUid"])
+    ctx.ids.update(
+        groups=br.result["groups"],
+        decoyUid=br.result["decoyUid"],
+        reelGroup=br.result["reelGroup"],
+    )
     flags = [await tx_is_current(ctx, g["uid"]) for g in br.result["groups"].values()]
     rec(
         ctx,
@@ -370,6 +447,62 @@ async def build_group(ctx: Ctx, session: Any, group: str, *, bypass: bool = Fals
         and len(clip_nodes) == 1,
         clipNodes=clip_nodes,
         currentTypes={k: type(v).__name__ for k, v in now.items()},
+        written=values,
+        errors=[e.get("error") for e in (added, created, connected, written) if not e.get("ok")],
+    )
+
+
+async def build_render_group(ctx: Ctx, session: Any, group: str = RENDER_GROUP) -> None:
+    """Clip node (a library clip through batch.add_clips) -> Render node, range RENDER_RANGE."""
+    target = target_of(ctx, group)
+    info = _result_of(await do(session, ctx, "batch.info", {"target": target}))
+    reel = (info.get("reels") or [{}])[0].get("name")
+    lib_clip = ctx.ids["libClips"][0][1]
+    added = await do(
+        session,
+        ctx,
+        "batch.add_clips",
+        {"target": target, "reel": reel, "clips": [{"kind": "wiretap", "id": lib_clip}]},
+    )
+    listed = _result_of(await do(session, ctx, "node.list", {"target": target}))
+    clip_nodes = [n["name"] for n in listed.get("items", []) if n.get("type") == "Clip"]
+    created = await do(
+        session, ctx, "node.create", {"target": target, "type": "Render", "name": RENDER_NODE}
+    )
+    connected = await do(
+        session,
+        ctx,
+        "node.connect",
+        {"source": node_sel(ctx, group, clip_nodes[0]), "target": node_sel(ctx, group, RENDER_NODE)}
+        if clip_nodes
+        else {"source": target, "target": target},
+    )
+    keys = ["range_start", "range_end"]
+    current = _result_of(
+        await do(
+            session,
+            ctx,
+            "node.get_attributes",
+            {"target": node_sel(ctx, group, RENDER_NODE), "keys": keys},
+        )
+    ).get("attributes", {})
+    now = {k: (current.get(k) or {}).get("value") for k in keys}
+    values = {
+        "range_start": value_like(now["range_start"], RENDER_RANGE[0]),
+        "range_end": value_like(now["range_end"], RENDER_RANGE[1]),
+    }
+    written = await do(
+        session,
+        ctx,
+        "node.set_attributes",
+        {"target": node_sel(ctx, group, RENDER_NODE), "values": values},
+    )
+    rec(
+        ctx,
+        "prepare_g_built_with_the_ops",
+        all(e.get("ok") is True for e in (added, created, connected, written))
+        and len(clip_nodes) == 1,
+        clipNodes=clip_nodes,
         written=values,
         errors=[e.get("error") for e in (added, created, connected, written) if not e.get("ok")],
     )
@@ -929,6 +1062,267 @@ async def stage_f(ctx: Ctx) -> None:
         )
 
 
+async def create_own_batch_group(ctx: Ctx, group: str) -> bool:
+    """A new Batch group `P23C_<group>_<ts>` made through transport: it becomes the current
+    group. Its uid and name go into `ctx.ids["groups"][group]`."""
+    code = "\n".join(
+        [
+            "desktop = flame.projects.current_project.current_workspace.desktop",
+            f"bg = desktop.create_batch_group('P23C_{group}_{ctx.ts}', "
+            "nb_reels=1, nb_shelf_reels=1)",
+            "_result = {'uid': _v(bg.uid), 'name': _v(bg.name)}",
+        ]
+    )
+    br = await tx(ctx, code, label="p23c_stage_g_group", timeout_s=60.0)
+    created = br.ok and isinstance(br.result, dict)
+    if created:
+        ctx.ids["groups"][group] = br.result
+    rec(ctx, "g_own_batch_group_created", created, resp=_br_dict(br))
+    return bool(created)
+
+
+async def stage_g(ctx: Ctx) -> None:
+    group = RENDER_GROUP
+    if not await create_own_batch_group(ctx, group):
+        return
+    uid, target = uid_of(ctx, group), target_of(ctx, group)
+    rec(
+        ctx,
+        "g_own_batch_group_is_the_current_one",
+        await tx_is_current(ctx, uid) is True,
+    )
+    async with server_session(ctx, "g-build") as build_session:
+        await build_render_group(ctx, build_session, group)
+    reel_group = str(ctx.ids["reelGroup"])
+    wanted = ["Reel Groups", reel_group]
+    set_to = await tx_set_destination(ctx, uid, RENDER_NODE, wanted)
+    now = set_to.get("now") if isinstance(set_to, dict) else None
+    names_a_reel = (
+        isinstance(now, list) and len(now) == 3 and now[:2] == wanted and isinstance(now[2], str)
+    )
+    rec(
+        ctx,
+        "g_destination_is_the_desktop_reel_group_by_transport_read_back",
+        now == wanted or names_a_reel,
+        wanted=wanted,
+        set=set_to,
+    )
+    ctx.ids["renderDestination"] = now
+    reel_name = now[2] if names_a_reel else DESKTOP_REEL
+    row_name = f"{reel_group}/{reel_name}"
+    before = await tx_desktop_reel(ctx, reel_group, reel_name)
+    async with server_session(ctx, "g-plain") as session:
+        plan = _result_of(await do(session, ctx, "render.plan", {"target": target}))
+        node = next((n for n in plan.get("nodes", []) if n.get("name") == RENDER_NODE), {})
+        dest = node.get("destinationReel") or {}
+        rec(
+            ctx,
+            "g_plan_destination_reel_agrees_with_the_transport_read_before_the_render",
+            isinstance(before, dict)
+            and before.get("groupFound") is True
+            and node.get("destination") == now
+            and node.get("effective") is True
+            and dest.get("kind") == "desktop"
+            and dest.get("group") == reel_group
+            and dest.get("reel") == reel_name
+            and dest.get("exists") is before.get("reelFound")
+            and dest.get("clipCount") == len(before.get("clips") or [])
+            and plan.get("destinationUnsupported") == [],
+            destinationReel=dest,
+            transport=before,
+        )
+        env = await do(session, ctx, "render.batch", {"target": target})
+        result = _result_of(env)
+        after = await tx_desktop_reel(ctx, reel_group, reel_name)
+        rows_before = [r for r in result.get("reelsBefore") or [] if r.get("kind") == "desktop"]
+        rows_after = [r for r in result.get("reelsAfter") or [] if r.get("kind") == "desktop"]
+        gained = (
+            len(after.get("clips") or []) - len(before.get("clips") or [])
+            if isinstance(after, dict) and isinstance(before, dict)
+            else None
+        )
+        rec(
+            ctx,
+            "g_render_is_ok",
+            env.get("ok") is True and result.get("ran") is True,
+            error=env.get("error"),
+            errorCode=env.get("errorCode"),
+        )
+        rec(
+            ctx,
+            "g_new_clips_names_the_clip_in_the_desktop_reel",
+            result.get("newClips")
+            == [{"kind": "desktop", "name": row_name, "clips": [RENDER_NODE]}]
+            and result.get("destinationUnsupported") == [],
+            newClips=result.get("newClips"),
+        )
+        rec(
+            ctx,
+            "g_the_desktop_reel_gained_exactly_one_clip_by_transport_read",
+            gained == 1
+            and isinstance(after, dict)
+            and after.get("reelFound") is True
+            and (after.get("clips") or []).count(RENDER_NODE)
+            == (before.get("clips") or []).count(RENDER_NODE) + 1,
+            before=before,
+            after=after,
+        )
+        rec(
+            ctx,
+            "g_reels_before_and_after_carry_the_desktop_row",
+            [(r.get("name"), r.get("clipCount")) for r in rows_before]
+            == [(row_name, len(before.get("clips") or []))]
+            and [(r.get("name"), r.get("clipCount")) for r in rows_after]
+            == [(row_name, len(after.get("clips") or []))],
+            rowsBefore=rows_before,
+            rowsAfter=rows_after,
+        )
+        plan_after = _result_of(await do(session, ctx, "render.plan", {"target": target}))
+        node_after = next(
+            (n for n in plan_after.get("nodes", []) if n.get("name") == RENDER_NODE), {}
+        )
+        dest_after = node_after.get("destinationReel") or {}
+        rec(
+            ctx,
+            "g_plan_after_the_render_says_the_reel_exists_with_one_more_clip",
+            dest_after.get("exists") is True
+            and dest_after.get("clipCount") == len(after.get("clips") or []),
+            destinationReel=dest_after,
+        )
+        observe(
+            ctx,
+            "g_what_the_render_did",
+            returned=result.get("returned"),
+            elapsedS=result.get("elapsedS"),
+            reelsOfTheGroupBefore=(before or {}).get("reels")
+            if isinstance(before, dict)
+            else before,
+            reelsOfTheGroupAfter=(after or {}).get("reels") if isinstance(after, dict) else after,
+            degraded=env.get("degraded"),
+        )
+
+
+async def list_outputs(
+    session: Any, ctx: Ctx, wanted: dict[str, str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Page through batch.list(outputs=true) until every uid in `wanted` (group -> uid) is found
+    or the pages run out. Returns the items by group and what the paging did."""
+    found: dict[str, dict[str, Any]] = {}
+    by_uid = {uid: group for group, uid in wanted.items()}
+    stopped: list[dict[str, Any]] = []
+    errors: list[Any] = []
+    pages, offset, total = 0, 0, None
+    started = time.monotonic()
+    while pages < LIST_MAX_PAGES and len(found) < len(wanted) and (total is None or offset < total):
+        env = await do(
+            session, ctx, "batch.list", {"outputs": True, "limit": LIST_PAGE, "offset": offset}
+        )
+        pages += 1
+        res = _result_of(env)
+        items = res.get("items") or []
+        if env.get("ok") is not True or not items:
+            errors.append(env.get("error") or "an empty page")
+            break
+        total = res.get("total")
+        for item in items:
+            if item.get("uid") in by_uid:
+                found[by_uid[item["uid"]]] = item
+        early = res.get("stoppedEarly")
+        if early:
+            stopped.append({"offset": offset, **early})
+        offset += early["read"] if early else len(items)
+    facts = {
+        "pages": pages,
+        "total": total,
+        "stoppedEarly": stopped,
+        "elapsedS": round(time.monotonic() - started, 1),
+        "errors": errors,
+    }
+    return found, facts
+
+
+async def stage_h(ctx: Ctx) -> None:
+    groups = ctx.ids["groups"]
+    wanted = {g: uid_of(ctx, g) for g in (*GROUPS, RENDER_GROUP) if g in groups}
+    current_before = {g: await tx_is_current(ctx, uid) for g, uid in wanted.items()}
+    async with server_session(ctx, "h-plain") as session:
+        found, facts = await list_outputs(session, ctx, wanted)
+    current_after = {g: await tx_is_current(ctx, uid) for g, uid in wanted.items()}
+    observe(
+        ctx,
+        "h_batch_list_outputs_paging_and_the_current_group",
+        **facts,
+        found=sorted(found),
+        currentBefore=current_before,
+        currentAfter=current_after,
+    )
+    outputs = {g: item.get("outputs") for g, item in found.items()}
+    observe(
+        ctx,
+        "h_outputs_of_the_groups_without_a_judged_expectation",
+        **{g: outputs.get(g) for g in ("C", "D", "F")},
+    )
+    truth_a = await tx_resolved(ctx, uid_of(ctx, "A"), WRITERS["A"]) if "A" in groups else None
+    truth_e = await tx_resolved(ctx, uid_of(ctx, "E"), WRITERS["E"]) if "E" in groups else None
+    truth_g = (
+        await tx_destination(ctx, uid_of(ctx, RENDER_GROUP), RENDER_NODE)
+        if RENDER_GROUP in groups
+        else None
+    )
+    got_a = outputs.get("A")
+    rec(
+        ctx,
+        "h_group_a_lists_its_write_file_with_the_media_path_transport_reads",
+        isinstance(truth_a, dict)
+        and truth_a.get("bypass") is False
+        and got_a
+        == [
+            {
+                "name": WRITERS["A"],
+                "kind": "write_file",
+                "bypass": False,
+                "mediaPath": truth_a.get("mediaPath"),
+            }
+        ],
+        api=got_a,
+        transport=truth_a,
+        paging=facts,
+    )
+    got_e = outputs.get("E")
+    rec(
+        ctx,
+        "h_group_e_lists_its_one_bypassed_write_file",
+        isinstance(truth_e, dict)
+        and truth_e.get("bypass") is True
+        and isinstance(got_e, list)
+        and len(got_e) == 1
+        and got_e[0].get("kind") == "write_file"
+        and got_e[0].get("name") == WRITERS["E"]
+        and got_e[0].get("bypass") is True,
+        api=got_e,
+        transport=truth_e,
+    )
+    got_g = outputs.get("G")
+    rec(
+        ctx,
+        "h_group_g_lists_its_render_node_with_the_destination_transport_reads",
+        isinstance(truth_g, dict)
+        and got_g
+        == [
+            {
+                "name": RENDER_NODE,
+                "kind": "render",
+                "bypass": truth_g.get("bypass"),
+                "destination": truth_g.get("destination"),
+            }
+        ]
+        and isinstance(ctx.ids.get("renderDestination"), list)
+        and truth_g.get("destination") == ctx.ids.get("renderDestination"),
+        api=got_g,
+        transport=truth_g,
+    )
+
+
 async def stage_z(ctx: Ctx) -> None:
     async with server_session(ctx, "z-plain") as session:
         info = await version_info(session, ctx)
@@ -960,10 +1354,43 @@ def print_observations(results: Results) -> None:
         print(f"{name}: { {k: v for k, v in obs.items() if k not in ('name', 'stage')} }")
 
 
+REEL_GROUP_PREFIX: Final[str] = "P23C_RG_"
+
+
+def delete_own_reel_group(ctx: Ctx) -> list[str]:
+    """Delete the Desktop reel group this run made (name starts with `P23C_RG_`), then read
+    Flame again to see that it is gone. Returns the names deleted."""
+    name = ctx.ids.get("reelGroup")
+    if not isinstance(name, str) or not name.startswith(REEL_GROUP_PREFIX):
+        return []
+    find = (
+        V_PRELUDE + "\n"
+        "_ws = flame.projects.current_project.current_workspace\n"
+        f"_g = [g for g in _ws.desktop.reel_groups if _v(g.name) == {name!r}]\n"
+    )
+    br = _tx(
+        find + "if _g:\n    flame.delete(_g[0], confirm=False)\n_result = len(_g)",
+        ctx.run_dir,
+        timeout_s=40.0,
+        label="p23c_cleanup_delete_reel_group",
+    )
+    after = _tx(find + "_result = len(_g)", ctx.run_dir, timeout_s=20.0, label="p23c_cleanup_check")
+    rec(
+        ctx,
+        "cleanup_own_reel_group_deleted_and_gone",
+        br.ok and br.result == 1 and after.ok and after.result == 0,
+        reelGroup=name,
+        deleted=_br_dict(br),
+        stillThere=after.result if after.ok else None,
+    )
+    return [name] if br.ok and br.result == 1 else []
+
+
 def cleanup(ctx: Ctx) -> None:
     ctx.stage = "cleanup"
+    deleted = delete_own_reel_group(ctx)
     ctx.results["cleanup"] = {
-        "deleted": [],
+        "deleted": [f"reel group {n}" for n in deleted],
         "kept": {
             "batchGroups": ctx.ids.get("groups"),
             "renderedFiles": ctx.ids.get("filesDir"),
@@ -1003,10 +1430,12 @@ async def async_main(ctx: Ctx) -> None:
                 ("d", stage_d),
                 ("e", stage_e),
                 ("f", stage_f),
+                ("g", stage_g),
+                ("h", stage_h),
             ):
                 await guarded(ctx, name, stage)
         else:
-            rec(ctx, "prepare_incomplete_stages_a_to_f_skipped", False, ids=ctx.ids)
+            rec(ctx, "prepare_incomplete_stages_a_to_h_skipped", False, ids=ctx.ids)
         await guarded(ctx, "z", stage_z)
     finally:
         cleanup(ctx)

@@ -14,21 +14,38 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from flame_mcp import selectors
+from flame_mcp.journaled_write import FOR_WRITE_ARG
 from flame_mcp.ops._common import build_source
 from flame_mcp.registry import RegistrationError, Registry
 from flame_mcp.types import JournalSpec, OperationParam, OperationSpec, SelectorKind
 
 StableSrc = Callable[[Mapping[str, Any]], str]
 
-_ATTRIBUTE_SYMBOLS = ("PyAttribute.get_value", "PyAttribute.set_value", "PyAttribute.values")
+_ATTRIBUTE_SYMBOLS = (
+    "PyAttribute.get_value",
+    "PyAttribute.set_value",
+    "PyAttribute.values",
+    "flame.PyResolution",
+    "PyResolution.width",
+    "PyResolution.height",
+    "PyResolution.bit_depth",
+    "PyResolution.frame_ratio",
+    "PyResolution.scan_mode",
+)
 
 
-def _get_to_python(stable_src: StableSrc) -> Callable[[Mapping[str, Any]], str]:
+def _get_to_python(
+    stable_src: StableSrc, write_guard_src: StableSrc | None
+) -> Callable[[Mapping[str, Any]], str]:
     def to_python(args: Mapping[str, Any]) -> str:
         keys = args.get("keys")
         include_values = bool(args.get("include_values", False))
+        # only the journaled write's pre-read sets `_for_write` (journaled_write.py): a caller
+        # cannot send it, validation rejects an unknown key
+        guard = write_guard_src(args) if write_guard_src and args.get(FOR_WRITE_ARG) else ""
         return build_source(
             selectors.resolve_code(args["target"], "target"),
+            guard,
             "\n".join(
                 [
                     f"_result = _get_attributes(target, {keys!r}, {include_values!r})",
@@ -80,6 +97,7 @@ def register_attribute_ops(
     revert_kinds: tuple[SelectorKind, ...],
     requires: tuple[str, ...],
     group_var: str | None = None,
+    write_guard_src: StableSrc | None = None,
     note: str = "",
 ) -> None:
     """Register `<category>.get_attributes` and `<category>.set_attributes`.
@@ -89,6 +107,8 @@ def register_attribute_ops(
     would be refused by the op itself (INVALID_ARGS) -- checked here.
     `group_var` names the resolved Batch group the target belongs to (nodes only):
     `name` is then checked against that group's other nodes before any write.
+    `write_guard_src`: source lines that raise `_OpError` for a target a write must refuse (a
+    library); the journaled write's pre-read runs them, before an intent is recorded.
     `note` is appended to the set op's description."""
     not_accepted = [kind for kind in revert_kinds if kind not in accepts]
     if not_accepted:
@@ -116,7 +136,8 @@ def register_attribute_ops(
                 "that keeps addressing the target (a wiretap id / batch uid / node name, with pos "
                 "when several nodes of the group share the name). A value "
                 "that is a Flame object (a PyTrack, a list of PySegment, ...) comes back as "
-                "{type, name} (name only when it can be read), never as a repr."
+                "{type, name} (name only when it can be read), never as a repr; a PyResolution "
+                "comes back as {type, width, height, bit_depth, frame_ratio, scan_mode}."
             ),
             effect="read",
             params=(
@@ -137,7 +158,7 @@ def register_attribute_ops(
                 ),
             ),
             accepts=accepts,
-            to_python=_get_to_python(stable_src),
+            to_python=_get_to_python(stable_src, write_guard_src),
             requires=requires,
         )
     )
@@ -156,8 +177,12 @@ def register_attribute_ops(
                 "written in order, each re-read through a freshly fetched attribute: a "
                 "write that raises nothing but does not stick (e.g. PySegment.dynamic_*) "
                 "counts as failed (errorCode SILENT_NOOP) and stops the call, leaving "
-                "later keys unwritten. The response has `partial` = {applied, failed} "
-                "whenever a key failed, and the result always carries before / after / "
+                "later keys unwritten; so does a write that moves the value but not to the "
+                "one asked for (a rounded number, part of a resolution): errorCode "
+                "FLAME_API_ERROR, failed[key] starts with 'partial:', and the key is in "
+                "changedKeys so that journal.revert puts it back. The response has `partial` = "
+                "{applied, failed} whenever a key failed, and the result always carries before / "
+                "after / "
                 "applied / failed. Do not revert with Ctrl+Z: a set_value write may not be put "
                 "on Flame's Undo history (measured on the name of a reel on the Desktop and "
                 "on a Batch node attribute, where Ctrl+Z removed an earlier, unrelated "

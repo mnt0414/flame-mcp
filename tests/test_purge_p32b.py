@@ -269,6 +269,69 @@ def test_a_copy_that_was_renamed_is_not_deleted(rig: Rig, monkeypatch: pytest.Mo
     assert stash_names(rig) == ["something else"] and purge_records(rig) == []
 
 
+def ignoring_delete_of(rig: Rig, monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    real = rig.flame.delete
+
+    def picky(obj: Any, confirm: bool = True) -> bool:
+        if str(obj.name.get_value()) in names:
+            return False
+        return bool(real(obj, confirm))
+
+    monkeypatch.setattr(rig.flame, "delete", picky)
+
+
+def test_a_delete_flame_ignored_for_every_copy_is_a_silent_noop_not_a_skip(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = old_checkpoint(rig, monkeypatch, S1)
+    ignoring_delete_of(rig, monkeypatch, "S1")
+    env = purge(rig, dry_run=False)
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    result = env["result"]
+    assert result["purged"] == [] and result["skipped"] == []
+    assert [d["id"] for d in result["notDeleted"]] == [old]
+    assert "still there" in result["notDeleted"][0]["reason"]
+    assert stash_names(rig) == ["S1"] and purge_records(rig) == []
+
+
+def test_some_copies_deleted_and_some_ignored_is_a_partial_error_and_the_deleted_are_recorded(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = old_checkpoint(rig, monkeypatch, S1)
+    second = old_checkpoint(rig, monkeypatch, S2)
+    ignoring_delete_of(rig, monkeypatch, "S2")
+    env = purge(rig, dry_run=False)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:")
+    assert env["partial"] == {"purged": 1, "notDeleted": 1} and env["affected"] == 1
+    result = env["result"]
+    assert [p["id"] for p in result["purged"]] == [first]
+    assert [d["id"] for d in result["notDeleted"]] == [second] and result["skipped"] == []
+    assert stash_names(rig) == ["S2"]
+    record = purge_records(rig)[0]
+    assert record["purged"] == [first] and record["notDeleted"] == [second]
+    listed = {i["id"]: i for i in rig.do("journal.list_checkpoints", {})["result"]["items"]}
+    assert listed[first]["purged"] is True and listed[second]["purged"] is False
+
+
+def test_a_copy_that_is_gone_though_flame_did_not_answer_true_is_purged_with_a_warning(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = old_checkpoint(rig, monkeypatch, S1)
+    real = rig.flame.delete
+
+    def false_answer(obj: Any, confirm: bool = True) -> bool:
+        real(obj, confirm)
+        return False
+
+    monkeypatch.setattr(rig.flame, "delete", false_answer)
+    env = purge(rig, dry_run=False)
+    assert env["ok"] is True, env
+    assert [p["id"] for p in env["result"]["purged"]] == [old]
+    assert any("flame.delete answered" in w for w in env["result"]["warnings"])
+    assert purge_records(rig)[0]["purged"] == [old]
+
+
 def test_a_copy_that_left_the_library_is_never_touched_and_is_recorded_as_gone(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

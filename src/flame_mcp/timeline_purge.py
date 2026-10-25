@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING, Any, Final
 from flame_mcp import execution
 from flame_mcp.checkpoints import CHECKPOINT_TIMEOUT_S, TIMELINE_KIND, kind_named
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import Index, new_id, now_iso
+from flame_mcp.journal import VERDICT_UNKNOWN, Index, new_id, now_iso
+from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.timeline_checkpoints import (
     LIBRARY_ARG,
@@ -52,6 +53,14 @@ KNOWN_ARG: Final[str] = "_known"
 ITEMS_ARG: Final[str] = "_items"
 BATCH_SIZE: Final[int] = 50
 """Most stashed copies one Flame call deletes (each call waits up to `CHECKPOINT_TIMEOUT_S`)."""
+PURGE_OP_NAME: Final[str] = "journal.purge_checkpoints"
+UNRECORDED_NOTE: Final[str] = (
+    "the call ended without an answer and left no journal record; Flame answers a read now, so it "
+    "is no longer running. What it did is not known: a copy it made is among `unknownInStash` (a "
+    "stash copy no checkpoint accounts for; journal.purge_checkpoints never deletes it), a setup "
+    "file of batch.checkpoint would be in the checkpoint directory without a record, and a "
+    "purge's deleted copies show as `missing` in a dry run."
+)
 DEFAULT_OLDER_THAN_DAYS: Final[int] = 30
 TOKEN_LENGTH: Final[int] = 32
 
@@ -120,6 +129,12 @@ def purge_op() -> RegisteredOperation:
 
 def _flame(ctx: ServerContext, args: dict[str, Any]) -> dict[str, Any]:
     env = execution.run_op(purge_op(), args, run_dir=ctx.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
+    if env.get("ok") is True and env.get("pending"):
+        raise ServerOpError(
+            "TIMEOUT",
+            "the checkpoint library could not be read or cleaned: the main thread was still busy "
+            f"(pending handle {(env.get('pending') or {}).get('handle')})",
+        )
     if env.get("ok") is not True:
         raw = env.get("result")
         raise ServerOpError(
@@ -214,7 +229,7 @@ def _scan(
 def _purge_batches(
     ctx: ServerContext, library: str, items: list[dict[str, Any]]
 ) -> tuple[dict[str, Any], ServerOpError | None]:
-    done: dict[str, Any] = {"deleted": [], "skipped": [], "reelsDeleted": []}
+    done: dict[str, Any] = {"deleted": [], "skipped": [], "notDeleted": [], "reelsDeleted": []}
     for start in range(0, len(items), BATCH_SIZE):
         batch = items[start : start + BATCH_SIZE]
         try:
@@ -253,6 +268,83 @@ def _token_refusal(given: Any, current: str, count: int) -> ServerOpError | None
         "candidate(s) it lists, and pass its `token` with dry_run=false",
         result={"ran": False, "count": count},
         hint="Nothing was changed.",
+    )
+
+
+def settle_unrecorded(ctx: ServerContext, index: Index) -> list[dict[str, Any]]:
+    """`journal.check` of the blocks that have no journal intent (a stash / checkpoint copy or a
+    purge batch that ended without an answer, `unrecorded_end`). Flame is read once (the stash
+    library): an answer means the main thread is free again, so the cut-off call is no longer
+    running, and every such block is lifted; what the library holds that no recorded checkpoint
+    accounts for is listed (the copy that call may have made is among it, and
+    `journal.purge_checkpoints` never deletes it). A read that does not answer lifts nothing."""
+    blocks = [b for b in ctx.guard.blocked() if not b.recorded]
+    if not blocks:
+        return []
+    known = [
+        uid for r in recorded_timeline_checkpoints(index) if (uid := _stash_uid(r)) is not None
+    ]
+    try:
+        scan = _flame(
+            ctx,
+            {
+                PHASE_ARG: PHASE_SCAN,
+                LIBRARY_ARG: checkpoint_library_name(),
+                CANDIDATES_ARG: [],
+                KNOWN_ARG: known,
+            },
+        )
+    except ServerOpError as exc:
+        return [
+            {
+                "id": b.intent_id,
+                "op": b.op,
+                "group": b.group or None,
+                "reason": b.reason,
+                "released": False,
+                "verdict": VERDICT_UNKNOWN,
+                "detail": f"Flame could not be read ({exc.code}: {exc.message}); writes stay "
+                "refused",
+            }
+            for b in blocks
+        ]
+    unknown = scan.get("unknown") or []
+    for block in blocks:
+        ctx.guard.release(block.intent_id)
+    return [
+        {
+            "id": b.intent_id,
+            "op": b.op,
+            "group": b.group or None,
+            "reason": b.reason,
+            "released": True,
+            "unknownInStash": unknown,
+            "detail": UNRECORDED_NOTE,
+        }
+        for b in blocks
+    ]
+
+
+def _not_deleted_error(result: dict[str, Any], purged: int, failed: int) -> ServerOpError:
+    """Some stashed copies were asked to be deleted, flame.delete was called and they are still
+    there: none deleted = SILENT_NOOP, some = FLAME_API_ERROR `partial:` (the deleted ones are in
+    the purge record already)."""
+    still = ", ".join(str(d["id"]) for d in result["notDeleted"])
+    if purged == 0:
+        return ServerOpError(
+            "SILENT_NOOP",
+            f"flame.delete left all {failed} stashed copy(ies) where they were (result.notDeleted: "
+            f"{still}); nothing was purged",
+            result=result,
+        )
+    return ServerOpError(
+        "FLAME_API_ERROR",
+        f"partial: {purged} stashed copy(ies) were deleted and {failed} are still there after "
+        f"flame.delete (result.notDeleted: {still}); the deleted ones are recorded as purged, "
+        "a purge again retries the rest",
+        result=result,
+        partial={"purged": purged, "notDeleted": failed},
+        affected=purged,
     )
 
 
@@ -298,6 +390,8 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
             if r["exists"]
         ]
         done, failure = _purge_batches(ctx, library, items)
+        if failure is not None and failure.code in UNKNOWN_END_CODES:
+            ctx.guard.block_unrecorded(None, PURGE_OP_NAME, failure.code)
         purged = [d["id"] for d in done["deleted"]]
         record_id = new_id("p")
         record = {
@@ -309,6 +403,7 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
             "purged": purged,
             "gone": [r["id"] for r in gone] if failure is None else [],
             "skipped": done["skipped"],
+            "notDeleted": [d["id"] for d in done["notDeleted"]],
             "reelsDeleted": done["reelsDeleted"],
         }
         journal_error: str | None = None
@@ -322,6 +417,8 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
             "purged": done["deleted"],
             "gone": record["gone"],
             "skipped": done["skipped"],
+            "notDeleted": done["notDeleted"],
+            "warnings": [d["warning"] for d in done["deleted"] if d.get("warning")],
             "reelsDeleted": done["reelsDeleted"],
             "purgeRecord": record_id if journal_error is None else None,
         }
@@ -339,4 +436,6 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
                 hint=failure.hint,
                 affected=len(purged),
             )
+        if done["notDeleted"]:
+            raise _not_deleted_error(result, len(purged), len(done["notDeleted"]))
         return ServerResult(result=result, affected=len(purged))

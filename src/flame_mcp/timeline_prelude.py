@@ -37,7 +37,7 @@ from __future__ import annotations
 
 TIMELINE_HELPER = """
 _TL_MEDIA_TYPES = ('PyClip', 'PySequence')
-_TL_PARENT_DEPTH = 8
+_TL_PARENT_DEPTH = 64
 
 
 def _tl_check_media(obj, label):
@@ -61,12 +61,17 @@ def _tl_chain(obj):
 
 
 def _tl_location(obj):
-    # 'desktop' (a reel of a Desktop reel group), 'library', 'batch' (a reel of a Batch group) or
-    # 'unknown' (the parents could not be followed to either)
-    for parent in _tl_chain(obj):
+    # 'desktop' (a reel of a Desktop reel group), 'library' (a library, or anything inside one),
+    # 'batch' (a reel of a Batch group) or 'unknown' (the parents could not be followed to either,
+    # also when they run on past _TL_PARENT_DEPTH)
+    if type(obj).__name__ == 'PyLibrary':
+        return 'library'
+    chain = _tl_chain(obj)
+    # a reel group made inside a library is a library too: any PyLibrary above wins
+    if any(type(parent).__name__ == 'PyLibrary' for parent in chain):
+        return 'library'
+    for parent in chain:
         name = type(parent).__name__
-        if name == 'PyLibrary':
-            return 'library'
         if name == 'PyBatch' or (name == 'PyReel' and _dc_is_batch_reel(parent)):
             return 'batch'
         if name in ('PyReelGroup', 'PyDesktop'):
@@ -75,7 +80,26 @@ def _tl_location(obj):
 
 
 def _tl_chain_types(obj):
-    return [type(p).__name__ for p in _tl_chain(obj)]
+    return [type(p).__name__ for p in _tl_chain(obj)][:12]
+
+
+def _tl_check_not_library(obj, label):
+    # for a write that must not touch a library or what is in one (a name, an attribute): refuses
+    # a PyLibrary, anything under one, and an object whose parents run past _TL_PARENT_DEPTH
+    # (it could not be told whether a library is above)
+    where = _tl_location(obj)
+    if where == 'library':
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a library or is inside one: library contents are never written to by '
+            'this server (a name and an attribute included)',
+        )
+    if where == 'unknown' and len(_tl_chain(obj)) >= _TL_PARENT_DEPTH:
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' has more than ' + str(_TL_PARENT_DEPTH) + ' parents, so it could not be '
+            'told whether it is inside a library: nothing is written',
+        )
 
 
 def _tl_refuse_location(obj, label):

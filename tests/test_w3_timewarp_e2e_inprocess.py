@@ -45,7 +45,9 @@ def run_script(
     if setup:
         setup_src.write_text(json.dumps(FAKE_SETUP), encoding="utf-8")
     monkeypatch.setattr(module, "SETUP_SRC", setup_src)
-    monkeypatch.setattr(module, "CLIP_FILES", tuple((n, wanted[n]) for n in ("clip1", "p2_len72")))
+    monkeypatch.setattr(
+        module, "CLIP_FILES", tuple((n, wanted[n]) for n in ("clip1", "p2_len72", "p2_len48"))
+    )
     monkeypatch.setattr(common, "MAKE_SEQ_TEMPLATE", FAKE_MAKE_SEQ)
     monkeypatch.setattr(common, "OUTPUT_DIR", tmp_path / "out")
     monkeypatch.setattr(common_a, "OUTPUT_DIR", tmp_path / "out")
@@ -79,7 +81,22 @@ def test_the_timewarp_e2e_runs_to_the_end_against_the_fake(
     assert failed_steps(results) == [], json.dumps(failed_steps(results), indent=1, default=str)
     assert results["ok"] is True and "fatal_error" not in results and "skipped" not in results
     names = [s["name"] for s in results["steps"]]
-    for stage in ("t1_", "t2_", "t3_", "t4_", "t5_", "t6_", "r1_", "n1_", "n2_", "n3_", "z_"):
+    for stage in (
+        "t1_",
+        "t2_",
+        "t3_",
+        "t4_",
+        "t5_",
+        "t6_",
+        "r1_",
+        "n1_",
+        "n2_",
+        "n3_",
+        "i0_",
+        "i1_",
+        "i2_",
+        "z_",
+    ):
         assert any(n.startswith(stage) for n in names), stage
     assert any(
         n.endswith("_the_setup_shrank_the_source_to_35_frames_and_the_segment_has_a_timewarp")
@@ -99,9 +116,21 @@ def test_the_timewarp_e2e_runs_to_the_end_against_the_fake(
     assert desktop.batch_groups == [] and desktop.reel_groups == []
     assert flame.projects.current_project.current_workspace.libraries == []
     assert results["env"] == {"FLAME_MCP_CHECKPOINT_LIBRARY": "PTW3E_261008_000000_CKPT"}
-    moved = {o["name"]: (o["sourceIn"], o["sourceOut"]) for o in results["observations"]}
+    moved = {
+        o["name"]: (o["sourceIn"], o["sourceOut"])
+        for o in results["observations"]
+        if o["name"].endswith("_how_far_the_source_moved")
+    }
     assert moved["t1_tail_plus_3_how_far_the_source_moved"] == (0, -2)
     assert moved["t5_slip_plus_2_how_far_the_source_moved"] == (-2, -1)
+    stage_i = {o["name"]: o for o in results["observations"] if o["name"].startswith("i")}
+    extended = stage_i["i0_how_the_transport_trim_extended_the_tail"]
+    assert extended["returned"] == "False"
+    assert extended["after"]["tail"] == "infinite"
+    assert extended["after"]["rout"] == extended["start"]["rout"] + 5
+    assert stage_i["i1_the_tail_after_the_trim"]["tail"] == "infinite"
+    slip = stage_i["i2_the_slip_direction_chosen_from_the_head_handle"]
+    assert (slip["head"], slip["offset"]) == (0, -2)
 
 
 def test_without_the_setup_file_the_run_says_skip_and_touches_nothing(

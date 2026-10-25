@@ -62,6 +62,7 @@ from flame_mcp.timeline_checkpoints import (
     stash_reel_name,
 )
 from flame_mcp.types import ServerOpError, ServerResult
+from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -79,11 +80,26 @@ DELETE_NOTE: Final[str] = (
     "is not restored). The stashed copies stay in the checkpoint library until "
     "journal.purge_checkpoints removes them."
 )
+REEL_NOTE: Final[str] = (
+    "An empty reel has no stashed copy (result.deleted[].stash is null). journal.revert(group) "
+    "makes a new empty reel of the same name and type at the END of the same reel group (a new "
+    "uid; its old place is not restored, and neither are its colour or other attributes); a "
+    "reel group that already has a reel of that name is a CONFLICT."
+)
 DELETE_REVERT_NOTE: Final[str] = (
     "The things were copied back into their old parents from their stashed copies: each has a NEW "
     "uid and wiretap id and is at the END of its reel (their old place is not restored); use "
     "reverted[].to.selector. The stashed copies are still in the checkpoint library."
 )
+
+
+def _item_key(row: Mapping[str, Any]) -> str:
+    """What identifies one deleted thing across a delete and its reverts: its checkpoint id, or
+    for an empty reel (no checkpoint) its old uid."""
+    checkpoint = row.get("checkpoint")
+    if isinstance(checkpoint, str):
+        return checkpoint
+    return "uid:" + str((row.get("from") or {}).get("uid"))
 
 
 def is_delete_intent(view: IntentView) -> bool:
@@ -151,13 +167,17 @@ def _prepare(
     args.update({PHASE_ARG: PHASE_STASH, LIBRARY_ARG: checkpoint_library_name()})
     args[REEL_ARG] = stash_reel_name()
     env = execution.run_op(op, args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
+    shut_if_unanswered(rt.guard, env, op.name, group_id)
     raw = env.get("result")
     value: dict[str, Any] = raw if isinstance(raw, dict) else {}
     stashes = [s for s in value.get("stashes") or [] if isinstance(s, dict)]
-    ids: list[str] = []
+    ids: list[str | None] = []
     try:
         for stash in stashes:
-            ids.append(stash_record(rt, op, group_id, stash))
+            # an empty reel has no stashed copy: nothing to record, the revert makes a new reel
+            ids.append(
+                stash_record(rt, op, group_id, stash) if stash.get("stash") is not None else None
+            )
     except OSError as exc:
         return _refuse(
             op,
@@ -169,12 +189,13 @@ def _prepare(
             "are in the checkpoint library (journal.purge_checkpoints lists them as unknown).",
         )
     if env.get("ok") is not True or len(stashes) != len(rows):
+        recorded = [i for i in ids if i is not None]
         failure = dict(env)
         failure["execution"] = envelope_mod.execution_meta(op)
         failure["error"] = (
             f"nothing was deleted: the copy that makes the delete revertible failed "
-            f"({env.get('error')}); {len(ids)} copy(ies) made before it are recorded as "
-            f"checkpoint(s) {ids}"
+            f"({env.get('error')}); {len(recorded)} copy(ies) made before it are recorded as "
+            f"checkpoint(s) {recorded}"
         )
         failure["ok"] = False
         if not failure.get("errorCode"):
@@ -219,6 +240,7 @@ def _source_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "fingerprint": row.get("fingerprint"),
         "segmentCount": row.get("segmentCount"),
         "displayed": row.get("displayed"),
+        "reelType": row.get("reelType"),
     }
 
 
@@ -251,7 +273,7 @@ def _intent_record(
             }
             for st in stashed
         ],
-        "checkpoints": [st.get("checkpoint") for st in stashed],
+        "checkpoints": [st.get("checkpoint") for st in stashed if st.get("checkpoint")],
         "shown": pre.get("shown"),
     }
 
@@ -276,8 +298,17 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
     result = env.get("result")
     if not isinstance(result, dict):
         return
-    if result.get("deleted"):
-        result["notes"] = [*(result.get("notes") or []), DELETE_NOTE]
+    deleted = result.get("deleted") or []
+    reels = [
+        d for d in deleted if isinstance(d, dict) and (d.get("from") or {}).get("type") == "PyReel"
+    ]
+    added = []
+    if len(reels) < len(deleted):
+        added.append(DELETE_NOTE)
+    if reels:
+        added.append(REEL_NOTE)
+    if added:
+        result["notes"] = [*(result.get("notes") or []), *added]
     warnings = result.get("warnings")
     if isinstance(warnings, list) and warnings:
         env["degraded"] = [*env.get("degraded", []), *[f"read-back differs: {w}" for w in warnings]]
@@ -326,7 +357,12 @@ def _revert_count(view: IntentView, result: Mapping[str, Any]) -> int:
 def _revert_extra(result: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "restored": [
-            {"checkpoint": r.get("checkpoint"), "stash": r.get("stash"), "to": r.get("to")}
+            {
+                "checkpoint": r.get("checkpoint"),
+                "from": r.get("from"),
+                "stash": r.get("stash"),
+                "to": r.get("to"),
+            }
             for r in result.get("reverted") or []
         ],
         "notRestored": result.get("notReverted") or [],
@@ -355,8 +391,8 @@ def _restored_checkpoints(index: Index, group: str) -> set[str]:
         for view in index.groups.get(other, []):
             restored = (view.outcome or {}).get("restored")
             for row in restored if isinstance(restored, list) else []:
-                if isinstance(row, dict) and isinstance(row.get("checkpoint"), str):
-                    done.add(row["checkpoint"])
+                if isinstance(row, dict):
+                    done.add(_item_key(row))
     return done
 
 
@@ -370,7 +406,7 @@ def revert_delete_group(
         view = views[0]
         created = view.created_info()
         if created is not None:
-            rest = [d for d in created.get("deletes") or [] if d.get("checkpoint") not in done]
+            rest = [d for d in created.get("deletes") or [] if _item_key(d) not in done]
             if not rest:
                 raise ServerOpError(
                     "PRECONDITION_UNMET",
@@ -406,6 +442,7 @@ def _created_from_intent(view: IntentView) -> dict[str, Any]:
                     "name": source.get("name"),
                     "type": source.get("type"),
                     "uid": source.get("uid"),
+                    "reelType": source.get("reelType"),
                 },
                 "checkpoint": stash.get("checkpoint"),
                 "stash": stash.get("stash"),

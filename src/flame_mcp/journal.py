@@ -5,8 +5,12 @@ turn its records into states. Records (one JSON object per line, append-only):
 
   intent      {type, id, group, ts, op, args, target, targetAfter, readOp, before, after,
                reverts?}              written and flushed before the write is sent
-  outcome     {type, id, group, ts, ok, applied, failed, errorCode, readBack}
-                                     written after the write's answer is in
+  outcome     {type, id, group, ts, ok, applied, changedKeys, failed, errorCode, readBack}
+                                     written after the write's answer is in; `applied` = the keys
+                                     that read back as asked, `changedKeys` = the keys whose value
+                                     is no longer what it was (the applied ones that moved, plus a
+                                     key Flame rounded or only partly took): what a revert puts
+                                     back. (A checkpoint outcome's `changed` is a flag of its own.)
   unresolved  {type, id, group, ts, errorCode, error}
                                      the answer never came (TIMEOUT / BRIDGE_LOST /
                                      BRIDGE_UNAVAILABLE): informational, not an outcome
@@ -52,6 +56,14 @@ bridge no longer knows) the files alone decide (`basis: "disk"`: an estimate, th
 confirmed). Every planned frame written since the intent = `landed`, some = `partial`, none =
 `not_landed` (`failed` when the render itself reported a failure and did not write everything).
 `partial` is therefore both a state an outcome can carry and a verdict a check can reach.
+
+A "render clip intent" (`render.clip`) is an intent with `kind: "render_clip"` that names the
+clip (`target`, a stable selector; `uid`, `name`), the arguments of the render and
+`isRenderedBefore`; its outcome carries `verdict` (landed / not_landed), `isRenderedBefore` and
+`isRenderedAfter`. Like a render intent it has no `before` and nothing brings it back.
+`journal.check` decides an open one (`render_clip_check.check_render_clip_intent`): the bridge's
+answer for the handle first (`basis: "handle"`), else `is_rendered()` read from Flame again
+(`basis: "flame"`: true = `landed`, false = `not_landed`, an estimate).
 
 A "desktop intent" (`desktop.create` / `desktop.copy`) is an intent with `kind:
 "desktop_create"` / `"desktop_copy"`; it has no `before` / `after` and no `revertCheckpoint`. It
@@ -126,11 +138,11 @@ from pathlib import Path
 from typing import IO, Any, Final
 
 from flame_mcp.attribute_prelude import CASE_FOLDED_ATTRIBUTES
+from flame_mcp.private_fs import default_root, make_private_dirs
 
 JOURNAL_DIR_ENV: Final[str] = "FLAME_MCP_JOURNAL_DIR"
 JOURNAL_MAX_AGE_S: Final[float] = 30 * 24 * 60 * 60
 JOURNAL_FILE_MODE: Final[int] = 0o600
-JOURNAL_DIR_MODE: Final[int] = 0o700
 _FILE_PREFIX: Final[str] = "journal_"
 _FILE_SUFFIX: Final[str] = ".jsonl"
 _NUMBER_TOLERANCE: Final[float] = 1e-6  # same tolerance as the in-Flame `_attr_equal`
@@ -149,6 +161,11 @@ STATE_REVERTED: Final[str] = "reverted"
 STATE_PARTIALLY_REVERTED: Final[str] = "partially_reverted"
 
 VERDICT_UNKNOWN: Final[str] = "unknown"
+
+ATTRIBUTE_FINGERPRINT_KEY: Final[str] = "attributeFingerprintAfter"
+"""Outcome key of a bundled Batch plan with value writes: the group's fingerprint over nodes,
+wiring and every node's attribute values, read right after the run (what `journal.revert` compares
+with, so an attribute changed since is not restored over)."""
 
 KIND_DESKTOP_CREATE: Final[str] = "desktop_create"
 KIND_DESKTOP_COPY: Final[str] = "desktop_copy"
@@ -197,7 +214,7 @@ def default_journal_dir() -> Path:
     override = os.environ.get(JOURNAL_DIR_ENV)
     if override:
         return Path(override)
-    return Path.home() / "Library" / "Application Support" / "flame-mcp" / "journal"
+    return default_root() / "journal"
 
 
 def new_id(prefix: str) -> str:
@@ -258,7 +275,7 @@ class Journal:
         if self._fh is not None:
             self._fh.close()
             self._fh = None
-        self._dir.mkdir(parents=True, exist_ok=True, mode=JOURNAL_DIR_MODE)
+        make_private_dirs(self._dir)
         # A file whose last line was torn (no trailing newline) must not swallow the next
         # record: start on a fresh line, leaving the torn one to be dropped by the reader.
         torn = False
@@ -449,7 +466,9 @@ class IntentView:
                 return STATE_CONFLICT
             if outcome.get("verdict") == STATE_PARTIAL:
                 return STATE_PARTIAL
-            if outcome.get("applied"):
+            if outcome.get("applied") or outcome.get("changedKeys"):
+                return STATE_PARTIAL
+            if outcome.get("touched") is True:
                 return STATE_PARTIAL
             return STATE_FAILED
         check = self.resolving_check()
@@ -488,6 +507,14 @@ class IntentView:
         value = self.outcome.get("fingerprintAfter")
         return value if isinstance(value, str) and value else None
 
+    def attribute_fingerprint_after(self) -> str | None:
+        """The fingerprint with the `attributes` section right after a bundled plan's run
+        (`watchAttributes` plans), when its outcome recorded one."""
+        if self.outcome is None:
+            return None
+        value = self.outcome.get(ATTRIBUTE_FINGERPRINT_KEY)
+        return value if isinstance(value, str) and value else None
+
     def is_revertible(self) -> bool:
         """A revert has something to put back: attribute keys that were applied, or a
         checkpoint intent that ran (an outcome, or a check that found the group changed)."""
@@ -498,17 +525,22 @@ class IntentView:
         if self.revert_checkpoint() is None:
             return False
         if self.outcome is not None:
-            return True
+            return self.outcome.get("touched") is not False
         check = self.resolving_check()
         return check is not None and check.get("verdict") in (STATE_LANDED, STATE_DIVERGED)
 
     def revertible_keys(self) -> list[str]:
-        """The attribute keys a revert would put back: the ones the outcome says were applied,
-        or (no outcome) all of them when a check found the write had landed."""
+        """The attribute keys a revert would put back: the ones the outcome says were applied or
+        changed (`applied`, `changedKeys`), or (no outcome) all of them when a check found the
+        write had landed."""
         keys = [str(k) for k in (self.intent.get("before") or {})]
         if self.outcome is not None:
-            applied = self.outcome.get("applied")
-            return [k for k in keys if isinstance(applied, list) and k in applied]
+            moved: list[Any] = []
+            for name in ("applied", "changedKeys"):
+                listed = self.outcome.get(name)
+                if isinstance(listed, list):
+                    moved.extend(listed)
+            return [k for k in keys if k in moved]
         check = self.resolving_check()
         if check is not None and check.get("verdict") == STATE_LANDED:
             return keys

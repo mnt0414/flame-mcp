@@ -224,9 +224,10 @@ def enrich_plan(raw: Mapping[str, Any]) -> dict[str, Any]:
             _describe_writer(node, row, listings)
         else:
             node["output"] = (
-                "a clip in the destination reel(s) "
-                f"{row.get('destination')!r}; a Render node has no file path attribute, so "
-                "what it wrote cannot be checked on disk"
+                "a clip in the reel named by destinationReel (a shelf reel of the Batch group or a "
+                f"reel of a Desktop reel group; destination {row.get('destination')!r}); a "
+                "Render node has no file path attribute, so what it wrote cannot be checked "
+                "on disk"
             )
         nodes.append(node)
     plan: dict[str, Any] = {
@@ -234,6 +235,7 @@ def enrich_plan(raw: Mapping[str, Any]) -> dict[str, Any]:
         "stable": raw.get("stable"),
         "nodes": nodes,
         "reels": raw.get("reels"),
+        "destinationUnsupported": raw.get("destinationUnsupported"),
     }
     effective = [n for n in nodes if n["effective"]]
     plan["summary"] = {

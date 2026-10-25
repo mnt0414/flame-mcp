@@ -10,12 +10,13 @@ exception, and allows two sequences with the same name."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from fake_media_tree import ACTIVE_TIMELINE, PyReel
+from fake_media_tree import ACTIVE_TIMELINE, PyReel, PyTime
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
@@ -243,22 +244,55 @@ def test_a_bit_depth_of_another_type_is_refused_on_the_server(
     assert untouched(rig) and seen_kwargs == []
 
 
-def test_a_bit_depth_that_reads_back_differently_is_a_warning(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def altered(monkeypatch: pytest.MonkeyPatch, change: Callable[[Any], None]) -> None:
     original = PyReel.create_sequence
 
-    def other_depth(self: PyReel, **kwargs: Any) -> Any:
+    def create_then_change(self: PyReel, **kwargs: Any) -> Any:
         made = original(self, **kwargs)
-        made.bit_depth = 8
+        change(made)
         return made
 
-    monkeypatch.setattr(PyReel, "create_sequence", other_depth)
-    env = create(rig, bit_depth=16)
-    assert env["ok"] is True, env
-    assert env["result"]["sequence"]["bitDepth"] == 8
-    assert env["result"]["warnings"] == ["read-back differs: bit_depth asked for 16, read back 8"]
-    assert env["degraded"] == env["result"]["warnings"]
+    monkeypatch.setattr(PyReel, "create_sequence", create_then_change)
+
+
+def drop_a_track(made: Any) -> None:
+    made.versions[0]._tracks.pop()
+
+
+def start_at_zero(made: Any) -> None:
+    made.start_time.set_value(PyTime(0))
+
+
+@pytest.mark.parametrize(
+    ("change", "extra", "needle"),
+    [
+        (lambda m: setattr(m, "bit_depth", 8), {"bit_depth": 16}, "bit_depth asked for 16"),
+        (lambda m: setattr(m, "frame_rate", "25 fps"), {}, "frame_rate asked for '23.976 fps'"),
+        (lambda m: setattr(m, "width", 1280), {}, "width asked for 1920, read back 1280"),
+        (lambda m: setattr(m, "height", 720), {}, "height asked for 1080, read back 720"),
+        (drop_a_track, {"video_tracks": 2}, "video_tracks asked for 2, read back 1"),
+        (start_at_zero, {"start_tc": "01:00:00:00"}, "start_tc asked for frame 86400"),
+    ],
+)
+def test_a_value_that_reads_back_differently_is_a_partial_error_and_the_sequence_is_recorded(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[Any], None],
+    extra: dict[str, Any],
+    needle: str,
+) -> None:
+    altered(monkeypatch, change)
+    env = create(rig, **extra)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and needle in env["error"]
+    assert env["result"]["created"]["type"] == "PySequence" and env["affected"] == 1
+    assert names(rig).count("NEWSEQ") == 1 and env["journal"]["revert"] is not None
+    outcome = rig.records()[-1]
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert outcome["created"]["uid"] == env["result"]["created"]["uid"]
+    assert rig.do("journal.list", {})["result"]["items"][0]["state"] == "partial"
+    out = rig.do("journal.revert", {"group": env["journal"]["group"]})
+    assert out["ok"] is True and names(rig).count("NEWSEQ") == 0
 
 
 def test_the_description_says_what_the_bit_depth_decides() -> None:
@@ -393,9 +427,10 @@ def test_a_revert_after_an_edit_that_was_not_reverted_is_a_conflict_and_deletes_
     rig: Rig,
 ) -> None:
     env = create(rig)
-    edit_created(rig, env)
+    edit = edit_created(rig, env)
     out = rig.do("journal.revert", {"group": env["journal"]["group"]})
-    assert out["ok"] is False and out["errorCode"] == "CONFLICT" and "fingerprint" in out["error"]
+    assert out["ok"] is False and out["errorCode"] == "CONFLICT"
+    assert [r["group"] for r in out["result"]["newerGroups"]] == [edit["journal"]["group"]]
     assert names(rig).count("NEWSEQ") == 1
 
 
@@ -460,6 +495,17 @@ def test_a_revert_of_a_sequence_that_was_renamed_is_a_conflict(rig: Rig) -> None
     out = rig.do("journal.revert", {"group": env["journal"]["group"]})
     assert out["ok"] is False and out["errorCode"] == "CONFLICT" and "name" in out["error"]
     assert "renamed" in names(rig)
+
+
+def test_a_revert_of_a_sequence_whose_content_was_changed_by_hand_is_a_conflict(rig: Rig) -> None:
+    env = create(rig)
+    made = rig.handles["reel"].children[-1]
+    made.versions[0].tracks[0].segments[0].head = 9  # a hand edit the journal never saw
+    out = rig.do("journal.revert", {"group": env["journal"]["group"]})
+    assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
+    assert any("fingerprint" in c for c in out["result"]["conflicts"]), out["result"]
+    assert not out["result"].get("newerGroups")
+    assert names(rig).count("NEWSEQ") == 1
 
 
 def test_a_sequence_that_is_gone_already_is_ok_to_revert(rig: Rig) -> None:

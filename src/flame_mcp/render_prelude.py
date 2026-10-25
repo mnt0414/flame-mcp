@@ -18,13 +18,28 @@ What it encodes (measured on Flame 2025.2.4):
     render puts a clip into the shelf reel `Batch Renders` and writes a `.clip` file
     beside the frames.
   - a Write File is effective only if it is not bypassed and something is wired to its input.
+  - a Render node whose `destination` is ['Reel Groups', <group>] puts its clip, named after the
+    node, into a reel of the Desktop's reel group <group> -- not into a reel of the Batch group
+    -- and `newClips` / the Batch group's reels show nothing of it. Which reel depends on the
+    Flame version. On 2025.2.4 the destination reads back as those 2 elements and the reel is
+    `Batch Renders` (Flame made it when the group had none; a second render went into the same
+    reel): `DESKTOP_RENDER_REEL`, one constant. On 2026.2.3 setting the same 2 elements reads
+    back as 3, ['Reel Groups', <group>, 'Reel 1'], and the clip goes into that reel; no
+    `Batch Renders` is made. So a 3rd element that is a string names the reel, and without one the
+    reel is `Batch Renders`. `destination.values` cannot be read. Only 'Batch Reels' and
+    'Reel Groups' are followed; any other kind is recorded in `destinationUnsupported` and not
+    counted.
 """
 
 from __future__ import annotations
 
 RENDER_NODE_PY_TYPES: tuple[str, ...] = ("PyWriteFileNode", "PyRenderNode")
 
-RENDER_HELPER = """
+DESKTOP_RENDER_REEL = "Batch Renders"
+
+RENDER_HELPER = (
+    f"_DESKTOP_RENDER_REEL = {DESKTOP_RENDER_REEL!r}\n"
+    + """
 _RENDER_PY_TYPES = ('PyWriteFileNode', 'PyRenderNode')
 
 
@@ -66,7 +81,84 @@ def _render_node_row(node):
     return row
 
 
-def _render_reel_state(batch):
+def _render_row_effective(row):
+    wired = row.get('wiredInputs')
+    return row.get('bypass') is not True and isinstance(wired, int) and wired > 0
+
+
+def _render_destination_lookup(batch, dest):
+    if not isinstance(dest, list) or len(dest) < 2 or not isinstance(dest[1], str):
+        return None
+    kind, name = dest[0], dest[1]
+    reel_name = dest[2] if len(dest) > 2 and isinstance(dest[2], str) else _DESKTOP_RENDER_REEL
+    if kind == 'Batch Reels':
+        info = {'kind': 'shelf', 'group': None, 'reel': name}
+        reels = _try(lambda: [r for r in list(batch.shelf_reels) if _v(r.name) == name])
+    elif kind == 'Reel Groups':
+        info = {'kind': 'desktop', 'group': name, 'reel': reel_name}
+        groups = _try(
+            lambda: [
+                g
+                for g in list(flame.projects.current_project.current_workspace.desktop.reel_groups)
+                if _v(g.name) == name
+            ]
+        )
+        if groups is None:
+            reels = None
+        elif not groups:
+            info['groupMissing'] = True
+            reels = []
+        else:
+            reels = _try(
+                lambda: [r for r in list(groups[0].reels) if _v(r.name) == reel_name]
+            )
+    else:
+        return None
+    if reels is None:
+        info.update(exists=None, clipCount=None)
+        return info, None
+    clips = _clip_names(reels[0]) if reels else []
+    info.update(exists=bool(reels), clipCount=None if clips is None else len(clips))
+    return info, clips
+
+
+def _render_scan(batch):
+    nodes = []
+    desktop = []
+    unsupported = []
+    seen = set()
+    for node in list(batch.nodes):
+        if type(node).__name__ not in _RENDER_PY_TYPES:
+            continue
+        row = _render_node_row(node)
+        nodes.append(row)
+        if row['kind'] != 'render':
+            continue
+        dest = row['destination']
+        found = _render_destination_lookup(batch, dest)
+        row['destinationReel'] = None if found is None else found[0]
+        if not _render_row_effective(row):
+            continue
+        if found is None:
+            entry = {'node': row['name'], 'destination': dest}
+            if dest is None:
+                entry['unread'] = True
+            unsupported.append(entry)
+            continue
+        info, clips = found
+        if info['kind'] != 'desktop' or (info['group'], info['reel']) in seen:
+            continue
+        seen.add((info['group'], info['reel']))
+        reel_row = {'kind': 'desktop', 'name': info['group'] + '/' + info['reel'], 'clips': clips}
+        if info['exists'] is False:
+            reel_row['missing'] = True
+        if info.get('groupMissing'):
+            reel_row['groupMissing'] = True
+        desktop.append(reel_row)
+    return {'nodes': nodes, 'desktop': desktop, 'unsupported': unsupported}
+
+
+def _render_reel_state(batch, scan):
     rows = []
     for attr, kind in (('reels', 'schematic'), ('shelf_reels', 'shelf')):
         for r in list(getattr(batch, attr)):
@@ -77,32 +169,44 @@ def _render_reel_state(batch):
                     'clips': _clip_names(r),
                 }
             )
-    return rows
+    return rows + scan['desktop']
 
 
 def _render_reel_counts(rows):
-    return [
-        {'kind': r['kind'], 'name': r['name'],
-         'clipCount': None if r['clips'] is None else len(r['clips'])}
-        for r in rows
-    ]
+    counts = []
+    for r in rows:
+        count = {
+            'kind': r['kind'],
+            'name': r['name'],
+            'clipCount': None if r['clips'] is None else len(r['clips']),
+        }
+        for flag in ('missing', 'groupMissing'):
+            if r.get(flag):
+                count[flag] = True
+        counts.append(count)
+    return counts
 
 
 def _render_plan(batch):
-    rows = [_render_node_row(n) for n in list(batch.nodes) if type(n).__name__ in _RENDER_PY_TYPES]
+    scan = _render_scan(batch)
     return {
         'batch': _batch_ident(batch),
         'stable': _batch_selector(batch),
-        'nodes': rows,
-        'reels': _render_reel_counts(_render_reel_state(batch)),
+        'nodes': scan['nodes'],
+        'reels': _render_reel_counts(_render_reel_state(batch, scan)),
+        'destinationUnsupported': scan['unsupported'],
     }
 
 
 def _render_new_clips(before, after):
     added = []
+    unknown = []
     for row in after:
         old = [b for b in before if b['kind'] == row['kind'] and b['name'] == row['name']]
-        seen = [] if not old or old[0]['clips'] is None else list(old[0]['clips'])
+        if old and old[0]['clips'] is None:
+            unknown.append({'kind': row['kind'], 'name': row['name']})
+            continue
+        seen = [] if not old else list(old[0]['clips'])
         fresh = []
         for clip in row['clips'] or []:
             if clip in seen:
@@ -111,22 +215,27 @@ def _render_new_clips(before, after):
                 fresh.append(clip)
         if fresh:
             added.append({'kind': row['kind'], 'name': row['name'], 'clips': fresh})
-    return added
+    return added, unknown
 
 
 def _render_run(batch):
     import time
-    before = _render_reel_state(batch)
+    scan = _render_scan(batch)
+    before = _render_reel_state(batch, scan)
     started = time.monotonic()
     returned = batch.render(render_option='Foreground')
     elapsed = time.monotonic() - started
-    after = _render_reel_state(batch)
+    after = _render_reel_state(batch, _render_scan(batch))
+    added, unknown = _render_new_clips(before, after)
     return {
         'renderOption': 'Foreground',
         'returned': _ja(returned),
         'elapsedS': round(elapsed, 3),
-        'newClips': _render_new_clips(before, after),
+        'newClips': added,
+        'newClipsUnknown': unknown,
         'reelsBefore': _render_reel_counts(before),
         'reelsAfter': _render_reel_counts(after),
+        'destinationUnsupported': scan['unsupported'],
     }
 """
+)

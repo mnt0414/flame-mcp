@@ -40,6 +40,17 @@ undo it the same way it undoes an eval run.
      load) / sweptOld / error; a reel that could not be put in order is also in
      `result.warnings`. `batch.load_setup` does none of this.
 
+4. A Batch setup holds no Timeline FX of the clips in the group's reels: a clip whose FX were
+     changed or rendered inside the group came back from `load_setup` without them, and a clip
+     that was only copied in can lose them too (Flame 2025.2.4). A restore
+     of a checkpoint that recorded the reel clips' FX
+     (`timeline_fx_loss`) reads them again in the same Flame call as the load, and the clips
+     whose FX got fewer are `result.timelineFxLost` (`[]` when there are none) and the clips it
+     could not compare (unreadable, or not back under the same name) are
+     `result.timelineFxUnchecked` (`[]` when there are none); both are null when nothing could
+     be checked, with `result.timelineFxNotCompared` saying why. A line in `result.warnings`
+     says what to do for each that is not empty. ok and the error code do not change.
+
 `batch.load_setup` (any setup file, not only a checkpoint's) goes through the same replace
 (`replace_group`, via its `wrap`): the same file check, the same checkpoint of the current state
 first, the same intent / outcome with fingerprints; there is just no fingerprint it is expected
@@ -55,7 +66,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from flame_mcp import clip_order, execution, reel_fidelity, transport
+from flame_mcp import clip_order, execution, reel_fidelity, timeline_fx_loss, transport
 from flame_mcp import envelope as envelope_mod
 from flame_mcp.checkpointed import (
     ASCII_REFUSAL_HINT,
@@ -66,6 +77,7 @@ from flame_mcp.checkpointed import (
 )
 from flame_mcp.checkpoints import (
     CHECKPOINT_TIMEOUT_S,
+    FX_ARG,
     REELS_ARG,
     TIMELINE_KIND,
     batch_target,
@@ -197,16 +209,20 @@ def run_load(
     target: Mapping[str, Any],
     path: str,
     reel_record: reel_fidelity.ReelRecord | None = None,
+    read_clip_fx: bool = False,
 ) -> dict[str, Any]:
     """Flame's `load_setup` through the bare `batch.load_setup` op: its Flame-side file check,
     no checkpoint of its own (the caller has taken one). Policy for it was checked up front.
-    With `reel_record` the reels are tidied in the same Flame call, right after the load."""
+    With `reel_record` the reels are tidied in the same Flame call, right after the load; with
+    `read_clip_fx` the reel clips' Timeline FX are read there too."""
     op = ctx.registry.get(LOAD_OP_NAME)
     if op is None:
         raise ServerOpError("UNKNOWN_OPERATION", f"'{LOAD_OP_NAME}' is not registered")
     args: dict[str, Any] = {"target": dict(target), "path": path}
     if reel_record is not None:
         args[REELS_ARG] = reel_record.rows
+    if read_clip_fx:
+        args[FX_ARG] = True
     return execution.run_op(
         op,
         args,
@@ -334,6 +350,7 @@ def restore_checkpoint(
         return restore_timeline_checkpoint(ctx, record)
     path, uid, expected_fp = _checkpoint_fields(ctx, checkpoint_id, record)
     reel_record, reel_skip_reason = reel_fidelity.record_of(record)
+    fx = timeline_fx_loss.record_of(record)
     step = _prepare_clip_order(ctx, path, reel_record, reel_skip_reason)
     progress = LoadProgress()
     result: Any = None
@@ -355,6 +372,7 @@ def restore_checkpoint(
             group=None,
             reel_record=reel_record,
             reel_skip_reason=reel_skip_reason,
+            fx=fx,
             load_path=str(step.copy.batch_path) if step.copy is not None else None,
             progress=progress,
         )
@@ -385,6 +403,7 @@ def replace_group(
     group: str | None,
     reel_record: reel_fidelity.ReelRecord | None = None,
     reel_skip_reason: str | None = None,
+    fx: timeline_fx_loss.FxRecord | None = None,
     load_path: str | None = None,
     progress: LoadProgress | None = None,
 ) -> ServerResult:
@@ -396,22 +415,32 @@ def replace_group(
     failure after the checkpoint carries `preCheckpoint` in its result. With `reel_record` (a
     checkpoint's reel inventory) the reels are tidied after the load and `reelTidy` /
     `reelsRestored` are in the result; without, `reelTidy` says why not (`reel_skip_reason`).
-    `load_path` is the file Flame loads when it is not `path` (the ordered copy of a checkpoint,
-    `clip_order`); `path` stays what the journal and the result name. `progress` is told when
-    Flame is asked to load and when the load ended without an answer (Flame may still be
-    reading `load_path`)."""
+    With `fx` (a checkpoint's record of the reel clips' Timeline FX) the clips whose FX got fewer
+    are `timelineFxLost` in the result and one line in `warnings`; without, nothing is said about
+    them. `load_path` is the file Flame loads when it is not `path` (the ordered copy of a
+    checkpoint, `clip_order`); `path` stays what the journal and the result name. `progress` is
+    told when Flame is asked to load and when the load ended without an answer (Flame may still
+    be reading `load_path`)."""
 
     def run(stable: dict[str, Any]) -> dict[str, Any]:
         if progress is not None:
             progress.started = True
-        return run_load(ctx, stable, load_path or path, reel_record)
+        return run_load(
+            ctx,
+            stable,
+            load_path or path,
+            reel_record,
+            read_clip_fx=fx is not None and fx.rows is not None,
+        )
 
     def tidy_of(load_env: Mapping[str, Any]) -> dict[str, Any]:
         raw = load_env.get("result") if load_env.get("ok") is True else None
         return reel_fidelity.report(reel_record, reel_skip_reason, raw)
 
     def matched_of(load_env: Mapping[str, Any], after_fp: str | None) -> bool:
-        return load_env.get("ok") is True and (expected_fp is None or after_fp == expected_fp)
+        if expected_fp is None:
+            return load_env.get("ok") is True and after_fp is not None
+        return load_env.get("ok") is True and after_fp == expected_fp
 
     def judge(load_env: dict[str, Any], after_fp: str | None) -> Judgement:
         if matched_of(load_env, after_fp):
@@ -470,7 +499,7 @@ def replace_group(
             journal={"group": facts.group, "id": facts.intent_id},
         )
     raw_load = load_env.get("result") if isinstance(load_env.get("result"), dict) else {}
-    load_result = {k: v for k, v in (raw_load or {}).items() if k != "reelTidy"}
+    load_result = {k: v for k, v in (raw_load or {}).items() if k not in ("reelTidy", "clipFx")}
     tidy = tidy_of(load_env)
     after_fp = facts.fingerprint_after
     matched = facts.ok
@@ -488,6 +517,12 @@ def replace_group(
         "preCheckpoint": pre_summary,
         "undo": {"op": OP_NAME, "args": {"checkpoint": facts.pre_id}},
     }
+    if fx is not None:
+        fx_report = timeline_fx_loss.report(fx, raw_load if load_env.get("ok") is True else None)
+        result.update(fx_report)
+        fx_warnings = timeline_fx_loss.warnings_of(fx_report)
+        if fx_warnings:
+            result["warnings"] = [*result.get("warnings", []), *fx_warnings]
     if forced is not None:
         result["forced"] = dict(forced)
     if facts.journal_error is not None:
@@ -560,6 +595,11 @@ def _failure_text(
 ) -> str:
     if load_env.get("ok") is not True:
         return f"load_setup failed: {load_env.get('error')}"
+    if after_fp is None and expected_fp is None:
+        return (
+            "load_setup was called and the group's fingerprint could not be read afterwards, so "
+            "the result of the load is unknown (the group may have been replaced)"
+        )
     return (
         f"load_setup returned True but the group's fingerprint {_short(after_fp)} is not the "
         f"checkpoint's {_short(expected_fp)}"

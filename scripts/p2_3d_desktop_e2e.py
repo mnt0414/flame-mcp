@@ -3,10 +3,10 @@
 `desktop.copy`, with their journal groups and `journal.revert` (run with the `.venv` Python;
 `scripts/run_e2e.sh p2_3d_desktop` starts Flame).
 
-Checks: `desktop.create` (Batch group, reel group, reel) and `desktop.copy`: names, `allow_rename`,
-refusals, and `journal.revert`, including the cases where a revert is refused or skips an item that
-changed. A default Batch group is compared with one that Flame itself makes with only a name (the
-number of reels differs by Flame version).
+Checks: `desktop.create` (Batch group, reel group, reel), `desktop.copy` and `desktop.arrange`:
+names, `allow_rename`, refusals, the order a reel is built in, and `journal.revert`, including the
+cases where a revert is refused or skips an item that changed. A default Batch group is compared
+with one that Flame itself makes with only a name (the number of reels differs by Flame version).
 
 Same shape and helpers as scripts/p2_3c_render_e2e.py (imported from p2_2a / p1 / p2_4_common): a
 real MCP stdio client drives `python -m flame_mcp` against a live Flame + dev bridge;
@@ -43,6 +43,13 @@ Stages
      the same name twice (a second clip), a Batch reel refused (nothing copied, nothing journaled),
      revert of the several (the sources stay), a second revert refused, revert with one copy deleted
      by hand (skipped), copy into a library (observed).
+  e  arrange: a Desktop reel with clip1, clip2 and clip3, another one built from it by one
+     `desktop.arrange` of [move clip3, copy clip1, move clip2, copy clip1] (the reel lists the new
+     clips in the order of the items, the copies' source stays, the moved ones are gone from the
+     source reel under their old uids), a move inside the source reel refused with nothing
+     journaled, and the revert (both reels read by transport are as they were; the source reel
+     keeps its order here because the moved clips were its last ones: a move goes back to the
+     end of its reel).
   f  the journal: every group of this run is landed / reverted / conflict, none unknown; no intent
      left undecided, writes not blocked.
   z  cross-cutting checks; everything this run made is deleted by transport; then flame.exit().
@@ -1161,6 +1168,157 @@ async def stage_d(ctx: Ctx) -> None:
         )
 
 
+def clip_names(row: Any) -> list[str]:
+    return [c[0] for c in row.get("clips", [])] if isinstance(row, dict) else []
+
+
+def clip_uids(row: Any) -> list[str]:
+    return [c[1] for c in row.get("clips", [])] if isinstance(row, dict) else []
+
+
+def note_revert_groups(ctx: Ctx, env: dict[str, Any]) -> None:
+    """A revert of a `desktop.arrange` is one revert group per item; `wdo` kept only the last."""
+    kept = {g["group"] for g in groups_of(ctx)}
+    for group in (env.get("journal") or {}).get("groups") or []:
+        if isinstance(group, str) and group not in kept:
+            groups_of(ctx).append({"op": "journal.revert", "group": group})
+
+
+async def stage_e(ctx: Ctx) -> None:
+    if "rg1Selector" not in ctx.ids:
+        rec(ctx, "e_skipped_no_reel_group_from_stage_b", False)
+        return
+    clip1, clip2 = ctx.ids["clipSelectors"]
+    async with server_session(ctx, "d-e") as session:
+        src = await make_reel(session, ctx, "E1")
+        dst = await make_reel(session, ctx, "E2")
+        first = await wdo(
+            session, ctx, "desktop.copy", {"sources": [clip1, clip2], "destination": src}
+        )
+        extra = await wdo(session, ctx, "desktop.copy", {"sources": [clip1], "destination": src})
+        copies = _result_of(first).get("copies") or []
+        third = (_result_of(extra).get("copies") or [{}])[0]
+        renamed = await wdo(
+            session, ctx, "desktop.rename", {"target": third.get("selector"), "name": "clip3"}
+        )
+        src_before = await tx_reel(ctx, str(wt(src).get("id")))
+        dst_before = await tx_reel(ctx, str(wt(dst).get("id")))
+        ok, parts = judged(
+            copies_made=first.get("ok") is True and extra.get("ok") is True and len(copies) == 2,
+            third_renamed=renamed.get("ok") is True,
+            source_reel_holds_clip1_clip2_clip3=clip_names(src_before)
+            == ["clip1", "clip2", "clip3"],
+            destination_reel_is_empty=clip_names(dst_before) == [],
+        )
+        rec(ctx, "e0_a_source_reel_with_clip1_clip2_clip3_and_an_empty_one", ok, clauses=parts)
+        if not ok:
+            return
+        uids_before = clip_uids(src_before)
+        by_name = dict(zip(clip_names(src_before), src_before["clips"], strict=True))
+        sel = {
+            "clip1": copies[0].get("selector"),
+            "clip2": copies[1].get("selector"),
+            "clip3": third.get("selector"),
+        }
+        items = [
+            {"action": "move", "source": sel["clip3"]},
+            {"action": "copy", "source": sel["clip1"]},
+            {"action": "move", "source": sel["clip2"]},
+            {"action": "copy", "source": sel["clip1"]},
+        ]
+        a1 = await wdo(session, ctx, "desktop.arrange", {"destination": dst, "items": items})
+        r1 = _result_of(a1)
+        dst_after = await tx_reel(ctx, str(wt(dst).get("id")))
+        src_after = await tx_reel(ctx, str(wt(src).get("id")))
+        ok, parts = judged(
+            op_ok=a1.get("ok") is True,
+            four_applied=[a.get("action") for a in r1.get("applied") or []]
+            == ["move", "copy", "move", "copy"],
+            op_read_the_same_order_back=r1.get("orderMatches") is True
+            and [row.get("name") for row in r1.get("order") or []]
+            == ["clip3", "clip1", "clip2", "clip1"],
+            transport_lists_the_items_in_order=clip_names(dst_after)
+            == ["clip3", "clip1", "clip2", "clip1"],
+            transport_uids_are_the_ones_the_op_reports=clip_uids(dst_after)
+            == [row.get("uid") for row in r1.get("order") or []],
+            the_two_copies_are_two_clips=len(set(clip_uids(dst_after))) == 4,
+            the_copy_source_stays_and_the_moved_are_gone=clip_names(src_after) == ["clip1"]
+            and clip_uids(src_after) == [by_name["clip1"][1]],
+            one_journal_group_with_four_ids=len((a1.get("journal") or {}).get("ids") or []) == 4,
+        )
+        rec(
+            ctx,
+            "e1_arrange_builds_the_reel_in_the_order_of_the_items",
+            ok,
+            clauses=parts,
+            error=a1.get("error"),
+            errorCode=a1.get("errorCode"),
+            destination=dst_after,
+            source=src_after,
+        )
+        moved_gone = [await tx_find(ctx, u) for u in (by_name["clip2"][1], by_name["clip3"][1])]
+        rec(
+            ctx,
+            "e2_a_moved_clip_is_not_found_by_its_old_uid",
+            moved_gone == [None, None],
+            found=moved_gone,
+        )
+
+        journal_before = len(groups_of(ctx))
+        a2 = await wdo(
+            session,
+            ctx,
+            "desktop.arrange",
+            {"destination": src, "items": [{"action": "move", "source": sel["clip1"]}]},
+        )
+        src_same = await tx_reel(ctx, str(wt(src).get("id")))
+        ok, parts = judged(
+            refused=a2.get("ok") is False and a2.get("errorCode") == "PRECONDITION_UNMET",
+            says_it_is_already_there="already in the destination" in str(a2.get("error")),
+            nothing_was_journaled=len(groups_of(ctx)) == journal_before,
+            the_reel_is_as_it_was=clip_uids(src_same) == clip_uids(src_after),
+        )
+        rec(
+            ctx,
+            "e3_a_move_inside_the_source_reel_is_refused_and_nothing_is_written",
+            ok,
+            clauses=parts,
+            error=a2.get("error"),
+        )
+
+        rv = await revert(session, ctx, a1)
+        note_revert_groups(ctx, rv)
+        dst_back = await tx_reel(ctx, str(wt(dst).get("id")))
+        src_back = await tx_reel(ctx, str(wt(src).get("id")))
+        ok, parts = judged(
+            revert_ok=rv.get("ok") is True,
+            four_steps_newest_first=[s.get("index") for s in _result_of(rv).get("steps") or []]
+            == [3, 2, 1, 0],
+            destination_is_empty_again=clip_names(dst_back) == [],
+            source_has_its_three_clips_in_the_old_order_because_the_moved_ones_were_its_last=clip_names(
+                src_back
+            )
+            == ["clip1", "clip2", "clip3"],
+            clip1_was_never_touched=clip_uids(src_back)[:1] == uids_before[:1],
+        )
+        rec(
+            ctx,
+            "e4_revert_puts_both_reels_back_and_the_source_keeps_its_order_when_its_last_clips_moved",
+            ok,
+            clauses=parts,
+            error=rv.get("error"),
+            destination=dst_back,
+            source=src_back,
+        )
+        rv2 = await revert(session, ctx, a1)
+        rec(
+            ctx,
+            "e5_a_second_revert_of_the_same_group_is_refused",
+            rv2.get("ok") is False and rv2.get("errorCode") == "PRECONDITION_UNMET",
+            error=rv2.get("error"),
+        )
+
+
 async def stage_f(ctx: Ctx) -> None:
     written = groups_of(ctx)
     async with server_session(ctx, "d-f") as session:
@@ -1237,6 +1395,7 @@ async def async_main(ctx: Ctx) -> None:
                 ("b", stage_b),
                 ("c", stage_c),
                 ("d", stage_d),
+                ("e", stage_e),
                 ("f", stage_f),
             ):
                 await guarded(ctx, name, stage)

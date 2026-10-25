@@ -16,10 +16,15 @@ are exactly the cut ends of the segments that cross the new end (q3b).
 
 Stage c reads `segment.connections` of segments that have no connection: no other segment is
 connected, while `PySegment.connected_segments()` read by transport lists the segment itself
-(measured), so it answers one. The three write ops (`segment.create_connection`,
-`segment.remove_connection`, `segment.sync_connections`) are NOT called: the connections of a
-segment may reach segments in other sequences, which no checkpoint covers, and what they do there
-was not measured.
+(measured), so it answers one. c3 to c5 read the same sequence with `timeline.list_segments`:
+with `include_connections` every media item carries `connections` 0 while transport counts one
+`connected_segments()` entry (the segment itself), `connectionsStoppedEarly` is absent, the Gap
+items' value is only recorded (not measured), without the flag no item has `connections`, and
+with `media='audio'` the flag is refused with INVALID_ARGS.
+
+The three write ops (`segment.create_connection`, `segment.remove_connection`,
+`segment.sync_connections`) are NOT called: the connections of a segment may reach segments in
+other sequences, which no checkpoint covers, and what they do there was not measured.
 
 Stage y: a READONLY server denies `timeline.delete_segments`, `timeline.move_track` and
 `timeline.shorten`, and still answers the two reads."""
@@ -37,9 +42,13 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent / "src"))
 
 from p1_mcp_e2e import _result_of  # noqa: E402
 from p2_2a_journal_e2e import Ctx, rec, server_session  # noqa: E402
+from p2_4_common import observe  # noqa: E402
 from p3_2a_e2e_common import copy_into  # noqa: E402
 from p3_6_e2e_common import (  # noqa: E402
+    GAP,
     err_text,
+    expect_error,
+    frame_of,
     make_s,
     run_call,
     same_video,
@@ -52,6 +61,8 @@ from p3_6_e2e_common import (  # noqa: E402
 )
 
 COMPARE_LIMIT = 200
+LIST_LIMIT = 100
+CONNECTION_TRACKS = (0, 1)
 WHERE_PATTERN = re.compile(r"^video track (\d+)(?: segment (\d+))?$")
 Q3_NAME = "q3_a_sequence_and_its_shortened_self_differ_only_at_or_after_the_new_end"
 Q3B_NAME = "q3b_the_audio_differences_are_the_cut_ends_of_the_segments_that_cross_the_new_end"
@@ -282,6 +293,88 @@ async def stage_c(ctx: Ctx) -> None:
                 result={k: res.get(k) for k in ("count", "total", "items", "targetListed")},
                 warnings=res.get("warnings"),
             )
+        await list_with_connections(session, ctx, wiretap)
+
+
+def list_args(wiretap: str, track: int, *, connections: bool) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "target": sel(wiretap),
+        "version": 0,
+        "track": track,
+        "limit": LIST_LIMIT,
+    }
+    if connections:
+        args["include_connections"] = True
+    return args
+
+
+async def list_with_connections(session: Any, ctx: Ctx, wiretap: str) -> None:
+    """c3 to c5: the `connections` of `timeline.list_segments` against `connected_segments()`."""
+    with_flag: dict[int, dict[str, Any]] = {}
+    without_flag: dict[int, dict[str, Any]] = {}
+    for track in CONNECTION_TRACKS:
+        args = list_args(wiretap, track, connections=True)
+        with_flag[track] = await run_call(session, ctx, "c_list_connections", args)
+        args = list_args(wiretap, track, connections=False)
+        without_flag[track] = await run_call(session, ctx, "c_list_plain", args)
+    problems: dict[str, Any] = {}
+    gaps: list[list[Any]] = []
+    for track, env in with_flag.items():
+        res = _result_of(env)
+        items = res.get("items") or []
+        media = [i for i in items if i.get("type") != GAP]
+        gaps += [[track, i.get("index"), i.get("connections")] for i in items if i not in media]
+        transport = [
+            await tx_connected(ctx, wiretap, track, frame_of(i.get("recordIn"))) for i in media
+        ]
+        if (
+            env.get("ok") is not True
+            or "connectionsStoppedEarly" in res
+            or not media
+            or res.get("total") != len(items)
+            or not all(type(i.get("connections")) is int and i["connections"] == 0 for i in media)
+            or transport != [1] * len(media)
+        ):
+            problems[f"track {track}"] = {
+                "error": env.get("error"),
+                "stoppedEarly": res.get("connectionsStoppedEarly"),
+                "connections": [(i.get("index"), i.get("connections")) for i in items],
+                "transportConnectedSegments": transport,
+            }
+    rec(
+        ctx,
+        "c3_list_segments_with_include_connections_counts_none_for_segments_with_no_connection",
+        not problems,
+        problems=problems,
+    )
+    observe(ctx, "c3_connections_of_the_gap_items_as_listed", gaps=gaps)
+    plain_problems = {
+        f"track {track}": {"error": env.get("error"), "keys": sorted(_result_of(env))}
+        for track, env in without_flag.items()
+        if env.get("ok") is not True
+        or not (_result_of(env).get("items"))
+        or any("connections" in i for i in _result_of(env)["items"])
+        or "connectionsStoppedEarly" in _result_of(env)
+    }
+    rec(
+        ctx,
+        "c4_list_segments_without_include_connections_has_no_connections_key",
+        not plain_problems,
+        problems=plain_problems,
+    )
+    audio = await run_call(
+        session,
+        ctx,
+        "c_list_connections_audio",
+        {**list_args(wiretap, 0, connections=True), "media": "audio", "channel": 0},
+    )
+    rec(
+        ctx,
+        "c5_include_connections_with_media_audio_is_invalid_args",
+        expect_error(audio, "INVALID_ARGS") and "include_connections" in err_text(audio),
+        error=audio.get("error"),
+        errorCode=audio.get("errorCode"),
+    )
 
 
 # -- y: the read-only policy --------------------------------------------------------------------

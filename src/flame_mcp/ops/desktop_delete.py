@@ -40,16 +40,22 @@ from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
 _DESCRIPTION = (
-    "Delete clips / sequences (flame.delete, confirm=False), after copying each one into the "
+    "Delete clips / sequences, and reels that hold no clip and no sequence (flame.delete, "
+    "confirm=False). Each clip / sequence is first copied into the "
     f"stash reel of the checkpoint library ('{DEFAULT_LIBRARY}', reel '{REEL_PREFIX}<YYMMDD>'; the "
     f"environment variable {LIBRARY_ENV} names another library) so that journal.revert can put it "
     f"back. `targets`: 1 to {MAX_SOURCES} wiretap / path / selection selectors, each a PyClip or "
-    "a PySequence on the Desktop. Refused before anything is copied or "
+    "a PySequence on the Desktop, or an empty PyReel of a Desktop reel group. Refused before "
+    "anything is copied or "
     "written: something inside a library, whichever library (PRECONDITION_UNMET: library "
     "contents are never deleted by this server; what the checkpoint library holds is cleaned up "
-    "with journal.purge_checkpoints), a reel, a reel group, a folder, a library or a Batch group "
-    "(PRECONDITION_UNMET: only clips and sequences are deleted), something inside a reel of a "
-    "Batch group (INVALID_ARGS), the same thing listed twice (INVALID_ARGS). "
+    "with journal.purge_checkpoints), a reel that holds a clip or a sequence (PRECONDITION_UNMET: "
+    "deleting a reel of a Batch group also deletes the Clip nodes that use its clips), a "
+    "reel group, a folder, a library or a Batch group (PRECONDITION_UNMET: only clips, "
+    "sequences and empty reels are deleted), a reel of a Batch group or something inside "
+    "one (INVALID_ARGS), the same thing listed twice (INVALID_ARGS), a reel whose type "
+    "cannot be read (PRECONDITION_UNMET). An empty reel has no stash and no checkpoint "
+    "(result.deleted[].stash is null) and is checked empty again at the write (else CONFLICT). "
     "FLOW: every target's type, name, uid, parent and fingerprint (timeline.fingerprint: segments "
     "and effects) are read and journaled first; each target is copied into the stash and the "
     "copy's fingerprint must equal the original's (a copy that fails ends the call before anything "
@@ -65,15 +71,25 @@ _DESCRIPTION = (
     "type, uid}, checkpoint, stash {type, name, uid, wiretapId, library, reel}, fingerprint, "
     "segmentCount, wasDisplayed}], notDeleted, partial, shownBefore / shownAfterDelete / "
     "shownAfter / reshown / reshownNote (the Timeline's sequence {type, uid, name}). A call "
-    "after which every target is still there is SILENT_NOOP; only some gone: ok with "
-    "result.partial = true, the envelope's partial {deleted, notDeleted} and a degraded note. "
+    "after which every target is still there is SILENT_NOOP; only some gone: FLAME_API_ERROR "
+    "whose message starts with 'partial:', result.partial = true and the envelope's partial "
+    "{deleted, notDeleted}; what was deleted is journaled (journal state partial), so "
+    "journal.revert puts it back. Everything gone but flame.delete did not "
+    "answer True: ok with a degraded note. A read of one target that raises before its delete "
+    "leaves it in notDeleted (readError). Reading back what the Timeline shows after the deletes "
+    "fails: FLAME_API_ERROR ('may have been written'); result.deleted still lists what was "
+    "deleted, journaled and revertible. "
     "JOURNAL as desktop.move (intent -> compare-and-swap -> outcome with the deletes). Envelope "
     "journal = {group, id, revert}. journal.check of a call whose answer was lost: every old "
     "uid gone = landed, every one still there = not_landed, else diverged. "
     "Undo: journal.revert(group) copies each stashed copy back into the thing's old parent "
     "(flame.media_panel.copy): the thing has a new uid and wiretap id and is at the end of the "
     "reel (its old place is not restored) -- result.reverted[].to.selector; a sequence that was "
-    "shown in the Timeline before the delete is opened again. A thing whose old parent is gone, "
+    "shown in the Timeline before the delete is opened again. An empty reel is made again as a "
+    "new empty reel of the same name and type at the end of its old reel group (new uid; its "
+    "old place, colour and other attributes are not restored; a CONFLICT if that group already "
+    "has a reel of that name; a made reel with another name is deleted again and reported). A "
+    "thing whose old parent is gone, "
     "or whose stashed copy is gone (journal.purge_checkpoints) or changed, stays a CONFLICT "
     "while the others are put back (result.partial); a second revert puts back only what the "
     "first one did not. The stashed copies stay in the checkpoint library until "
@@ -120,12 +136,12 @@ def _delete_to_python(args: Mapping[str, Any]) -> str:
     return build_source(
         *blocks,
         f"_result = _dd_delete({listed}, {snapshot!r}, {args.get(EXPECTED_ARG)!r})",
-        raise_on_error_src(),
         "_affected = len(_result['deleted'])",
         "_partial = (\n"
         "    {'deleted': len(_result['deleted']), 'notDeleted': len(_result['notDeleted'])}\n"
         "    if _result['partial'] else None\n"
         ")",
+        raise_on_error_src(),
     )
 
 
@@ -159,9 +175,10 @@ def register(registry: Registry) -> None:
                     name="targets",
                     type="array",
                     description=(
-                        f"1 to {MAX_SOURCES} selectors of clips / sequences: wiretap, path "
-                        "(root='desktop' for the Desktop) or selection; each must resolve to "
-                        "one PyClip / PySequence."
+                        f"1 to {MAX_SOURCES} selectors of clips / sequences / empty reels: "
+                        "wiretap, path (root='desktop' for the Desktop) or selection; each must "
+                        "resolve to one PyClip / PySequence, or an empty PyReel of a Desktop reel "
+                        "group."
                     ),
                     required=True,
                     item_type="selector",
@@ -182,6 +199,11 @@ def register(registry: Registry) -> None:
                 "PyTimeline.clip",
                 "PyReel.children",
                 "PyReel.type",
+                "PyReel.clips",
+                "PyReel.sequences",
+                "PyReel.name",
+                "PyReelGroup.create_reel",
+                "PyReelGroup.reels",
                 "PyLibrary.children",
                 "PyLibrary.reels",
                 "PyLibrary.create_reel",

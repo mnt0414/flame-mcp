@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fake_media_tree import PyClip, PySegment, PySequence, PyTrack, PyVersion, adopt
+from fake_media_tree import PyClip, PySegment, PySequence, PyTime, PyTrack, PyVersion, adopt
 from fake_segment_edit import clip_media
 from journal_test_helpers import Rig
 from timeline_p32a_helpers import (
@@ -146,6 +146,7 @@ def import_with_media(fake_cls: Any) -> Any:
                 media(name, 0, length - 1, source_in=start, name=name)
             )
             clip._media = (start, length)
+            clip.duration = PyTime(length)
         return made
 
     return import_clips

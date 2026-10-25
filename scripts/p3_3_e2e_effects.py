@@ -399,6 +399,16 @@ async def save_load(session: Any, ctx: Ctx, case: dict[str, Any], one: int, file
     )
     blur_file = next((f["path"] for f in _result_of(blur).get("files") or []), None)
     if blur_file is not None:
+        rec(
+            ctx,
+            "e18b_the_saved_setup_file_is_0600_and_listed_in_made_private",
+            (os.stat(blur_file).st_mode & 0o777) == 0o600
+            and blur_file in (_result_of(blur).get("madePrivate") or [])
+            and not _result_of(blur).get("notMadePrivate"),
+            mode=oct(os.stat(blur_file).st_mode & 0o777),
+            madePrivate=_result_of(blur).get("madePrivate"),
+            notMadePrivate=_result_of(blur).get("notMadePrivate"),
+        )
         wrong = await run_call(
             session,
             ctx,

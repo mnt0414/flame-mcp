@@ -6,9 +6,11 @@ flame-mcp is maintained by one person in spare time. Issues and pull requests ar
 
 ## Report a bug or ask a question
 
-Use [GitHub Issues](https://github.com/mnt0414/flame-mcp/issues) for bug reports, questions, and requests.
+Use [GitHub Issues](https://github.com/mnt0414/flame-mcp/issues) for bug reports, questions, and requests. When you open an issue, pick a form: Bug report, Request, or Usage report. Each form needs only one field, and you can write in any language. To write freely instead, open a blank issue.
 
-For a bug report, include:
+flame-mcp is in beta, so a usage report helps even when nothing went wrong: the Flame version, the kind of work, the ops you used, and what was hard or missing.
+
+For a bug report, the following help most:
 
 - Your macOS version, Flame version, and Python version
 - The operation (op) that you ran and its arguments

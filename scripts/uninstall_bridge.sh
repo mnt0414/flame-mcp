@@ -26,6 +26,21 @@ BRIDGE_DIR="$APP_SUPPORT/bridge"
 IMPL_DST="$BRIDGE_DIR/impl.py"
 BACKUPS_DIR="$APP_SUPPORT/backups"
 
+_make_private_dir() {
+    # $1 = a directory below $APP_SUPPORT. Makes it and the missing directories above it (down to
+    # $APP_SUPPORT) one at a time with mode 700: mkdir -p -m applies the mode to the last one
+    # only, and the umask would decide the rest. A directory that already exists is not changed.
+    local dir="$1"
+    [ -d "$dir" ] && return 0
+    if [ "$dir" = "$APP_SUPPORT" ]; then
+        mkdir -p "$(dirname "$dir")"  # ~/Library/Application Support: not ours to make private
+    else
+        _make_private_dir "$(dirname "$dir")"
+    fi
+    mkdir -m 700 "$dir"
+    chmod 700 "$dir"
+}
+
 FLAME_ANY_VERSION_PATTERN='flame\.app/Contents/MacOS/flame( |$)'
 
 DRY_RUN=0
@@ -64,7 +79,7 @@ _backup() {
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "[dry-run] would back up: $target -> $backup_path"
     else
-        mkdir -p "$BACKUPS_DIR"
+        _make_private_dir "$BACKUPS_DIR"
         cp -p "$target" "$backup_path"
         echo "Backed up: $target -> $backup_path"
     fi

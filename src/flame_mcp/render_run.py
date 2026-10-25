@@ -13,10 +13,11 @@ extra rules:
   - after the run the frames are counted against the plan (`SILENT_NOOP` / `FLAME_API_ERROR` when
     short);
   - a run that ends without an answer (TIMEOUT / BRIDGE_LOST / a bridge `pending` handle) leaves
-    the intent open and closes the write door (`WriteGuard`) until `journal.check` has decided
-    (`render_check.check_render_intent`). `journal.check` asks the bridge for the run's result with
-    `transport.poll` -- that, not the files, says the render has ended (in one run the frames were
-    complete about 8 s before render() returned) -- and then counts the files. The bridge gives a
+    the intent open and closes the write guard (`WriteGuard`; writes are refused until
+    `journal.check` has decided, `render_check.check_render_intent`). `journal.check` asks the
+    bridge for the run's result with `transport.poll` -- that, not the files, says the render
+    has ended (in one run the frames were complete about 8 s before render() returned) -- and
+    then counts the files. The bridge gives a
     result over once, so it is journaled at once (`polled`).
   - the handle to ask with is chosen by this server: when the bridge announces
     `client_handle` the intent carries a fresh `handle` (`handleSource: "client"`) before anything
@@ -261,6 +262,8 @@ def _unknown_end(
     code: str,
     timeout_s: float,
     client_handle: str | None,
+    *,
+    reads: str = "Flame and the output files",
 ) -> dict[str, Any]:
     ctx.guard.block(intent_id, group_id, op.name, code)
     note_unresolved(ctx, intent_id, group_id, env)
@@ -298,7 +301,7 @@ def _unknown_end(
     env["hint"] = (
         f"{hint} It is not known whether the render finished: a Foreground render keeps "
         "Flame occupied and a TIMEOUT does not stop it. This server now refuses every "
-        f"write until journal.check (group={group_id!r}) has read Flame and the output files "
+        f"write until journal.check (group={group_id!r}) has read {reads} "
         f"again.{handle_note} {BRIDGE_BUSY_NOTE}"
     ).strip()
     env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
@@ -495,25 +498,60 @@ def judge_render(
     checked: bool,
 ) -> RenderJudgement:
     """What a finished render counts as, from Flame's answer (`env_*`, the op's own value
-    `flame`) and the frames found: the same rule for `render.batch` and for a `journal.check`
-    that got the answer through the bridge's poll. An error of the render stays an error
-    (whatever is on disk); a render that returned without an error but wrote fewer frames than
-    planned is SILENT_NOOP (FLAME_API_ERROR when it returned False); a False return with every
-    frame there is a success with a note."""
+    `flame`) and the frames found.
+
+    The rule is the same for `render.batch` and for a `journal.check` that got the answer through
+    the bridge's poll. An error of the render stays an error, whatever is on disk. A render that
+    returned without an error but wrote some of the planned frames is FLAME_API_ERROR starting
+    `partial:` (the frames stay; `journal.check` reads it as partial too). A render that wrote
+    none is SILENT_NOOP (FLAME_API_ERROR when it returned False). A False return with every frame
+    there is a success with a note. With no Write File to count (`checked` false: only Render
+    nodes), the clips the reels gained (`flame['newClips']`) are the evidence. None gained is
+    SILENT_NOOP, unless a reel could not be read, this server does not check a destination, or
+    the Desktop reel group it names is not there; then it is a success with a note."""
     if not env_ok:
         return RenderJudgement(False, errors.as_error_code(str(env_code)), str(env_error))
+    returned = flame.get("returned")
     if checked and written < expected:
-        code: ErrorCode = "FLAME_API_ERROR" if flame.get("returned") is False else "SILENT_NOOP"
-        message = (
-            f"render returned {flame.get('returned')!r} without an exception but only {written} "
+        short = (
+            f"render returned {returned!r} without an exception but only {written} "
             f"of {expected} planned frames were written (see result.nodes for what is missing)"
         )
-        return RenderJudgement(False, code, message)
+        if written > 0:
+            return RenderJudgement(False, "FLAME_API_ERROR", f"partial: {short}")
+        code: ErrorCode = "FLAME_API_ERROR" if returned is False else "SILENT_NOOP"
+        return RenderJudgement(False, code, short)
     degraded: list[str] = []
-    if flame.get("returned") is not True:
+    new_clips = flame.get("newClips")
+    if not checked and isinstance(new_clips, list) and not new_clips:
+        unread = flame.get("newClipsUnknown")
+        unfollowed = flame.get("destinationUnsupported")
+        no_group = [
+            r.get("name")
+            for r in flame.get("reelsAfter") or []
+            if isinstance(r, Mapping) and r.get("groupMissing")
+        ]
+        if not unread and not unfollowed and not no_group:
+            code = "FLAME_API_ERROR" if returned is False else "SILENT_NOOP"
+            message = (
+                f"render returned {returned!r} without an exception but no reel gained a clip "
+                "(only Render nodes were rendered; result.newClips is empty)"
+            )
+            return RenderJudgement(False, code, message)
         degraded.append(
-            f"render returned {flame.get('returned')!r}, not True; the output files are complete"
+            "no new clip was seen, but the Render nodes' output could not be fully read back "
+            f"(reels that could not be read: {unread!r}; destinations this server does not check: "
+            f"{unfollowed!r}; reel groups that are not there: {no_group!r})"
         )
+    if returned is not True:
+        seen = (
+            "the output files are complete"
+            if checked
+            else "the reels gained the clips (result.newClips)"
+            if new_clips
+            else "its output could not be checked"
+        )
+        degraded.append(f"render returned {returned!r}, not True; {seen}")
     return RenderJudgement(True, None, None, degraded)
 
 
@@ -559,8 +597,10 @@ def _finish(
         ),
         "nodes": rows,
         "newClips": flame.get("newClips"),
+        "newClipsUnknown": flame.get("newClipsUnknown"),
         "reelsBefore": flame.get("reelsBefore"),
         "reelsAfter": flame.get("reelsAfter"),
+        "destinationUnsupported": flame.get("destinationUnsupported"),
         "undo": "unsupported: the frames on disk and the clips in the reels stay",
     }
     if not ok and code is not None:

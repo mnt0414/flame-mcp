@@ -961,13 +961,32 @@ def test_the_generated_code_of_the_new_writes_has_no_loops(rig: Rig) -> None:
     "step",
     [
         {"op": "batch.create_reel", "args": {"target": BG1, "name": "x"}},
-        {"op": "batch.create_shelf_reel", "args": {"target": BG1, "name": "x"}},
         {"op": "batch.add_clips", "args": {"target": BG1, "reel": SCHEMATIC, "clips": [CLIP1]}},
         {"op": "batch.organize", "args": {"target": BG1}},
-        {"op": "batch.iterate", "args": {"target": BG1}},
     ],
 )
-def test_plan_run_refuses_ops_that_take_their_own_checkpoint_and_runs_nothing(
+def test_plan_run_bundles_the_ops_that_run_behind_a_checkpoint(
+    rig: Rig, step: dict[str, Any]
+) -> None:
+    env = rig.do(
+        "plan.run",
+        {"steps": [{"op": "batch.info", "args": {"target": BG1}}, step]},
+    )
+    assert env["ok"] is True, env
+    assert [s["ok"] for s in env["result"]["steps"]] == [True, True]
+    info = env["result"]["batch"]
+    assert info["target"]["name"] == "BG1" and info["checkpoint"]
+    assert sent(rig).count("batch.checkpoint") == 1
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        {"op": "batch.iterate", "args": {"target": BG1}},
+        {"op": "batch.create_shelf_reel", "args": {"target": BG1, "name": "x"}},
+    ],
+)
+def test_plan_run_refuses_what_a_restore_does_not_put_back_and_runs_nothing(
     rig: Rig, step: dict[str, Any]
 ) -> None:
     env = rig.do(
@@ -994,12 +1013,14 @@ def test_plan_run_still_runs_batch_info_and_save_setup(rig: Rig, tmp_path: Path)
     assert [s["ok"] for s in env["result"]["steps"]] == [True, True]
 
 
-def test_the_plan_run_description_names_the_refused_ops(rig: Rig) -> None:
+def test_the_plan_run_description_names_the_bundled_ops_and_the_refused_iterate(rig: Rig) -> None:
     op = rig.registry.get("plan.run")
     assert op is not None
     text = " ".join(op.description.split())
     for name in CHECKPOINTED_OPS:
         assert name in text
+    assert "batch.iterate and batch.create_shelf_reel" in text
+    assert "outside a Batch setup" in text
 
 
 def test_the_force_parameter_of_revert_says_what_a_forced_restore_loses(rig: Rig) -> None:

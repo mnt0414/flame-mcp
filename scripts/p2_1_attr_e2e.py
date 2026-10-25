@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """MCP end-to-end check of the generic attribute ops and the selectors.
 
-Checks: The generic attribute ops on libraries, reels, clips, segments, Batch groups and nodes, the
-revert of each write, the refusal of bad values, and the `batch`, `node` and `action_node`
-selectors.
+Checks: The generic attribute ops on reels, clips, segments, Batch groups and nodes (a library and
+its clip are refused), the revert of each write, the refusal of bad values, the `batch`, `node` and
+`action_node` selectors, and the resolution of a Colour Source node (a write that Flame applies in
+full and one it applies only in part, each put back by `journal.revert`).
 
 Also covers the `batch` / `node` / `action_node` selectors (run with the `.venv` Python;
 `scripts/run_e2e.sh p2_1_attr` starts Flame).
@@ -30,13 +31,19 @@ Stages
   c   for each target: get_attributes(include_values) -> set_attributes ->
       get_attributes == new value AND an independent transport read == new value ->
       the returned `revert` called as-is through flame_do -> both reads == before
-        Library (name) / Desktop Reel (name) / Clip (name, colour_label if the
+        Library and its clip (name: refused with PRECONDITION_UNMET, name unchanged) /
+        Desktop Reel (name) / Desktop Clip (name, colour_label if the
         attribute lists candidates) / Segment (shot_name + comment in one call) /
         Batch (name) / Node (Comp.blend_type from its `values`, Exposure.exposure_red,
         and three node renames of blur2: (a) to a unique name -> the revert
         restores it by the post-write name; (b) to a name the CURRENT group B holds ->
         Flame refuses, ok=false, explained, unchanged; (c) to a sibling's name in the same
         group -> refused before any write. Stages e and f do not depend on these)
+      c_resolution: a Colour Source node of A: resolution 800x1080 at bit_depth 16 -> read
+        back (op and transport) -> journal.revert -> the start value; then bit_depth 10 ->
+        FLAME_API_ERROR "partial:", transport reads width 800, height 1080, bit_depth 16 ->
+        journal.revert -> the start value (width and height come back although the write was
+        not applied as asked)
   d   Segment dynamic_* : set -> ok=false (SILENT_NOOP expected), value unchanged, partial
   e   Comp.blend_type 'NoSuchMode' -> INVALID_ARGS, value unchanged (both reads);
       Exposure.exposure_red just above its range -> rejected; unknown key -> rejected;
@@ -343,6 +350,8 @@ def prepare(ctx: Ctx) -> None:
                 "    'rgName': _v(rg.name),",
                 "    'rgWtid': rg.get_wiretap_node_id(),",
                 "    'deskReelWtid': desk_reel.get_wiretap_node_id(),",
+                "    'deskClipWtid': _clips[0].get_wiretap_node_id(),",
+                "    'deskClipName': _v(_clips[0].name),",
                 "    'seqWtid': seq.get_wiretap_node_id(),",
                 "    'segments': [",
                 "        [_v(s.type), _v(s.name)]",
@@ -362,6 +371,8 @@ def prepare(ctx: Ctx) -> None:
             rgWtid=br.result["rgWtid"],
             deskReelName=desk_reel_name,
             deskReelWtid=br.result["deskReelWtid"],
+            deskClipWtid=br.result["deskClipWtid"],
+            deskClipName=br.result["deskClipName"],
             seqWtid=br.result["seqWtid"],
             segmentsBefore=br.result["segments"],
         )
@@ -525,16 +536,28 @@ async def guarded(ctx: Ctx, name: str, stage: Callable[[Ctx], Awaitable[None]]) 
 
 
 async def stage_c_library(ctx: Ctx) -> None:
+    """`desktop.set_attributes` refuses the library and its clip (PRECONDITION_UNMET), and the
+    names are what they were."""
     ids = ctx.ids
-    await roundtrip(
-        ctx,
-        "c_library_name",
-        "desktop",
-        {"kind": "wiretap", "id": ids["libWtid"]},
-        {"name": f"{ids['libName']}_attr"},
-        locate_wiretap(ids["libWtid"]),
-        expect_before={"name": ids["libName"]},
-    )
+    for label, wid, name_key in (
+        ("c_library_name_refused", ids["libWtid"], "libName"),
+        ("c_library_clip_name_refused", ids["clipWtid"], "clipName"),
+    ):
+        env = await do(
+            ctx,
+            "desktop.set_attributes",
+            {"target": {"kind": "wiretap", "id": wid}, "values": {"name": f"{ids[name_key]}_attr"}},
+        )
+        now = tx_read(ctx, locate_wiretap(wid), "name")
+        rec(
+            ctx.results,
+            label,
+            env.get("ok") is False
+            and env.get("errorCode") == "PRECONDITION_UNMET"
+            and now == ids[name_key],
+            env=env,
+            nameNow=now,
+        )
 
 
 async def stage_c_reel(ctx: Ctx) -> None:
@@ -552,15 +575,15 @@ async def stage_c_reel(ctx: Ctx) -> None:
 
 async def stage_c_clip(ctx: Ctx) -> None:
     ids = ctx.ids
-    target = {"kind": "wiretap", "id": ids["clipWtid"]}
+    target = {"kind": "wiretap", "id": ids["deskClipWtid"]}
     await roundtrip(
         ctx,
         "c_clip_name",
         "desktop",
         target,
-        {"name": f"{ids['clipName']}_attr"},
-        locate_wiretap(ids["clipWtid"]),
-        expect_before={"name": ids["clipName"]},
+        {"name": f"{ids['deskClipName']}_attr"},
+        locate_wiretap(ids["deskClipWtid"]),
+        expect_before={"name": ids["deskClipName"]},
     )
     probe = await do(
         ctx,
@@ -581,7 +604,7 @@ async def stage_c_clip(ctx: Ctx) -> None:
             "desktop",
             target,
             {"colour_label": pick},
-            locate_wiretap(ids["clipWtid"]),
+            locate_wiretap(ids["deskClipWtid"]),
         )
     else:
         rec(
@@ -714,6 +737,134 @@ async def stage_c_nodes(ctx: Ctx) -> None:
     )
 
     await stage_c_node_renames(ctx)
+
+
+RES_FIELDS: Final[tuple[str, ...]] = ("width", "height", "bit_depth", "frame_ratio", "scan_mode")
+
+
+def tx_resolution(ctx: Ctx, name: str) -> Any:
+    """Independent read of a node's resolution as {field: value} (a transport error as text)."""
+    code = "\n".join(
+        [
+            locate_node(ctx.ids["aUid"], name),
+            "_r = _v(obj.resolution)",
+            f"_result = {{k: _v(getattr(_r, k)) for k in {RES_FIELDS!r}}}",
+        ]
+    )
+    br = _txv(code, ctx.run_dir, label="read_resolution")
+    return br.result if br.ok else f"<transport error {br.error_code}: {br.error}>"
+
+
+def narrow(res: Any) -> Any:
+    """The five fields of an op's resolution value (it also carries `type`)."""
+    if not isinstance(res, dict):
+        return res
+    return {k: res.get(k) for k in RES_FIELDS}
+
+
+def resolution_matches(a: Any, b: Any) -> bool:
+    return (
+        isinstance(a, dict)
+        and isinstance(b, dict)
+        and all(same(a.get(k), b.get(k)) for k in RES_FIELDS)
+    )
+
+
+async def stage_c_resolution(ctx: Ctx) -> None:
+    ids = ctx.ids
+    br = _txv(
+        "\n".join(
+            [
+                locate_batch(ids["aUid"]),
+                "_types = [t for t in obj.node_types if 'colour source' in str(t).lower()",
+                "          or 'color source' in str(t).lower()]",
+                "_node = obj.create_node(_types[0]) if _types else None",
+                "_result = {'types': list(_types), 'name': _v(_node.name) if _node else None}",
+            ]
+        ),
+        ctx.run_dir,
+        timeout_s=40.0,
+        label="p21_create_colour_source",
+    )
+    name = br.result.get("name") if br.ok and isinstance(br.result, dict) else None
+    rec(ctx.results, "c_resolution_colour_source_created", isinstance(name, str), resp=_br_dict(br))
+    if not isinstance(name, str):
+        return
+    target = node_selector(ids, name)
+    start = tx_resolution(ctx, name)
+    rec(ctx.results, "c_resolution_start_value_read", isinstance(start, dict), start=start)
+    if not isinstance(start, dict):
+        return
+
+    read = await do(ctx, "node.get_attributes", {"target": target, "keys": ["resolution"]})
+    rec(
+        ctx.results,
+        "c_resolution_get_attributes_matches_transport",
+        resolution_matches(attr_value(read, "resolution"), start),
+        op=narrow(attr_value(read, "resolution")),
+        transport=start,
+    )
+
+    asked = {"width": 800, "height": 1080, "bit_depth": 16}
+    written = await do(
+        ctx, "node.set_attributes", {"target": target, "values": {"resolution": asked}}
+    )
+    after = tx_resolution(ctx, name)
+    rec(
+        ctx.results,
+        "c_resolution_write_applied_and_read_back_independently",
+        written.get("ok") is True
+        and value_of(written, "applied") == ["resolution"]
+        and isinstance(after, dict)
+        and (after["width"], after["height"], after["bit_depth"]) == (800, 1080, 16)
+        and after["frame_ratio"] == start["frame_ratio"]
+        and after["scan_mode"] == start["scan_mode"]
+        and resolution_matches(value_of(written, "after", "resolution"), after),
+        env=written,
+        transport=after,
+    )
+    group = (written.get("journal") or {}).get("group")
+    back = await do(ctx, "journal.revert", {"group": group})
+    restored = tx_resolution(ctx, name)
+    rec(
+        ctx.results,
+        "c_resolution_revert_restores_the_start_value",
+        back.get("ok") is True and resolution_matches(restored, start),
+        env=back,
+        transport=restored,
+        start=start,
+    )
+
+    partial = await do(
+        ctx,
+        "node.set_attributes",
+        {"target": target, "values": {"resolution": {**asked, "bit_depth": 10}}},
+    )
+    mid = tx_resolution(ctx, name)
+    failed_text = str((value_of(partial, "failed") or {}).get("resolution"))
+    rec(
+        ctx.results,
+        "c_resolution_bit_depth_10_is_a_partial_write",
+        partial.get("ok") is False
+        and partial.get("errorCode") == "FLAME_API_ERROR"
+        and failed_text.startswith("partial:")
+        and isinstance(mid, dict)
+        and (mid["width"], mid["height"], mid["bit_depth"]) == (800, 1080, 16)
+        and resolution_matches(value_of(partial, "after", "resolution"), mid),
+        env=partial,
+        transport=mid,
+    )
+    group = (partial.get("journal") or {}).get("group")
+    back = await do(ctx, "journal.revert", {"group": group})
+    restored = tx_resolution(ctx, name)
+    rec(
+        ctx.results,
+        "c_resolution_revert_after_the_partial_write_restores_width_and_height",
+        back.get("ok") is True and resolution_matches(restored, start),
+        env=back,
+        transport=restored,
+        start=start,
+    )
 
 
 async def stage_c_node_renames(ctx: Ctx) -> None:
@@ -1339,7 +1490,7 @@ async def async_main(run_dir: Path, results: Results) -> None:
                 prepare(ctx)
             except BaseException:
                 rec(results, "b_prepare_crashed", False, traceback=traceback.format_exc())
-            if "aUid" in ids and "libWtid" in ids:
+            if "aUid" in ids and "libWtid" in ids and "deskClipWtid" in ids:
                 for name, stage in (
                     ("c_library", stage_c_library),
                     ("c_reel", stage_c_reel),
@@ -1347,6 +1498,7 @@ async def async_main(run_dir: Path, results: Results) -> None:
                     ("c_segment", stage_c_segment),
                     ("c_batch", stage_c_batch),
                     ("c_nodes", stage_c_nodes),
+                    ("c_resolution", stage_c_resolution),
                     ("d", stage_d_segment_dynamic),
                     ("e", stage_e_rejections),
                     ("f", stage_f_non_current),

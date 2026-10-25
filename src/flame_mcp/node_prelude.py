@@ -43,6 +43,9 @@ NODE_HELPER = """
 _ACTION_FAMILY = ('PyActionNode', 'PyImageNode', 'PyGMaskTracerNode')
 _ACTION_LINK_TYPES = ('default', 'look at', 'gmask', 'gmask exclusive', 'light',
                       'light exclusive', 'mimic')
+# node types for which Flame 2025.2.4 makes a second node of the listed types along with the one
+# asked for (measured: creating each of the 97 types of a Batch group one by one)
+_NODE_COMPANIONS = {'Colour Blend': ('Group Input',), 'Matte Blend': ('Group Input',)}
 
 
 def _node_names(batch):
@@ -75,14 +78,6 @@ def _sock_state(node):
             if not isinstance(linked, (list, tuple)):
                 linked = []
             out[side][str(sock)] = sorted(str(c) for c in linked)
-    return out
-
-
-def _resolution_dict(res):
-    res = _v(res)
-    out = {}
-    for key in ('width', 'height', 'bit_depth', 'scan_mode', 'frame_ratio'):
-        out[key] = _try(lambda key=key: _ja(getattr(res, key)))
     return out
 
 
@@ -127,6 +122,50 @@ def _node_row(n, counts):
         'pos': _node_pos(n),
         'sameNameCount': counts.get(name, 1),
     }
+
+
+def _nd_ident(batch):
+    return {
+        'type': type(batch).__name__,
+        'name': _try(lambda: _v(batch.name)),
+        'uid': _try(lambda: _v(batch.uid)),
+        'selector': _batch_selector(batch),
+    }
+
+
+def _nd_pre_row(get_batch, late, node_name, pos, create_name):
+    # One selector of one write step of a bundled plan, resolved without writing: the Batch group
+    # it belongs to (what a plan bundles on) and, unless `late`, the node itself (as the same
+    # `_resolve_node` an op's own code runs); for a node.create, whether the name asked for is
+    # taken. Answers {ok, errorCode, error, target, node, nameTaken}.
+    out = {
+        'ok': False,
+        'errorCode': None,
+        'error': None,
+        'target': None,
+        'node': None,
+        'nameTaken': None,
+    }
+    try:
+        batch = get_batch()
+        out['target'] = _nd_ident(batch)
+        if node_name is not None and not late:
+            found = _resolve_node(batch, node_name, pos)
+            out['node'] = {
+                'name': node_name,
+                'pos': _node_pos(found),
+                'type': _try(lambda: _ja(found.type)),
+            }
+        if create_name is not None:
+            out['nameTaken'] = create_name in _node_names(batch)
+        out['ok'] = True
+    except _OpError as exc:
+        out['errorCode'] = exc.code
+        out['error'] = exc.message
+    except BaseException as exc:
+        out['errorCode'] = 'FLAME_API_ERROR'
+        out['error'] = type(exc).__name__ + ': ' + str(exc)
+    return out
 
 
 def _ambiguous_socket_names(sockets, counts):
@@ -241,31 +280,67 @@ def _create_node(batch, node_type, name):
         created_name = added[0]
     error = None
     error_code = None
-    if found is None:
+    if found is None and not added:
         error = (
             'create_node returned without an error but no new node appeared (had '
             + str(len(before)) + ' node(s), now ' + str(len(after))
             + '; new names ' + repr(added) + ')'
         )
         error_code = 'SILENT_NOOP'
+    elif found is None:
+        error = (
+            'partial: create_node left ' + str(len(added)) + ' new node(s) ' + repr(added)
+            + ' and returned ' + repr(created_name) + ', which is not one of them or cannot '
+            'be told from the others'
+        )
+        error_code = 'FLAME_API_ERROR'
+    companions = []
+    others = list(added)
+    for n in after_nodes:
+        n_name = _try(lambda n=n: _v(n.name))
+        n_type = _try(lambda n=n: _ja(n.type))
+        if (
+            n_name in others and n_name != created_name
+            and n_type in _NODE_COMPANIONS.get(node_type, ())
+        ):
+            others.remove(n_name)
+            companions.append(n_name)
+    naming_failed = False
     if found is not None and name is not None:
         try:
             found.name.set_value(name)
         except BaseException as exc:
+            naming_failed = True
             error = (
-                'the node was created as ' + repr(created_name) + ' but naming it ' + repr(name)
-                + ' failed: ' + type(exc).__name__ + ': ' + str(exc)
+                'partial: the node was created as ' + repr(created_name) + ' but naming it '
+                + repr(name) + ' failed: ' + type(exc).__name__ + ': ' + str(exc)
                 + ' (Flame checks a node name against the CURRENT Batch group, not the '
                 "node's own group)"
             )
             error_code = 'FLAME_API_ERROR'
     final_names = _node_names(batch)
     final_name = created_name
-    if error is None and name is not None:
+    if found is not None and name is not None and not naming_failed:
         final_name = name
         if name not in final_names:
-            error = 'the node was renamed to ' + repr(name) + ' but no node of that name is there'
-            error_code = 'SILENT_NOOP'
+            error = (
+                'partial: the node was created as ' + repr(created_name) + '; renaming it to '
+                + repr(name) + ' raised no error but no node of that name is there'
+            )
+            error_code = 'FLAME_API_ERROR'
+    if found is not None and len(others) > 1:
+        renamed = final_name != created_name and name in final_names
+        extra = (
+            'create_node left ' + str(len(others)) + ' new nodes ' + repr(others)
+            + '; the one it returned is ' + repr(created_name)
+            + (' (renamed to ' + repr(name) + ')' if renamed else '')
+            + ' (the others are extra)'
+        )
+        if error is None:
+            error = 'partial: ' + extra
+        else:
+            error += '; also, ' + extra
+        error_code = 'FLAME_API_ERROR'
     row = None
     if found is not None:
         counts = _name_counts(final_names)
@@ -285,6 +360,7 @@ def _create_node(batch, node_type, name):
         'nodeCountBefore': len(before),
         'nodeCountAfter': len(final_names),
         'addedNames': added,
+        'companions': companions,
         'error': error,
         'errorCode': error_code,
     }
@@ -318,19 +394,34 @@ def _delete_node(batch, node):
         wired = None
     returned = node.delete(confirm=False)
     after = _node_names(batch)
+    gone = after.count(name) < before.count(name)
+    removed = _new_names(after, before)
+    also = list(removed)
+    if gone and name in also:
+        also.remove(name)
     error = None
-    if after.count(name) >= before.count(name):
+    error_code = None
+    notes = []
+    if also:
+        error = (
+            'partial: delete returned ' + repr(_ja(returned)) + '; the node ' + repr(name)
+            + (' is gone' if gone else ' is still there') + ' but other node(s) ' + repr(also)
+            + ' are gone too'
+        )
+        error_code = 'FLAME_API_ERROR'
+    elif not gone:
         error = (
             'delete returned ' + repr(_ja(returned)) + ' but a node named ' + repr(name)
             + ' is still there (' + str(after.count(name)) + ' of that name, was '
             + str(before.count(name)) + ')'
         )
+        error_code = 'SILENT_NOOP'
     elif returned is not True:
-        error = (
+        notes.append(
             'delete returned ' + repr(_ja(returned)) + ' (expected True), though the node is gone'
         )
     stale = _links_involving(batch, name)
-    return {
+    out = {
         'deleted': name,
         'pyType': ptype,
         'nodeCountBefore': len(before),
@@ -338,9 +429,14 @@ def _delete_node(batch, node):
         'wasWiredTo': wired,
         'staleLinksInNeighbours': stale,
         'staleLinksAmbiguousNames': [name] if name in after else [],
+        'alsoRemoved': also,
         'deleteReturned': _ja(returned),
         'error': error,
+        'errorCode': error_code,
     }
+    if notes:
+        out['degradedNotes'] = notes
+    return out
 
 
 def _connect_nodes(source_batch, source, target_batch, target, source_socket, target_socket):
@@ -408,6 +504,7 @@ def _connect_nodes(source_batch, source, target_batch, target, source_socket, ta
         new_links = []
     error = None
     error_code = None
+    notes = []
     if not linked:
         where = 'any input socket'
         if target_socket != 'Default':
@@ -419,18 +516,17 @@ def _connect_nodes(source_batch, source, target_batch, target, source_socket, ta
         )
         error_code = 'SILENT_NOOP'
     elif returned is not True:
-        error = (
+        notes.append(
             'connect_nodes returned ' + repr(_ja(returned))
             + ' (expected True), though the link is there'
         )
-        error_code = 'FLAME_API_ERROR'
     replaced = {}
     if target_socket != 'Default':
         now = t_after['input'].get(target_socket, [])
         replaced = {
             target_socket: [c for c in t_before['input'].get(target_socket, []) if c not in now]
         }
-    return {
+    out = {
         'source': sname,
         'target': tname,
         'sourceSocket': source_socket,
@@ -447,6 +543,9 @@ def _connect_nodes(source_batch, source, target_batch, target, source_socket, ta
         'error': error,
         'errorCode': error_code,
     }
+    if notes:
+        out['degradedNotes'] = notes
+    return out
 
 
 def _disconnect_node(batch, node, socket):
@@ -468,6 +567,7 @@ def _disconnect_node(batch, node, socket):
     remaining = {s: after['input'].get(s) for s in scope if after['input'].get(s)}
     error = None
     error_code = None
+    notes = []
     if remaining:
         error = (
             'disconnect_node returned ' + repr(_ja(returned)) + ' but ' + repr(name)
@@ -475,12 +575,11 @@ def _disconnect_node(batch, node, socket):
         )
         error_code = 'SILENT_NOOP'
     elif returned is not True:
-        error = (
+        notes.append(
             'disconnect_node returned ' + repr(_ja(returned))
             + ' (expected True), though nothing is linked'
         )
-        error_code = 'FLAME_API_ERROR'
-    return {
+    out = {
         'node': name,
         'socket': socket,
         'scope': scope,
@@ -492,6 +591,9 @@ def _disconnect_node(batch, node, socket):
         'error': error,
         'errorCode': error_code,
     }
+    if notes:
+        out['degradedNotes'] = notes
+    return out
 
 
 def _duplicate_node(batch, node, keep_connections):
@@ -515,14 +617,20 @@ def _duplicate_node(batch, node, keep_connections):
     added = _new_names(before, after)
     copy_name = _try(lambda: _v(copy.name))
     error = None
-    if copy_name is None or copy_name not in added:
-        if len(added) == 1:
-            copy_name = added[0]
-        else:
-            error = (
-                'duplicate returned without an error but the group shows ' + str(len(added))
-                + ' new node(s) ' + repr(added) + ', not one'
-            )
+    error_code = None
+    if len(added) == 0:
+        error = (
+            'duplicate returned without an error but the group shows 0 new node(s) [], not one'
+        )
+        error_code = 'SILENT_NOOP'
+    elif len(added) > 1:
+        error = (
+            'partial: duplicate returned ' + repr(copy_name) + ' but the group shows '
+            + str(len(added)) + ' new nodes ' + repr(added) + ', not one'
+        )
+        error_code = 'FLAME_API_ERROR'
+    elif copy_name is None or copy_name not in added:
+        copy_name = added[0]
     row = None
     sockets = None
     if error is None:
@@ -538,6 +646,7 @@ def _duplicate_node(batch, node, keep_connections):
         'nodeCountAfter': len(after),
         'sockets': sockets,
         'error': error,
+        'errorCode': error_code,
     }
 
 
@@ -585,6 +694,10 @@ def _node_save_setup(batch, node, path, overwrite):
         or os.path.basename(p).startswith((name + '.', stem + '.'))
     ]
     files = named if named else (written if len(written) == 1 else [])
+    made_private, not_made_private = _make_files_private(files)
+    for p in written:
+        if p not in files:
+            not_made_private[p] = 'not named after the file asked for'
     node_type = _try(lambda: str(_v(node.type)).lower().replace(' ', '_'))
     own = [
         p for p in files
@@ -615,6 +728,8 @@ def _node_save_setup(batch, node, path, overwrite):
         'extension': base[len(name):] if base is not None and base.startswith(name) else None,
         'written': written,
         'overwritten': [p for p in written if p in before],
+        'madePrivate': made_private,
+        'notMadePrivate': not_made_private,
         'saveSetupReturned': _ja(returned),
         'node': _node_row(node, _name_counts(_node_names(batch))),
         'error': error,
@@ -771,17 +886,25 @@ def _action_create_node(node, inner_type):
     added_names = _new_names(before_names, after_names)
     created_name = _try(lambda: _v(created.name))
     error = None
+    error_code = None
+    notes = []
     if not added_names:
         error = (
             'create_node returned without an error but the Action gained no inner node (had '
             + repr(before_names) + ', now ' + repr(after_names) + ')'
         )
+        error_code = 'SILENT_NOOP'
     elif created_name is None or created_name not in added_names:
-        error = (
+        said = (
             'create_node returned ' + repr(created_name)
             + ', which is not among the new inner nodes ' + repr(added_names)
         )
-    return {
+        if len(added_names) == 1:
+            notes.append(said + ' (the one node it added is the only candidate)')
+        else:
+            error = 'partial: ' + said
+            error_code = 'FLAME_API_ERROR'
+    out = {
         'requestedType': requested_type,
         'canonicalType': inner_type,
         'created': _try(lambda: _inner_row(created)),
@@ -790,7 +913,11 @@ def _action_create_node(node, inner_type):
         'nodesBefore': before_names,
         'nodesAfter': after_names,
         'error': error,
+        'errorCode': error_code,
     }
+    if notes:
+        out['degradedNotes'] = notes
+    return out
 
 
 def _co_read(node, method, args):

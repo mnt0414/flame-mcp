@@ -798,3 +798,52 @@ def test_info_unknown_wiretap_is_selector_empty() -> None:
     flame, _h = build_default_tree()
     result = _info(flame, {"kind": "wiretap", "id": "nope"})
     assert result["opErrorCode"] == "SELECTOR_EMPTY"
+
+
+def test_list_children_clip_and_sequence_rows_carry_width_height_and_bit_depth() -> None:
+    flame, _h = build_default_tree()
+    result = run_op(
+        make_registry(),
+        "desktop.list_children",
+        {"target": {"kind": "path", "path": ["P1O", "R1"]}, "limit": 50},
+        flame,
+    )
+    assert result["opError"] is None
+    items = result["value"]["items"]
+    assert items
+    for item in items:
+        assert (item["width"], item["height"], item["bitDepth"]) == (1920, 1080, 10)
+        assert item["duration"]["frame"] == 100
+
+
+def test_list_children_width_height_bit_depth_are_null_when_they_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(self: PyClip) -> int:
+        raise RuntimeError("scripted failure")
+
+    flame, _h = build_default_tree()
+    monkeypatch.setattr(PyClip, "bit_depth", property(broken), raising=False)
+    result = run_op(
+        make_registry(),
+        "desktop.list_children",
+        {"target": {"kind": "path", "path": ["P1O", "R1"]}, "limit": 50},
+        flame,
+    )
+    assert result["opError"] is None
+    for item in result["value"]["items"]:
+        assert item["bitDepth"] is None
+        assert (item["width"], item["height"]) == (1920, 1080)
+
+
+def test_list_children_other_types_get_no_size_fields() -> None:
+    flame, _h = make_batch_world()
+    result = run_op(
+        make_registry(),
+        "desktop.list_children",
+        {"target": {"kind": "desktop"}, "limit": 50},
+        flame,
+    )
+    assert result["opError"] is None
+    for item in result["value"]["items"]:
+        assert not {"width", "height", "bitDepth"} & set(item)

@@ -502,6 +502,42 @@ async def stage_a(ctx: Ctx) -> None:
             taken=taken,
         )
 
+        # a type Flame makes a companion node for: ok, the companion is listed, one revert
+        # removes both
+        for node_type in ("Colour Blend", "Matte Blend"):
+            before = await tx_world(ctx, uid)
+            env = await do(session, ctx, "node.create", {"target": target, "type": node_type})
+            after = await tx_world(ctx, uid)
+            added = sorted(set(node_names(after)) - set(node_names(before)))
+            result = _result_of(env)
+            made = (result.get("node") or {}).get("name")
+            companions = result.get("companions") or []
+            companion_rows = [find(after, c) for c in companions]
+            rec(
+                ctx,
+                f"a_create_{node_type.replace(' ', '_').lower()}_is_ok_and_lists_its_group_input",
+                env.get("ok") is True
+                and made is not None
+                and len(companions) == 1
+                and sorted([made, *companions]) == added
+                and all(r is not None and r.get("type") == "Group Input" for r in companion_rows),
+                requested=node_type,
+                added=added,
+                companions=companions,
+                result=result,
+            )
+            group = (env.get("journal") or {}).get("group")
+            if group is not None:
+                reverted = await do(session, ctx, "journal.revert", {"group": group})
+                back = await tx_world(ctx, uid)
+                rec(
+                    ctx,
+                    f"a_revert_of_{node_type.replace(' ', '_').lower()}_removes_both_nodes",
+                    reverted.get("ok") is True and diff_world(before, back) == {},
+                    reverted=reverted.get("errorCode"),
+                    left=sorted(set(node_names(back)) - set(node_names(before))),
+                )
+
 
 # stage b
 def pick(names: list[str], preferred: str) -> str:
@@ -917,6 +953,17 @@ async def stage_e(ctx: Ctx) -> None:
             and (_result_of(saved).get("size") or 0) > 0,
             result=_result_of(saved),
             directory=listing,
+        )
+        rec(
+            ctx,
+            "e_save_setup_made_the_file_0600_and_lists_it_in_made_private",
+            real is not None
+            and (os.stat(str(real)).st_mode & 0o777) == 0o600
+            and _result_of(saved).get("madePrivate") == [real]
+            and not _result_of(saved).get("notMadePrivate"),
+            mode=None if real is None else oct(os.stat(str(real)).st_mode & 0o777),
+            madePrivate=_result_of(saved).get("madePrivate"),
+            notMadePrivate=_result_of(saved).get("notMadePrivate"),
         )
         rec(
             ctx,

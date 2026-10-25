@@ -14,6 +14,15 @@ What it encodes (measured on Flame 2025.2.4):
     silently ignored (PySegment.dynamic_* stay False after being set to True, with no
     exception): every write is read back
     through a freshly fetched `getattr(obj, key)` and compared.
+  - a PyResolution attribute is read as {type, width, height, bit_depth, frame_ratio, scan_mode}
+    and written by building a new flame.PyResolution (the fields not given keep their value).
+    `set_value` answers True even when the value did not take. One field of a resolution can
+    stay unchanged while the others take: bit_depth, which a Colour Source keeps at 8 / 16 / 32
+    only (10 and 12 become 16) and a Clip node does not take at all. A write that changed the
+    value but not to what was asked (some fields of a resolution; a scalar that Flame rounds)
+    ends in `partial:` (FLAME_API_ERROR), one that changed nothing in `silent_noop:`. The keys
+    whose value changed are returned as `changedKeys` (applied or not): that is what a revert
+    puts back.
   - compare-and-swap: when the server passes `expected` (the values it read a
     moment ago), every key's current value must still equal it, checked after the
     preflight and before the first write; one mismatch means nothing is written and
@@ -42,6 +51,22 @@ def _wrapper_ref(v):
     return out
 
 
+_RES_KEYS = ('width', 'height', 'bit_depth', 'frame_ratio', 'scan_mode')
+_RES_BIT_DEPTHS = (8, 10, 12, 16, 32)
+
+
+def _is_resolution(x):
+    return type(x).__name__ == 'PyResolution'
+
+
+def _resolution_dict(res):
+    res = _v(res)
+    out = {}
+    for key in ('width', 'height', 'bit_depth', 'scan_mode', 'frame_ratio'):
+        out[key] = _try(lambda key=key: _ja(getattr(res, key)))
+    return out
+
+
 def _ja(x):
     v = _v(x)
     if v is None or isinstance(v, (str, int, float, bool)):
@@ -50,6 +75,10 @@ def _ja(x):
         return [_ja(i) for i in v]
     if type(v).__name__ == 'PyTime':
         return {'timecode': _ja(v.timecode), 'frame': _ja(v.frame)}
+    if _is_resolution(v):
+        out = {'type': 'PyResolution'}
+        out.update(_resolution_dict(v))
+        return out
     if type(v).__name__.startswith('Py'):
         return _wrapper_ref(v)
     return repr(v)
@@ -93,7 +122,16 @@ def _to_tuple(x):
     return x
 
 
+def _resolution_gaps(got, want):
+    # [(field, asked, read back)] for every field of the resolution `want` that `got` does not hold
+    g = _resolution_dict(got)
+    w = _resolution_dict(want)
+    return [(k, w[k], g[k]) for k in _RES_KEYS if not _attr_equal(g[k], w[k])]
+
+
 def _attr_equal(a, b):
+    if _is_resolution(a) and _is_resolution(b):
+        return len(_resolution_gaps(a, b)) == 0
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if _is_num(a) and _is_num(b):
@@ -140,6 +178,58 @@ def _sibling_names(obj, group):
     return names
 
 
+def _resolution_problem(current, want):
+    if not isinstance(want, dict):
+        return 'expected an object with any of ' + ', '.join(_RES_KEYS) + ', got ' + repr(want)
+    for k in want:
+        if k == 'type':
+            if want[k] != 'PyResolution':
+                return "'type' must be 'PyResolution' when given, got " + repr(want[k])
+        elif k not in _RES_KEYS:
+            return 'unknown key ' + repr(k) + ' (keys: ' + ', '.join(_RES_KEYS) + ')'
+    for k in ('width', 'height'):
+        if k in want:
+            n = want[k]
+            if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+                return k + ' must be a positive integer, got ' + repr(n)
+    if 'bit_depth' in want:
+        n = want['bit_depth']
+        if not isinstance(n, int) or isinstance(n, bool) or n not in _RES_BIT_DEPTHS:
+            return 'bit_depth must be one of ' + repr(_RES_BIT_DEPTHS) + ', got ' + repr(n)
+    if 'frame_ratio' in want and not _is_num(want['frame_ratio']):
+        return 'frame_ratio must be a number, got ' + repr(want['frame_ratio'])
+    if 'scan_mode' in want:
+        have = _try(lambda: _v(current.scan_mode))
+        if want['scan_mode'] != have or not isinstance(have, str):
+            return (
+                'scan_mode: only the value it has now (' + repr(have) + ') is accepted'
+            )
+    return None
+
+
+def _resolution_want(current, want):
+    problem = _resolution_problem(current, want)
+    if problem is not None:
+        return 'rejected: ' + problem, None
+    have = _resolution_dict(current)
+    merged = {}
+    for k in _RES_KEYS:
+        merged[k] = want[k] if k in want else have[k]
+        if merged[k] is None:
+            return 'rejected: the current ' + k + ' cannot be read, so it must be given', None
+    try:
+        built = flame.PyResolution(
+            merged['width'],
+            merged['height'],
+            merged['bit_depth'],
+            merged['frame_ratio'],
+            merged['scan_mode'],
+        )
+    except BaseException as exc:
+        return 'rejected: Flame refused to build the resolution: ' + str(exc), None
+    return None, built
+
+
 def _attr_preflight(obj, names, key, want):
     if key not in names:
         shown = ', '.join(names[:40]) + (' ...' if len(names) > 40 else '')
@@ -153,6 +243,9 @@ def _attr_preflight(obj, names, key, want):
         return 'rejected: not a PyAttribute (' + type(attr).__name__ + ')', None, None
     if type(current).__name__ == 'PyTime':
         return 'rejected: PyTime attributes are not supported yet', None, current
+    if _is_resolution(current):
+        reason, built = _resolution_want(current, want)
+        return reason, built, current
     if isinstance(current, tuple):
         want = _to_tuple(want)
     if isinstance(current, bool):
@@ -261,15 +354,37 @@ def _set_attributes(obj, values, group=None, expected=None, restoring=False):
                     failed[key] += _COLOUR_LABEL_HINT
                 break
             after[key] = _ja(got)
-            if not _attr_equal(got, current):
+            # compared as JSON forms: `current` may be a live reference that set_value changed
+            changed = not _attr_equal(after[key], before[key])
+            if changed:
                 revert_values[key] = before[key]
             if not _written_equal(key, got, want):
-                failed[key] = (
-                    'silent_noop: set_value raised nothing but the value read back is '
-                    + repr(after[key])
-                    + ', not '
-                    + repr(_ja(want))
-                )
+                if changed and _is_resolution(want):
+                    gaps = ', '.join(
+                        f + ' (asked ' + repr(a) + ', read back ' + repr(r) + ')'
+                        for f, a, r in _resolution_gaps(got, want)
+                    )
+                    failed[key] = (
+                        'partial: set_value raised nothing but only part of the resolution took '
+                        'effect; did not take: ' + gaps + '; read back ' + repr(after[key])
+                    )
+                elif changed:
+                    failed[key] = (
+                        'partial: set_value raised nothing but the value read back is '
+                        + repr(after[key])
+                        + ', not '
+                        + repr(_ja(want))
+                        + ' (it was '
+                        + repr(before[key])
+                        + ')'
+                    )
+                else:
+                    failed[key] = (
+                        'silent_noop: set_value raised nothing but the value read back is '
+                        + repr(after[key])
+                        + ', not '
+                        + repr(_ja(want))
+                    )
                 break
             applied.append(key)
     return {
@@ -278,6 +393,7 @@ def _set_attributes(obj, values, group=None, expected=None, restoring=False):
         'applied': applied,
         'failed': failed,
         'revertValues': revert_values,
+        'changedKeys': list(revert_values),
         'conflicts': conflicts,
     }
 
@@ -291,6 +407,7 @@ def _set_result(op_name, obj, out, stable):
         'before': out['before'],
         'after': out['after'],
         'applied': out['applied'],
+        'changedKeys': out['changedKeys'],
         'failed': out['failed'],
         'conflicts': out['conflicts'],
         'revert': revert,

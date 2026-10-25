@@ -38,11 +38,25 @@ What it encodes:
     and reads the all-section fingerprint back. A reel that holds a clip or a sequence is never
     deleted: deleting one also deleted the Clip nodes that use it. The order matters: deleting
     the last reel of a group made Flame create its default ones.
+  - Timeline FX of the reel clips: a Batch setup does not hold them, and a clip whose FX were
+    changed or rendered inside the group came back from `load_setup` without them, and a clip
+    that was only copied in can lose them too (Flame 2025.2.4).
+    `_clip_fx_read` lists, per clip of every schematic and shelf reel, the FX
+    types (in segment order); a checkpoint records it right before `save_setup` and a restore
+    reads it again right after its `load_setup` (`timeline_fx_loss` compares the two). Read-only;
+    a value that cannot be read is None with the error text; the whole read stops at
+    `CLIP_FX_READ_BUDGET_S` and gives no rows.
 """
 
 from __future__ import annotations
 
-CHECKPOINT_HELPER = """
+from typing import Final
+
+CLIP_FX_READ_BUDGET_S: Final[float] = 5.0
+"""How long `_clip_fx_read` may take before it stops: a checkpoint and a restore share one Flame
+call limit (`checkpoints.CHECKPOINT_TIMEOUT_S`) with the rest of what they do there."""
+
+_HELPER_TEMPLATE = """
 def _inner_entries(n):
     # (has_inner, inner): inner is the sorted [name, type] of the inner nodes, None when unreadable
     if type(n).__name__ not in ('PyActionNode', 'PyImageNode', 'PyGMaskTracerNode'):
@@ -244,6 +258,46 @@ def _reel_inventory(batch):
     return rows
 
 
+def _clip_fx_row(kind, rname, c):
+    row = {'reelKind': kind, 'reel': rname, 'clip': None, 'effects': None, 'error': None}
+    try:
+        row['clip'] = _v(c.name)
+    except BaseException as exc:
+        row['error'] = type(exc).__name__ + ': ' + str(exc)
+        return row
+    try:
+        types = []
+        for ver in list(c.versions):
+            for trk in list(ver.tracks):
+                for seg in list(trk.segments):
+                    for fx in list(seg.effects):
+                        types.append(_ja(fx.type))
+        row['effects'] = types
+    except BaseException as exc:
+        row['error'] = type(exc).__name__ + ': ' + str(exc)
+    return row
+
+
+def _clip_fx_read(batch):
+    # {'rows': [per clip of every schematic and shelf reel], 'error': why rows is None}; read-only
+    import time
+    budget = __CLIP_FX_READ_BUDGET_S__
+    started = time.monotonic()
+    try:
+        rows = []
+        for kind, attr in (('schematic', 'reels'), ('shelf', 'shelf_reels')):
+            for r in list(getattr(batch, attr)):
+                rname = _v(r.name)
+                for c in list(r.clips):
+                    if time.monotonic() - started > budget:
+                        why = 'time budget of %s s exceeded after %d clips' % (budget, len(rows))
+                        return {'rows': None, 'error': why}
+                    rows.append(_clip_fx_row(kind, rname, c))
+        return {'rows': rows, 'error': None}
+    except BaseException as exc:
+        return {'rows': None, 'error': type(exc).__name__ + ': ' + str(exc)}
+
+
 def _reel_is_empty(r):
     return len(list(r.clips)) == 0 and len(list(r.sequences)) == 0
 
@@ -362,6 +416,35 @@ def _make_private_tree(path):
         pass
 
 
+def _make_files_private(paths):
+    # best effort, for the files a save_setup wrote at a path the caller chose: 0600 for a regular
+    # file of ours; a symlink, another kind of file or someone else's file is left alone
+    import os
+    import stat
+    made = []
+    refused = {}
+    uid = os.getuid()
+    for path in paths:
+        try:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                refused[path] = 'symlink'
+            elif not stat.S_ISREG(st.st_mode):
+                refused[path] = 'not a regular file'
+            elif st.st_uid != uid:
+                refused[path] = 'not owner'
+            else:
+                if os.chmod in os.supports_follow_symlinks:
+                    # a path swapped for a symlink after the lstat is changed, not followed
+                    os.chmod(path, 0o600, follow_symlinks=False)
+                else:
+                    os.chmod(path, 0o600)
+                made.append(path)
+        except OSError as exc:
+            refused[path] = type(exc).__name__
+    return made, refused
+
+
 def _save_checkpoint(batch, directory, base, sections=None, full_sections=None):
     import glob
     import os
@@ -377,6 +460,7 @@ def _save_checkpoint(batch, directory, base, sections=None, full_sections=None):
         reels = _reel_inventory(batch)
     except BaseException as exc:
         reels_error = type(exc).__name__ + ': ' + str(exc)
+    clip_fx = _clip_fx_read(batch)
     full = None
     if full_sections:
         try:
@@ -417,6 +501,8 @@ def _save_checkpoint(batch, directory, base, sections=None, full_sections=None):
         'unreadableNodes': fp['unreadableNodes'],
         'reels': reels,
         'reelsError': reels_error,
+        'clipFx': clip_fx['rows'],
+        'clipFxError': clip_fx['error'],
         'fingerprintFull': full['fingerprint'] if full else None,
         'fingerprintFullSections': list(full_sections) if full and full_sections else None,
         'sectionData': full.get('sectionData') if full else None,
@@ -481,3 +567,7 @@ def _eval_json_safe(value):
             'repr': repr(value)[:2000],
         }
 """
+
+CHECKPOINT_HELPER = _HELPER_TEMPLATE.replace(
+    "__CLIP_FX_READ_BUDGET_S__", repr(CLIP_FX_READ_BUDGET_S)
+)

@@ -49,19 +49,19 @@ p3_3_segment|standard|p3|yes|no|no|-|setup, stages s, r, e, x, p, y, z
 p3_2b_plan_delete|standard|p3|yes|no|no|-|setup, stages p, d, m, k, r, g, z
 p3_2a_checkpoint|standard|p3|yes|no|no|-|setup, stages a-k, z
 p3_1b_write|standard|p3|yes|no|no|-|setup, stages a, a2, b, c, e, g, z
-p3_1a_read|standard|p3|yes|no|no|-|setup, stages a-g, z
+p3_1a_read|standard|p3|yes|no|no|-|setup, stages a-f, h, i, g, z
 p1_bridge|dedicated|-|-|-|-|-|-
 p1_transport|dedicated|-|-|-|-|-|-
 p1_mcp|standard|p1|no|no|no|-|-
 p2_1_attr|standard|p2|no|no|no|-|-
 p2_2a_journal|standard|p2|yes|no|no|-|stages a-f, z
-p2_2b_plan|standard|p2|yes|no|no|-|stages a-f, z
+p2_2b_plan|standard|p2|yes|no|no|-|stages a-g, z
 p2_2c_checkpoint_eval|standard|p2|yes|no|no|-|stages a-e, z
 p2_3a_batch|standard|p2|yes|no|no|-|stages a-e, z
 p2_3b_node_action|standard|p2|yes|no|no|-|stages a-f, z
 p2_3r_reel_fidelity|standard|p2|yes|no|no|-|stages a-e, z
-p2_3c_render|standard|p2|yes|no|no|-|setup, stages a-f, z
-p2_3d_desktop|standard|p2|yes|no|no|-|setup, stages a-d, f, z
+p2_3c_render|standard|p2|yes|no|no|-|setup, stages a-h, z
+p2_3d_desktop|standard|p2|yes|no|no|-|setup, stages a-f, z
 p2_4_scenario4|standard|p2|yes|yes|yes|-|all stages
 p2_4_stress|standard|p2|yes|yes|yes|-|all stages
 p2_4_restart|dedicated|-|-|-|-|-|-
@@ -73,7 +73,12 @@ fix3_reel_order|standard|p3|yes|no|no|-|setup, stages n, c, z
 fix5_timeline_selector|standard|p3|yes|no|no|-|setup, stages a, t, p, s, z
 fix6_same_name_nodes|standard|p3|yes|no|no|-|setup, stages n, c, z
 fix7_small_items|standard|p3|yes|no|no|-|setup, stages a, b, c, d, z
-w3_timewarp|standard|p3|yes|no|no|FLAME_MCP_W3_SETUP=|setup, stages t, r, n, z
+p5_batch_fx_loss|standard|p3|yes|no|no|-|setup, stages f, z
+p5_render_clip|standard|p3|yes|no|no|-|setup, stages r, t, z
+p5_plan_batch|standard|p3|yes|no|no|-|setup, stages b, a, n, z
+p5_setup_edit|standard|p3|yes|no|no|-|setup, stages c, p, n, z
+p6_list_all|standard|p3|yes|no|no|-|setup, stages l, z
+w3_timewarp|standard|p3|yes|no|no|FLAME_MCP_W3_SETUP=|setup, stages t, r, n, i, z
 EOF
 }
 

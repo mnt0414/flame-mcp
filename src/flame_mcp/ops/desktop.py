@@ -77,6 +77,9 @@ def _list_children_to_python(args: Mapping[str, Any]) -> str:
                 f"_offset = {offset!r}",
                 "_total = len(_children)",
                 "_items = [_describe_entry(_x) for _x in _children[_offset : _offset + _limit]]",
+                "for _item, _x in zip(_items, _children[_offset : _offset + _limit]):",
+                "    if _item['type'] in _RP_MEDIA_TYPES:",
+                "        _item.update(_rp_size_facts(_x))",
             ]
         ),
         list_result_src("_items", "_total", "_offset"),
@@ -98,6 +101,16 @@ def _selection_to_python(args: Mapping[str, Any]) -> str:
         ),
         list_result_src("_items", "_total", "_offset"),
     )
+
+
+_LIBRARY_WRITE_NOTE = (
+    "A library, and anything inside one (a folder, a reel, a clip, a sequence, a Batch group, or a "
+    "reel group made in a library), is never renamed or written to: such a target is "
+    "refused with PRECONDITION_UNMET before anything is read for the write, nothing is written "
+    "and nothing is journaled (this holds for a plan.run step too; a library entry can be "
+    "taken out with desktop.copy and changed there). The revert of a write made earlier is "
+    "not refused."
+)
 
 
 def _rename_to_python(args: Mapping[str, Any]) -> str:
@@ -215,8 +228,8 @@ def _create_to_python(args: Mapping[str, Any]) -> str:
         parent,
         f"_result = _dc_create({kind!r}, parent, {args['name']!r}, "
         f"{bool(args.get('allow_rename', False))!r}, {opts!r}, {expected!r})",
+        "_affected = 1 if _result['created'] is not None else 0",
         raise_on_error_src(),
-        "_affected = 1",
     )
 
 
@@ -288,8 +301,12 @@ def _copy_to_python(args: Mapping[str, Any]) -> str:
     else:
         blocks += [
             f"_result = _dc_copy(dest, {listed}, {args.get(EXPECTED_ARG)!r})",
-            raise_on_error_src(),
             "_affected = len(_result['copies'])",
+            "_partial = (\n"
+            "    {'copied': len(_result['copies']), 'notCopied': len(_result['notCopied'])}\n"
+            "    if _result['partial'] else None\n"
+            ")",
+            raise_on_error_src(),
         ]
     return build_source(*blocks)
 
@@ -347,7 +364,9 @@ _CREATE_DESCRIPTION = (
     "is the actual list of names) and one shelf reel 'Batch Renders'), `start_frame` (default 1) "
     "and `duration` (default 100) set the group's range; nb_reels is not offered. result.selector "
     "is {kind: 'batch', uid}; reels / shelfReels / startFrame / duration / nodeCount are read "
-    "back (a difference from what was asked is listed in `degraded`); a new group holds no node. "
+    "back, and a difference from what was asked is FLAME_API_ERROR whose message starts with "
+    "'partial:': the group exists and is journaled (state partial), so journal.revert "
+    "deletes it; a new group holds no node. "
     "reel_group: starts with Reel 1 to 4 and Sequences (result.reelRows). reel: result.type is "
     "'Reel', or 'Sequences' with sequence=true (only for a reel group parent); the reel is "
     "added at the end of the parent. Selectors "
@@ -378,8 +397,8 @@ _COPY_DESCRIPTION = (
     "are copied at once (the copies come back in the order given). Copying a name that is "
     "already in the reel adds another clip of that name "
     "(duplicate_action is not offered: 'replace' replaced nothing). Into a library or a "
-    "folder the copies are checked by the returned clips' uids (a warning says when "
-    "the destination does not list them). "
+    "folder, which may not list them, the answered clips that are new and found by uid stand in "
+    "for the listing (a degraded note says so). "
     "A destination that is a reel of a Batch group is refused (INVALID_ARGS, nothing written): "
     "use batch.add_clips, which checkpoints the group. "
     "Batch group: one per call, never together with clips. A Batch group of the Desktop "
@@ -394,15 +413,23 @@ _COPY_DESCRIPTION = (
     "only after it is copied onto the Desktop. result.copies[].selector of a group in a library "
     "is a name path from its library, null when a name on the way is not unique (then select it "
     "in the Media Panel and use a selection selector); on the Desktop it is {kind: 'batch', uid}. "
-    f"At most {MAX_SOURCES} sources. result: destination, requested / returned, copies "
-    "[{name, uid, wiretapId, selector, type, sourceUid, inDestination}], sources (with the "
+    f"At most {MAX_SOURCES} sources. What a call made is decided by the destination, not by "
+    "the answer: its entries that were not there before (a source is never one of them), "
+    "paired with the sources by the answer's order, then by type and name. result: destination, "
+    "requested / returned (the answer's length), copies "
+    "[{name, uid, wiretapId, selector, type, sourceUid, inDestination}], notCopied (sources "
+    "that have no copy), partial, sources (with the "
     "uid each had), sourcesRemain (every source is still found by uid) and the destination's "
     "entry names before / after; a Batch group copy also has current / currentBefore / "
     "currentMoved and node counts / fingerprints (sourceNodeCount, sourceFingerprint of the "
     "group of the Desktop copied into a library; copyNodeCount, copyFingerprint of the group "
-    "put back onto the Desktop: equal when nothing changed). A call that returns without "
-    "an error but leaves the destination "
-    "without the copies is an error (SILENT_NOOP). "
+    "put back onto the Desktop: equal when nothing changed). A call after which the "
+    "destination did not grow is an error (SILENT_NOOP, nothing journaled as made). Only some "
+    "sources have a copy: FLAME_API_ERROR whose message starts with 'partial:', "
+    "result.partial = true and the envelope's partial {copied, notCopied}; the copies that "
+    "exist are journaled (journal state partial), so journal.revert deletes them. Every "
+    "source has a copy but the answer was not the list of new clips (empty, "
+    "a wrong length, a source in it): ok with a degraded note. "
     "JOURNAL as desktop.create (intent with the destination's uids -> compare-and-swap -> "
     "outcome with the copies' uids). Envelope journal = {group, id, revert}. "
     "Undo: journal.revert(group) deletes exactly those copies by uid (flame.delete), only while "
@@ -647,7 +674,9 @@ def register(registry: Registry) -> None:
                 "List the children of a library/folder/reel group/reel/desktop "
                 "(anything with a `.children` attribute), one page at a time: "
                 "`offset` skips items, `types` keeps only the named Flame types "
-                "(`total` counts the items after that filter)."
+                "(`total` counts the items after that filter). A PyClip / PySequence item "
+                "also carries `duration` and `frameRate` and `width`, `height`, `bitDepth` "
+                "(each null when it cannot be read)."
             ),
             effect="read",
             params=(
@@ -667,7 +696,17 @@ def register(registry: Registry) -> None:
             ),
             accepts=(*_TARGET_ACCEPTS, "desktop"),
             to_python=_list_children_to_python,
-            requires=("PyLibrary.children", "PyReel.children", "PyDesktop.children"),
+            requires=(
+                "PyLibrary.children",
+                "PyReel.children",
+                "PyDesktop.children",
+                "PyClip.width",
+                "PyClip.height",
+                "PyClip.bit_depth",
+                "PySequence.width",
+                "PySequence.height",
+                "PySequence.bit_depth",
+            ),
         )
     )
 
@@ -699,7 +738,7 @@ def register(registry: Registry) -> None:
                 "(envelope `journal` = {group, id}), then renames with a compare-and-swap; "
                 "if the name changed in between, nothing is written (errorCode CONFLICT). "
                 "journal.revert(group) puts the previous name back. A 'batch' selector "
-                "(a Batch group, by uid or name) is accepted as well."
+                "(a Batch group, by uid or name) is accepted as well. " + _LIBRARY_WRITE_NOTE
             ),
             effect="reversible",
             params=(
@@ -748,6 +787,8 @@ def register(registry: Registry) -> None:
             "(Reel Group, Reel, Batch group)."
         ),
         stable_src=lambda _args: "_stable = _stable_desktop(target)",
+        write_guard_src=lambda _args: "_tl_check_not_library(target, 'the target')",
+        note=_LIBRARY_WRITE_NOTE,
         revert_kinds=("wiretap", "batch"),
         requires=attribute_requires(
             "PyLibrary.attributes",

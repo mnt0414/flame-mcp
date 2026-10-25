@@ -29,6 +29,7 @@ from flame_mcp.desktop_run import (
     PHASE_ARG,
     PHASE_WRITE,
     WRITE_TIMEOUT_S,
+    partial_verdict,
 )
 from flame_mcp.journal import KIND_DESKTOP_REFORMAT, new_id, now_iso
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
@@ -70,7 +71,7 @@ def _result_of(env: Mapping[str, Any]) -> dict[str, Any]:
 
 def _unknown_end(run: Run, env: dict[str, Any], intent_id: str, index: int) -> bool:
     """Whether `env` is a call that ended without an answer; if so the run stops here, the write
-    door is shut and the intent stays open."""
+    guard is shut and the intent stays open."""
     code = env.get("errorCode")
     pending = env.get("pending")
     if code not in UNKNOWN_END_CODES and not (env.get("ok") is True and pending):
@@ -194,6 +195,7 @@ def _clip_row(
         "after": result.get("after"),
         "applied": result.get("applied"),
         "changed": bool(result.get("changed")),
+        "touched": bool(result.get("changed")) or made is not None,
         "skipped": bool(result.get("skipped")),
         "checkpoint": stash.get("checkpoint") if stash else None,
         "stash": stash.get("stash") if stash else None,
@@ -259,6 +261,7 @@ def _outcome_record(
         "readBack": {"before": result.get("before"), "after": result.get("after")},
         "created": created,
         "fingerprintAfter": result.get("fingerprintAfter"),
+        **partial_verdict(ok, created),
     }
 
 

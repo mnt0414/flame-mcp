@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from fake_media_tree import PyBatch, PyClip, PyReelGroup, PySegment, PyTime
+from fake_media_tree import PyClip, PyReelGroup, PySegment, PyTime
 from flame_mcp import desktop_run, execution
 from flame_mcp.desktop_prelude import DESKTOP_HELPER
 from flame_mcp.desktop_run import CURRENT_MOVED_NOTE
@@ -131,22 +131,57 @@ def test_create_batch_group_with_options_reads_them_back(rig: Rig) -> None:
     assert env["degraded"] == []
 
 
-def test_a_read_back_that_differs_from_what_was_asked_is_reported_in_degraded(rig: Rig) -> None:
-    def start_ignored(group: PyBatch) -> None:
-        group.start_frame.set_value(1)
-
-    original = rig.flame.projects.current_project.current_workspace.desktop.create_batch_group
+def altered_group(rig: Rig, change: Any) -> None:
+    original = desktop(rig).create_batch_group
 
     def creating(*args: Any, **kwargs: Any) -> Any:
         made = original(*args, **kwargs)
-        start_ignored(made)
+        change(made)
         return made
 
     desktop(rig).create_batch_group = creating
-    env = create(rig, kind="batch_group", name="OPT", start_frame=1001)
-    assert env["ok"] is True
-    assert any("startFrame" in note for note in env["degraded"])
-    assert env["result"]["startFrame"] == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "change", "needle"),
+    [
+        (
+            {"start_frame": 1001},
+            lambda g: g.start_frame.set_value(1),
+            "startFrame asked for 1001",
+        ),
+        (
+            {"duration": 48},
+            lambda g: g.duration.set_value(100),
+            "duration asked for 48",
+        ),
+        (
+            {"reels": ["A", "B"]},
+            lambda g: g.reels[0].name.set_value("Z"),
+            "reels asked for ['A', 'B']",
+        ),
+        (
+            {"shelf_reels": ["S1"]},
+            lambda g: g.shelf_reels[0].name.set_value("Z"),
+            "shelfReels asked for ['S1']",
+        ),
+    ],
+)
+def test_a_read_back_that_differs_from_what_was_asked_is_a_partial_error_with_the_group_recorded(
+    rig: Rig, args: dict[str, Any], change: Any, needle: str
+) -> None:
+    altered_group(rig, change)
+    env = create(rig, kind="batch_group", name="OPT", **args)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and needle in env["error"]
+    assert env["result"]["created"]["type"] == "PyBatch" and env["affected"] == 1
+    assert "OPT" in batch_names(rig) and env["journal"]["revert"] is not None
+    outcome = rig.records()[-1]
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert outcome["created"]["uid"] == env["result"]["created"]["uid"]
+    assert rig.do("journal.list", {})["result"]["items"][0]["state"] == "partial"
+    out = revert(rig, env)
+    assert out["ok"] is True and "OPT" not in batch_names(rig)
 
 
 def test_a_taken_name_refuses_before_anything_is_written_or_journaled(rig: Rig) -> None:
@@ -877,16 +912,76 @@ def test_a_copy_that_returns_a_source_is_not_recorded_as_a_copy_so_a_revert_cann
     assert rig.flame.find_by_uid(source.uid.get_value()) is source
 
 
-def test_a_copy_that_does_not_land_in_the_reel_is_an_error_but_its_copies_are_recorded(
-    rig: Rig,
-) -> None:
+def test_a_copy_answer_that_is_not_in_the_destination_is_not_recorded_as_a_copy(rig: Rig) -> None:
     stray = PyClip("stray", wiretap_id="/wt/stray", uid="stray-uid")
     rig.flame.media_panel.copy = lambda *args, **kwargs: [stray]
     env = copy(rig, [CLIP1], REEL1)
-    assert env["errorCode"] == "SILENT_NOOP" and "does not list every new clip" in env["error"]
-    assert [c["uid"] for c in rig.records()[-1]["created"]["copies"]] == ["stray-uid"]
-    out = revert(rig, env)  # not found: skipped, nothing deleted
-    assert out["ok"] is True and [s["uid"] for s in out["result"]["skipped"]] == ["stray-uid"]
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    assert "did not grow" in env["error"]
+    assert rig.records()[-1]["created"] is None and env["journal"]["revert"] is None
+
+
+def test_a_copy_that_answers_nothing_but_filled_the_destination_is_recorded(rig: Rig) -> None:
+    real = rig.flame.media_panel.copy
+
+    def silent(*args: Any, **kwargs: Any) -> list[Any]:
+        real(*args, **kwargs)
+        return []
+
+    rig.flame.media_panel.copy = silent
+    env = copy(rig, [CLIP1, CLIP2], REEL1)
+    assert env["ok"] is True, env
+    assert [c["name"] for c in env["result"]["copies"]] == ["clip1", "clip2"]
+    assert [c["sourceUid"] for c in env["result"]["copies"]] == [
+        rig.handles["clip1"].uid.get_value(),
+        rig.handles["clip2"].uid.get_value(),
+    ]
+    assert any("answered 0" in note for note in env["degraded"])
+    assert [c["name"] for c in rig.records()[-1]["created"]["copies"]] == ["clip1", "clip2"]
+    assert env["journal"]["revert"] is not None
+    rig.flame.media_panel.copy = real
+    out = revert(rig, env)
+    assert out["ok"] is True and entry_names(rig.handles["reel_group"].reels[0]) == ["c1"]
+
+
+def test_a_copy_that_answers_a_wrong_list_but_made_every_copy_is_ok_with_a_note(rig: Rig) -> None:
+    real = rig.flame.media_panel.copy
+    source = rig.handles["clip1"]
+
+    def wrong_list(*args: Any, **kwargs: Any) -> list[Any]:
+        real(*args, **kwargs)
+        return [source]
+
+    rig.flame.media_panel.copy = wrong_list
+    env = copy(rig, [CLIP1], REEL1)
+    assert env["ok"] is True, env
+    assert [c["name"] for c in env["result"]["copies"]] == ["clip1"]
+    assert env["result"]["copies"][0]["uid"] != source.uid.get_value()
+    assert env["result"]["notNew"][0]["uid"] == source.uid.get_value()
+    assert env["degraded"] and env["journal"]["revert"] is not None
+
+
+def test_a_copy_that_makes_only_some_is_a_partial_error_and_its_revert_deletes_those(
+    rig: Rig,
+) -> None:
+    real = rig.flame.media_panel.copy
+    rig.flame.media_panel.copy = lambda src, dest, duplicate_action="add": real(
+        src[0], dest, duplicate_action=duplicate_action
+    )
+    env = copy(rig, [CLIP1, CLIP2], REEL1)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and env["result"]["partial"] is True
+    assert env["partial"] == {"copied": 1, "notCopied": 1}
+    assert [c["name"] for c in env["result"]["copies"]] == ["clip1"]
+    assert [c["name"] for c in env["result"]["notCopied"]] == ["clip2"]
+    assert env["affected"] == 1 and env["journal"]["revert"] is not None
+    outcome = rig.records()[-1]
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert [c["name"] for c in outcome["created"]["copies"]] == ["clip1"]
+    assert rig.do("journal.list", {})["result"]["items"][0]["state"] == "partial"
+    rig.flame.media_panel.copy = real
+    out = revert(rig, env)
+    assert out["ok"] is True and entry_names(rig.handles["reel_group"].reels[0]) == ["c1"]
 
 
 def test_a_copy_that_takes_a_source_away_says_so_in_sources_remain_and_degraded(rig: Rig) -> None:

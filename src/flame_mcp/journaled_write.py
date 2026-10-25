@@ -5,7 +5,9 @@ For a `value`-undo op that carries a `JournalSpec` (desktop.rename and every
 
   1. pre-read   the spec's read op (get_attributes for the same target and keys) returns the
                 previous values and a stable address of the target (wiretap id / batch uid /
-                node name -- not the caller's `selection` or `path`, which can move)
+                node name -- not the caller's `selection` or `path`, which can move). For a
+                write (not a revert) it also applies the op's refusals for writes (a target in a
+                library: PRECONDITION_UNMET), so a refused call leaves nothing in the journal
   2. intent     {op, args, target, before, after} is appended and flushed before anything is
                 written: if this process dies from here on, the journal still says what was
                 about to happen and what the values were
@@ -50,6 +52,11 @@ answer, and gets an outcome record."""
 RESTORING_ARG: Final[str] = "_restoring"
 """Reserved args key set only when the write is a journal.revert: it puts back a recorded value,
 so the server-side same-name check of a node rename is skipped (Flame's own check stays)."""
+
+FOR_WRITE_ARG: Final[str] = "_for_write"
+"""Reserved args key set on the pre-read of a write (not of a revert): a read op that has a
+refusal for writes (a target in a library) applies it then, so the call ends before an intent is
+journaled. A caller cannot send it (`validate_op_args` rejects an unknown key)."""
 
 EXPECTED_ARG: Final[str] = "_expected"
 """The reserved args key carrying the compare-and-swap values into `to_python`. It is not a
@@ -143,6 +150,18 @@ def _read_values(pre: Mapping[str, Any], keys: list[str]) -> tuple[dict[str, Any
     return before, rejected
 
 
+def _completed_after(before: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+    """`values` as the attributes will read once written. An object value (a resolution) names
+    only the fields it changes; the others keep what the pre-read found, so the intent's `after`
+    can be compared with a later read of the whole object (`journal.check`, a revert)."""
+    return {
+        key: {**before[key], **value}
+        if isinstance(value, dict) and isinstance(before.get(key), dict)
+        else value
+        for key, value in values.items()
+    }
+
+
 def _outcome_record(
     env: Mapping[str, Any], intent_id: str, group: str, keys: list[str]
 ) -> dict[str, Any]:
@@ -152,6 +171,9 @@ def _outcome_record(
     applied = result.get("applied")
     if not isinstance(applied, list):
         applied = list(keys) if ok else []
+    changed_keys = result.get("changedKeys")
+    if not isinstance(changed_keys, list):
+        changed_keys = []
     failed = result.get("failed")
     if not isinstance(failed, dict):
         failed = {}
@@ -167,6 +189,7 @@ def _outcome_record(
         "ts": now_iso(),
         "ok": ok,
         "applied": applied,
+        "changedKeys": changed_keys,
         "failed": failed,
         "errorCode": env.get("errorCode"),
         "readBack": read_back,
@@ -214,6 +237,8 @@ def run_journaled_write(
             )
 
         read_args: dict[str, Any] = {"target": op_args["target"], "keys": keys}
+        if reverts is None:
+            read_args[FOR_WRITE_ARG] = True
         apply_param_defaults(read_op, read_args)
         pre = execution.run_op(read_op, read_args, run_dir=rt.run_dir)
         if not pre["ok"]:
@@ -292,7 +317,7 @@ def run_journaled_write(
             "targetAfter": target_after,
             "readOp": spec.read_op,
             "before": before,
-            "after": values,
+            "after": _completed_after(before, values),
         }
         if reverts is not None:
             intent["reverts"] = reverts

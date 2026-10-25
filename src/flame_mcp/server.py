@@ -39,7 +39,7 @@ from flame_mcp.runtime import Runtime, TestHooks
 from flame_mcp.types import NO_DEFAULT, SelectorKind
 from flame_mcp_bridge.impl import BRIDGE_ABI
 
-SERVER_VERSION: Final[str] = "0.1.0"
+SERVER_VERSION: Final[str] = "0.2.0"
 TESTED_FLAME_VERSIONS: Final[tuple[str, ...]] = ("2025.2.4", "2026.2.3")
 
 TOOL_VERSION_INFO: Final[str] = "flame_version_info"
@@ -66,8 +66,9 @@ INSTRUCTIONS: Final[str] = "\n".join(
         "refused with INVALID_ARGS.",
         "flame_context lists known pitfalls. Read them before writing eval.run code.",
         "Before an operation that cannot be undone or that overwrites (render.batch, "
-        "overwrite=true, journal.purge_checkpoints, desktop.delete, desktop.reformat (in place), "
-        "journal.revert force=true, eval.run), ask the user to confirm.",
+        "render.clip, overwrite=true, journal.purge_checkpoints, desktop.delete, "
+        "desktop.reformat (in place), journal.revert force=true, journal.restore_checkpoint, "
+        "batch.load_setup, eval.run), ask the user to confirm.",
     ]
 )
 
@@ -326,6 +327,24 @@ def _tool_definitions(registry: Registry, policy: Policy) -> list[types.Tool]:
 
 PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
     {
+        "text": "A Batch setup does not contain the Timeline FX of the clips in the group's reels: "
+        "loading the setup again (journal.revert, journal.restore_checkpoint) can bring a clip "
+        "back without them. Every clip whose Timeline FX were changed or rendered while it was "
+        "in the group came back without them; a clip that was only copied in can lose them too. "
+        "result.timelineFxLost lists the clips that lost theirs; "
+        "add the original clip from the Desktop again (batch.add_clips).",
+    },
+    {
+        "text": "Do not save or load the setup of a Timeline FX (save_setup / load_setup) in the "
+        "same Flame call as a smart_replace_media of its segment. Measured with a Timewarp: "
+        "after that, every clip put on a sequence made later in the session got an extra Image "
+        "effect (seen on Flame 2025.2.4 and 2026.2.3), and Flame 2025.2.4 later "
+        "hung or crashed in save_setup. The same steps as separate calls (plan.run steps are "
+        "separate calls) changed nothing on either version. A replace also shifts the "
+        "Timewarp's timing by the length of the head, so save its setup before and load it "
+        "after, each as its own call (segment.effect_save_setup, segment.effect_load_setup).",
+    },
+    {
         "text": "smart_replace (segment.replace mode=media_and_fx) drops the segment's effects "
         "when the replacing media has none of its own (a Resize that Flame added by itself "
         "because of a bit depth difference stays: measured on Flame 2026.2.3). To keep them "
@@ -361,7 +380,9 @@ PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
         "group moves current to an unpredictable other group.",
     },
     {
-        "text": "Deleting a reel that holds clips also deletes the Clip nodes that reference it.",
+        "text": "Deleting a Batch schematic reel that holds clips also deletes the Clip nodes that "
+        "reference it. desktop.delete refuses a Desktop reel that holds a clip or a sequence for "
+        "the same reason.",
     },
     {
         "text": "shared_source_segments() does not return copies inside a library "
@@ -466,7 +487,9 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "a segment: the same name, duration and content), else CONFLICT and nothing is "
             "deleted; for desktop.move it moves the things back (they get new uids again). "
             "library.create has the same journal and revert: it deletes the library only while "
-            "it is empty. desktop.copy of a Batch group (into a library, or back from a "
+            "it is empty. desktop.arrange is one journal group of one desktop.copy / "
+            "desktop.move intent per item, and journal.revert(group) puts the items back "
+            "newest first. desktop.copy of a Batch group (into a library, or back from a "
             "library onto the Desktop) deletes the copy only while it is as made (in a "
             "library its name and reels; on the Desktop also its nodes, connections and node "
             "attribute values), and before it deletes a group on the Desktop it saves the "
@@ -478,10 +501,12 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "(PRECONDITION_UNMET) before anything is done. "
             "Library contents are never deleted or moved out by this server: desktop.delete "
             "refuses a clip or sequence inside a library and desktop.move refuses a source "
-            "inside one (desktop.copy takes something out of a library); only the revert of "
+            "inside one (desktop.copy takes something out of a library); desktop.rename and "
+            "desktop.set_attributes (and segment.set_attributes) refuse a library and what is "
+            "inside one (PRECONDITION_UNMET, nothing written or journaled); only the revert of "
             "its own write and journal.purge_checkpoints remove anything there. A write to a "
             "sequence's segments (segment.trim, slip, replace, "
-            "create_effect, delete_effect, set_effect, effect_load_setup, "
+            "create_effect, delete_effect, set_effect, effect_load_setup, edit_effect_setup, "
             "timeline.delete_segments, timeline.move_track and timeline.shorten) runs behind a "
             "checkpoint of the whole sequence (timeline.checkpoint: a copy in the stash "
             "library flame_mcp_checkpoints) and hands back `journal` = {group, id, checkpoint, "
@@ -490,8 +515,12 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "uid and "
             "wiretap id and sits at the end of its reel (result.restored.selector). A plan.run "
             "that holds such a write is one checkpointed write on one sequence: one copy, one "
-            "journal.revert for the whole plan. desktop.delete copies what it deletes into the "
-            "same stash first and journal.revert(group) copies it back (new uid, end of the "
+            "journal.revert for the whole plan; a plan.run that holds a Batch write behind a "
+            "checkpoint (node.create, node.connect, batch.create_reel ...) is the same on one "
+            "Batch group (batch.iterate and batch.create_shelf_reel cannot be a step). "
+            "desktop.delete copies what it deletes "
+            "into the same stash first and journal.revert(group) copies it back (new uid, end "
+            "of the "
             "reel). desktop.reformat stashes each clip it reformats in place the same way, and "
             "journal.revert(group) restores the stashed copy (new uid, end of the reel; with "
             "duplicate=true it deletes the copy instead). "
@@ -499,10 +528,14 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "(dry_run by default; a real run needs the token of the dry run just before); a "
             "purged copy cannot be restored. "
             "segment.effect_save_setup only writes setup files (undo none: delete them by hand). "
-            "segment.create_connection, remove_connection and sync_connections leave no journal "
-            "record (journal.revert does not undo them, and a checkpoint of the target's "
-            "sequence does not cover connected segments in other sequences); result.inverse "
-            "is a presumed inverse call. "
+            "segment.create_connection, remove_connection and sync_connections each write an "
+            "intent to the journal but have no revert (journal.revert refuses them, and a "
+            "checkpoint of the target's sequence does not cover connected segments in other "
+            "sequences); result.inverse is a presumed inverse call. They are judged by a "
+            "read-back: no change is SILENT_NOOP, a change the wrong way is FLAME_API_ERROR. After "
+            "TIMEOUT or BRIDGE_LOST the server refuses writes until journal.check has read "
+            "segment.connections again (create and remove: landed / not_landed / diverged; "
+            "sync: always diverged, compare the segments by hand). "
             "segment.replace on a segment that has connected segments replaces theirs too, "
             "and journal.revert does not put those back (result.notices says how many)."
         ),
@@ -561,6 +594,8 @@ def _flame_version_info_sync(runtime: Runtime) -> dict[str, Any]:
         "inflight": {"count": inflight.count, "newest": inflight.newest},
         "journal": runtime.journal_summary(),
     }
+    if runtime.permissions is not None:
+        result["permissions"] = runtime.permissions
     env = envelope_mod.build_envelope(ok=True, result=result, duration_ms=_elapsed_ms(started))
     env["notices"].extend(notices)
     return env
@@ -698,6 +733,7 @@ def create_server(
     run_dir: Path | None = None,
     journal: Journal | None = None,
     hooks: TestHooks | None = None,
+    permissions: dict[str, Any] | None = None,
 ) -> Server[Any]:
     runtime = Runtime(
         registry=registry,
@@ -705,6 +741,7 @@ def create_server(
         journal=journal if journal is not None else Journal(),
         run_dir=run_dir,
         hooks=hooks if hooks is not None else TestHooks(),
+        permissions=permissions,
     )
 
     async def on_list_tools(

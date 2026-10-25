@@ -13,9 +13,10 @@ from typing import Any
 
 import pytest
 
+from flame_mcp import transport
 from flame_mcp.desktop_reformat_state import REFORMAT_WAIT_S, STASH_BATCH
 from flame_mcp.policy import Policy
-from journal_test_helpers import Rig
+from journal_test_helpers import Rig, bridge_result
 from reformat_helpers import (
     CLIPX,
     LIB_CLIP1,
@@ -31,6 +32,7 @@ from reformat_helpers import (
     reel,
     reel_names,
     reformat,
+    revert,
     stash_entries,
     touched_clips,
     uid,
@@ -339,6 +341,21 @@ def test_a_non_ascii_frame_rate_is_refused_and_nothing_is_sent(rig: Rig) -> None
     assert rig.exec.calls == []
 
 
+def test_a_pre_read_that_ends_pending_is_a_timeout_in_words_and_nothing_is_written(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def pending(code: str, thread: str, *args: object, **kwargs: object) -> object:
+        return bridge_result(pending_handle="h55")
+
+    monkeypatch.setattr(transport, "exec", pending)
+    env = reformat(rig)
+    assert env["ok"] is False and env["errorCode"] == "TIMEOUT", env
+    assert env["pending"] == {"handle": "h55"}
+    assert "None" not in env["error"] and "nothing was written" in env["error"]
+    assert "pending handle" in env["error"] and "journal.poll" in env["hint"]
+    assert rig.records() == []
+
+
 @pytest.mark.parametrize("count", [0, 51])
 def test_the_number_of_targets_is_one_to_fifty(rig: Rig, count: int) -> None:
     targets = [wt(f"/wt/RG/Reel 1/none{i}") for i in range(count)]
@@ -503,6 +520,7 @@ def test_a_start_frame_flame_did_not_apply_is_an_error_though_the_size_changed(r
     clip.start_frame_behavior = "noop"
     env = reformat(rig, start_frame=1001)
     assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:")
     assert "start_frame" in env["error"] and clip.width == 960
     assert env["journal"]["revert"] is not None
 
@@ -512,22 +530,30 @@ def test_a_change_start_frame_that_raises_is_reported(rig: Rig) -> None:
     clip.start_frame_behavior = "raise"
     env = reformat(rig, start_frame=1001)
     assert env["errorCode"] == "FLAME_API_ERROR" and "scripted change_start_frame" in env["error"]
+    assert env["error"].startswith("partial:") and env["journal"]["revert"] is not None
 
 
-def test_some_clips_failing_gives_a_partial_result_and_the_others_stay_reformatted(
+def test_some_clips_failing_is_a_partial_error_and_the_others_stay_reformatted(
     rig: Rig,
 ) -> None:
     a, b = rig.handles["a"], rig.handles["b"]
     a.reformat_behavior = "noop"
     env = reformat(rig, [CLIPX, wt(a.get_wiretap_node_id()), wt(b.get_wiretap_node_id())])
-    assert env["ok"] is True, env
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:")
     assert env["result"]["partial"] is True
     assert env["partial"] == {"reformatted": 2, "notReformatted": 1}
     assert [r["from"]["name"] for r in env["result"]["reformatted"]] == ["CLIPX", "B"]
     assert [r["from"]["name"] for r in env["result"]["notReformatted"]] == ["A"]
     assert env["result"]["notReformatted"][0]["errorCode"] == "SILENT_NOOP"
     assert (rig.handles["clipx"].width, a.width, b.width) == (960, 1280, 960)
-    assert env["affected"] == 2 and env["degraded"]
+    assert env["affected"] == 2 and env["journal"]["revert"] is not None
+    states = {i["group"]: i["state"] for i in rig.do("journal.list", {})["result"]["items"]}
+    assert states[env["journal"]["group"]] == "partial"
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    back = {str(c.name.get_value()): c.width for c in reel(rig).children}
+    assert (back["CLIPX"], back["B"], back["A"]) == (1920, 3840, 1280)
 
 
 def test_all_clips_failing_with_different_causes_is_a_flame_api_error(rig: Rig) -> None:
@@ -685,6 +711,96 @@ def test_a_frame_rate_flame_ignored_is_a_silent_noop(rig: Rig) -> None:
     rig.handles["clipx"].reformat_behavior = "noop"
     env = reformat(rig, width=1920, height=1080, frame_rate="25 fps")
     assert env["errorCode"] == "SILENT_NOOP", env
+
+
+def ignoring(clip: Any, key: str) -> None:
+    """The clip's `reformat` takes every argument but `key`; Flame can ignore a bit depth too."""
+    real = clip.reformat
+
+    def reformat_without(**kwargs: Any) -> None:
+        kwargs[key] = {"bit_depth": 0, "scan_mode": "", "frame_rate": "", "ratio": 0.0}[key]
+        real(**kwargs)
+
+    clip.reformat = reformat_without
+
+
+@pytest.mark.parametrize(
+    ("key", "extra"),
+    [
+        ("bit_depth", {"bit_depth": 16}),
+        ("scan_mode", {"scan_mode": "F1"}),
+        ("frame_rate", {"frame_rate": "25 fps"}),
+    ],
+)
+def test_a_value_flame_did_not_take_after_the_size_changed_is_a_partial_error(
+    rig: Rig, key: str, extra: dict[str, Any]
+) -> None:
+    clip = rig.handles["clipx"]
+    ignoring(clip, key)
+    env = reformat(rig, **extra)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and key in env["error"]
+    assert clip.width == 960
+    only = env["result"]["notReformatted"][0]
+    assert only["changed"] is True and only["after"]["width"] == 960
+    assert env["journal"]["revert"] is not None
+    outcome = first_record(rig, "outcome")
+    assert outcome["ok"] is False and outcome["verdict"] == "partial"
+    assert outcome["created"]["mode"] == "in_place"
+    states = {i["group"]: i["state"] for i in rig.do("journal.list", {})["result"]["items"]}
+    assert states[env["journal"]["group"]] == "partial"
+    out = revert(rig, env)
+    assert out["ok"] is True and clip_format(reel(rig).children[-1])["width"] == 1920
+
+
+def test_a_ratio_flame_did_not_take_after_the_size_changed_is_a_partial_error(rig: Rig) -> None:
+    clip = rig.handles["clipx"]
+    real = clip.reformat
+
+    def wrong_ratio(**kwargs: Any) -> None:
+        real(**kwargs)
+        clip.ratio = 1.0
+
+    clip.reformat = wrong_ratio
+    env = reformat(rig, allow_aspect_change=True)
+    assert env["ok"] is False and env["error"].startswith("partial:"), env
+    assert "ratio" in env["error"] and env["journal"]["revert"] is not None
+
+
+def test_only_the_start_frame_asked_and_flame_changed_nothing_is_a_silent_noop(rig: Rig) -> None:
+    clip = add_media_clip(reel(rig), "S", start_frame=1)
+    clip.start_frame_behavior = "noop"
+    env = reformat(
+        rig,
+        [wt(clip.get_wiretap_node_id())],
+        width=clip.width,
+        height=clip.height,
+        start_frame=1001,
+    )
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    assert env["journal"]["revert"] is None
+
+
+def test_a_start_frame_that_became_another_value_than_asked_is_a_partial_error(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip = add_media_clip(reel(rig), "S", start_frame=1)
+    real = clip.change_start_frame
+
+    def other(start_frame: int, use_segment_connections: bool = True) -> None:
+        real(start_frame + 5, use_segment_connections)
+
+    monkeypatch.setattr(clip, "change_start_frame", other)
+    env = reformat(
+        rig,
+        [wt(clip.get_wiretap_node_id())],
+        width=clip.width,
+        height=clip.height,
+        start_frame=1001,
+    )
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and "1006" in env["error"]
+    assert env["journal"]["revert"] is not None
 
 
 def test_a_scan_mode_only_reformat_is_applied_and_read_back(rig: Rig) -> None:

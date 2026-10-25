@@ -9,7 +9,8 @@ Checks: Editing a built sequence: `timeline.delete_segments` (ripple and lift, a
 clip left out of the stash reel), `timeline.move_track` (a track to the bottom and to the top, an
 empty track, the audio left alone), the audio reads of `timeline.info` and
 `timeline.list_segments`, `timeline.shorten` on a sequence with sound, `timeline.compare` of
-copies, and `segment.connections` of a segment that has none.
+copies, `segment.connections` of a segment that has none, and the `connections` that
+`timeline.list_segments` adds on request.
 
 Material: scripts/make_clip_media.sh, scripts/make_p2_media.sh and scripts/make_p2_av_media.sh
 (`p2_av72`: 72 frames with PCM audio, the one clip of the tests that has sound). The test sequences
@@ -25,8 +26,9 @@ journal directory is this run's own (`p3/journal_p36e_e2e_<ts>/`). No test hook 
 server.
 
 JUDGED steps (`ok` decides the run) are the ones whose outcome is fixed by the design or by what
-was measured on a real Flame beforehand. Every step of this run is JUDGED; none is only recorded
-(`kind: "observation"`, always ok). These steps are judged on a measurement (Flame
+was measured on a real Flame beforehand. Every step of this run is JUDGED except one that is only
+recorded (`kind: "observation"`, always ok): the `connections` of the Gap items in c3, which was
+not measured. These steps are judged on a measurement (Flame
 2025.2.4 and 2026.2.3): moving the track that holds the audio clip leaves the audio as it was (m11)
 and its revert, and the revert after moving another track (m10b, m11b); the lift that builds the
 measured case of `timeline.shorten` (s1), what a revert of a shorten brings back (s9b); a shorten
@@ -66,7 +68,9 @@ Stages (every case is a fresh sequence; `make_s`, `make_contiguous`, `make_effec
   q  timeline.compare: copies are equal, a deleted segment shows where it was, a shortened
      sequence differs from its original only at or after the new end and, in the audio, only by
      the cut ends of the segments that cross it (q3b), an extra track and the empty tracks.
-  c  segment.connections of segments with no connection.
+  c  segment.connections of segments with no connection; timeline.list_segments with
+     include_connections counts none for them (c3; the Gap items are only recorded), has no
+     `connections` key without the flag (c4) and refuses the flag with media='audio' (c5).
   y  a READONLY server denies the three writes and answers the two reads.
   z  cross-cutting checks (the JUDGED steps s2, s9b, q3 and q3b were recorded, by name: an
      observation of that name does not count); everything this run made is deleted; flame.exit().
@@ -216,7 +220,7 @@ async def async_main(ctx: Ctx) -> None:
 # -- --dry-run ----------------------------------------------------------------------------------
 
 EXPECTED_VALIDATION_FAILURES: Final[frozenset[str]] = frozenset()
-EXPECTED_REFUSALS: Final[frozenset[str]] = frozenset()
+EXPECTED_REFUSALS: Final[frozenset[str]] = frozenset({"c_list_connections_audio"})
 """Calls whose placeholder arguments the server itself refuses: what a stage sends in their place
 is what the run judges."""
 

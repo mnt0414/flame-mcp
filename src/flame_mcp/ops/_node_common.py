@@ -22,7 +22,10 @@ CHECKPOINTED_NODE_NOTE: Final[str] = (
     "nodes; it does NOT see attribute values, positions, links between inner nodes, reels, "
     "shelf reels or iterations, so `changed` reads false for a change made only of those. "
     "Native Undo is not used. "
-    "Not allowed in plan.run (it owns its journal group). " + RESTORE_SIDE_EFFECTS + " "
+    "In plan.run the step is bundled: the plan is one checkpointed write on the group, so the "
+    "step takes no checkpoint of its own and journal.revert(group) of the plan is one restore. "
+    + RESTORE_SIDE_EFFECTS
+    + " "
 )
 
 ROLE_TARGET: Final[str] = "the target"

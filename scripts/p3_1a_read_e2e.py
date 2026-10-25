@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Real-Flame end-to-end: the segment selector by `record_in` (with `expect_source_name`),
 `timeline.list_segments` with `effects`, `segment.list_effects`, `segment.shared_sources`,
-`desktop.find` and `desktop.info` (run with the `.venv` Python; `scripts/run_e2e.sh p3_1a_read`
-starts Flame; `--dry-run` connects to nothing and only lists the stages and compiles the code).
+`desktop.find`, `desktop.info` and the sizes `desktop.list_children` carries (run with the `.venv`
+Python; `scripts/run_e2e.sh p3_1a_read` starts Flame; `--dry-run` connects to nothing and only
+lists the stages and compiles the code).
 
 Checks: The segment selector by `record_in`, `timeline.list_segments` with effects,
-`segment.list_effects`, `segment.shared_sources`, `desktop.find` and `desktop.info`.
+`segment.list_effects`, `segment.shared_sources`, `desktop.find`, `desktop.info`, and the `width`,
+`height` and `bitDepth` that `desktop.list_children` returns for clips and sequences.
 
 The test sequences are made with the bit depth of the media, read from the clip: Flame puts a
 Resize on each segment of a sequence of another bit depth, and a new sequence otherwise gets the
@@ -53,6 +55,9 @@ Stages
      reel group, compared with transport's own reads.
   h  timeline.info (start time, size, audio), segment.info (type, head, tail, effects;
      attributes as structure), a Flame object value as {type}.
+  i  desktop.list_children: every clip of SRC and every sequence of SEQ carries width, height and
+     bitDepth equal to transport's own reads of that object (found by uid); the reels of RG carry
+     none of the three.
   g  the journal: every group of this run is landed / reverted, none unknown.
   z  cross-cutting checks; everything this run made is deleted; flame.exit().
 """
@@ -364,6 +369,21 @@ def _h4(ids: dict[str, Any]) -> dict[str, Any]:
     return {"target": wt(ids["s1Wt"]), "keys": keys}
 
 
+@call_for("i1_children_clips", "desktop.list_children")
+def _i1c(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["srcWt"]), "types": ["PyClip"], "limit": 100}
+
+
+@call_for("i1_children_sequences", "desktop.list_children")
+def _i1s(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["seqReelWt"]), "types": ["PySequence"], "limit": 100}
+
+
+@call_for("i1_children_reel_group", "desktop.list_children")
+def _i1g(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["rgWt"]), "limit": 100}
+
+
 # -- transport scaffolding (never through the op under test)
 
 PRELUDE: Final[str] = "\n".join(
@@ -555,6 +575,18 @@ REEL_CLIPS_CODE: Final[str] = "\n".join(
     ]
 )
 
+SIZE_CODE: Final[str] = "\n".join(
+    [
+        "_out = []",
+        "for _uid, _wt in @PAIRS@:",
+        "    _o = flame.find_by_uid(_uid) if _uid else flame.find_by_wiretap_node_id(_wt)",
+        "    _out.append({'uid': _uid, 'wt': _wt, 'type': type(_o).__name__,",
+        "                 'width': _g(lambda: _v(_o.width)), 'height': _g(lambda: _v(_o.height)),",
+        "                 'bitDepth': _g(lambda: _v(_o.bit_depth))})",
+        "_result = _out",
+    ]
+)
+
 CLEANUP_CODE: Final[str] = "\n".join(
     [
         "_p = @P@",
@@ -594,6 +626,7 @@ TEMPLATES: Final[dict[str, str]] = {
     "entry": ENTRY_CODE,
     "uid": UID_CODE,
     "reel_clips": REEL_CLIPS_CODE,
+    "size": SIZE_CODE,
     "cleanup": CLEANUP_CODE,
     "left": LEFT_CODE,
 }
@@ -1522,6 +1555,67 @@ async def stage_h(ctx: Ctx) -> None:
         )
 
 
+# -- i: desktop.list_children sizes
+
+SIZE_KEYS: Final[tuple[str, ...]] = ("width", "height", "bitDepth")
+
+
+def is_size(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+async def children_sizes(
+    session: Any, ctx: Ctx, call_id: str, reel_key: str, kind: str, tail: str
+) -> None:
+    env = await run_call(session, ctx, call_id)
+    items = items_of(env)
+    listed = await tx_val(ctx, fill(REEL_CLIPS_CODE, WT=ctx.ids[reel_key]), f"p31a_children_{tail}")
+    pairs = [[i.get("uid"), i.get("wiretapId")] for i in items]
+    sizes = await tx_val(ctx, fill(SIZE_CODE, PAIRS=pairs), f"p31a_sizes_{tail}")
+    transport_ok = isinstance(listed, list) and isinstance(sizes, list) and len(sizes) == len(items)
+    want = sorted(u for t, _n, u in listed if t == kind) if transport_ok else []
+    same = transport_ok and all(
+        is_size(s[k]) and i.get(k) == s[k]
+        for i, s in zip(items, sizes, strict=True)
+        for k in SIZE_KEYS
+    )
+    rec(
+        ctx,
+        f"i1_list_children_{tail}_carry_the_size_transport_reads",
+        env.get("ok") is True
+        and transport_ok
+        and bool(want)
+        and sorted(str(i.get("uid")) for i in items) == want
+        and _result_of(env).get("total") == len(want)
+        and all(i.get("type") == kind for i in items)
+        and same,
+        api=[(i.get("name"), [i.get(k) for k in SIZE_KEYS]) for i in items],
+        transport=sizes,
+        transportChildren=listed,
+        error=env.get("error"),
+    )
+
+
+async def stage_i(ctx: Ctx) -> None:
+    async with server_session(ctx, "p31a-i") as session:
+        await children_sizes(session, ctx, "i1_children_clips", "srcWt", "PyClip", "clips")
+        await children_sizes(
+            session, ctx, "i1_children_sequences", "seqReelWt", "PySequence", "sequences"
+        )
+        group = await run_call(session, ctx, "i1_children_reel_group")
+        items = items_of(group)
+        rec(
+            ctx,
+            "i1_list_children_reels_carry_no_size",
+            group.get("ok") is True
+            and {i.get("name") for i in items} >= {"SRC", "SEQ"}
+            and all(i.get("type") == "PyReel" for i in items)
+            and not any(k in i for i in items for k in SIZE_KEYS),
+            items=items,
+            error=group.get("error"),
+        )
+
+
 # -- g: the journal
 
 
@@ -1558,6 +1652,7 @@ async def stage_z(ctx: Ctx) -> None:
         "segment.shared_sources",
         "desktop.find",
         "desktop.info",
+        "desktop.list_children",
         "journal.revert",
         "timeline.info",
         "segment.get_attributes",
@@ -1599,6 +1694,7 @@ async def async_main(ctx: Ctx) -> None:
                 ("e", stage_e),
                 ("f", stage_f),
                 ("h", stage_h),
+                ("i", stage_i),
                 ("g", stage_g),
             ):
                 await guarded(ctx, name, stage)

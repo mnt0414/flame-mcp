@@ -48,7 +48,7 @@ from flame_mcp.journal import (
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.library_open import merge_library_reports
 from flame_mcp.timeline_restore import uid_chain
-from flame_mcp.types import ServerOpError, ServerResult
+from flame_mcp.types import ErrorCode, ServerOpError, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -392,6 +392,37 @@ def revert_flow(
     return ServerResult(result=result, affected=touched, journal=journal_ref)
 
 
+def failure_code(failures: list[dict[str, Any]]) -> ErrorCode:
+    """The code a revert of several steps ends in when some failed: an unknown end (TIMEOUT,
+    BRIDGE_LOST ...) first, since it is the one that needs `journal.check`; else the one code all
+    failures share; else CONFLICT."""
+    codes = [str(f["errorCode"]) for f in failures]
+    unknown = next((c for c in codes if c in UNKNOWN_END_CODES), None)
+    if unknown is not None:
+        return as_error_code(unknown)
+    return as_error_code(codes[0]) if len(set(codes)) == 1 else "CONFLICT"
+
+
+def unresolved_of(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The revert groups whose write ended without an answer: `journal.check` decides each."""
+    return [
+        {"group": f.get("group"), "errorCode": f["errorCode"]}
+        for f in failures
+        if f["errorCode"] in UNKNOWN_END_CODES
+    ]
+
+
+def unresolved_hint(unresolved: list[dict[str, Any]]) -> str | None:
+    if not unresolved:
+        return None
+    listed = ", ".join(repr(u["group"]) for u in unresolved)
+    return (
+        f"A revert step ended without an answer: it is not known whether it landed, and this "
+        f"server refuses writes until journal.check has read Flame again (group {listed}; "
+        "result.unresolved)."
+    )
+
+
 def revert_desktop_group(
     ctx: ServerContext, index: Index, group: str, views: list[IntentView]
 ) -> ServerResult:
@@ -404,11 +435,26 @@ _NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
 
 def observe(ctx: ServerContext, op_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run the op's Flame code in a read-only phase (its own; nothing is written). Not gated by
-    the policy: it only reads, like `journal.check`."""
+    the policy: it only reads, like `journal.check`.
+
+    A read the bridge answers with `pending` (ok, no result: the main thread is still busy, for
+    example inside the write being checked) read nothing. It is returned as a TIMEOUT, so that no
+    caller takes it for "looked, found nothing"."""
     op = ctx.registry.get(op_name)
     if op is None:
         return {"ok": False, "errorCode": "UNKNOWN_OPERATION", "error": f"'{op_name}' is missing"}
-    return execution.run_op(op, args, run_dir=ctx.run_dir)
+    env = execution.run_op(op, args, run_dir=ctx.run_dir)
+    pending = env.get("pending")
+    if env.get("ok") is True and pending is not None:
+        return {
+            **env,
+            "ok": False,
+            "errorCode": "TIMEOUT",
+            "error": f"'{op_name}' read did not finish: the main thread is still busy "
+            f"(pending handle {pending.get('handle')})",
+            "result": None,
+        }
+    return env
 
 
 def _check_revert_intent(ctx: ServerContext, view: IntentView) -> tuple[str, str, dict[str, Any]]:
@@ -565,7 +611,7 @@ def check_flow(
     revert_check: Callable[[ServerContext, IntentView], CheckVerdict],
 ) -> dict[str, Any]:
     """`journal.check` of a desktop intent with no outcome: read Flame again and decide. Writes
-    nothing to the project; the finding is appended to the journal and lifts the write door."""
+    nothing to the project; the finding is appended to the journal and lifts the write guard."""
     intent = view.intent
     entry: dict[str, Any] = {"group": view.group, "id": view.id, "op": intent.get("op")}
     if view.desktop_kind == KIND_DESKTOP_REVERT:

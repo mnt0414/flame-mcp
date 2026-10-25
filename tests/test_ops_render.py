@@ -16,7 +16,15 @@ from typing import Any
 
 import pytest
 
-from fake_media_tree import PyBatch, PyClip, PyRenderNode, PyWriteFileNode
+from fake_media_tree import (
+    FakeAttr,
+    PyBatch,
+    PyClip,
+    PyReel,
+    PyReelGroup,
+    PyRenderNode,
+    PyWriteFileNode,
+)
 from flame_mcp import render_files, transport
 from flame_mcp.journal import Index, IntentView
 from flame_mcp.policy import Policy
@@ -61,6 +69,19 @@ def add_writer(
         source = next(n for n in batch.nodes if n.name.get_value() == "blur1")
         batch.connect_nodes(source, "Default", writer, "Default")
     return writer
+
+
+def land_a_clip(rig: Rig) -> None:
+    """The default destination of a Render node is the shelf reel `Batch Renders`, which the fake
+    does not fill: have the render put one clip there, so a Render-node-only render has something
+    to read back (without it the render is SILENT_NOOP)."""
+    shelf = next(
+        (r for r in bg(rig).shelf_reels if r.name.get_value() == "Batch Renders"), None
+    ) or bg(rig).create_shelf_reel("Batch Renders")
+    assert shelf is not None
+    bg(rig).render_before_write = lambda batch: shelf._children.append(
+        PyClip("render1", wiretap_id="/w/render1")
+    )
 
 
 def render_records(rig: Rig) -> list[dict[str, Any]]:
@@ -552,6 +573,7 @@ def test_a_render_of_a_render_node_only_is_not_verified_on_disk(rig: Rig) -> Non
     node._owner = bg(rig)
     source = next(n for n in bg(rig).nodes if n.name.get_value() == "blur1")
     bg(rig).connect_nodes(source, "Default", node, "Default")
+    land_a_clip(rig)
     env = render(rig)
     assert env["ok"] is True, env
     result = env["result"]
@@ -561,14 +583,14 @@ def test_a_render_of_a_render_node_only_is_not_verified_on_disk(rig: Rig) -> Non
     assert env["partial"] is None
 
 
-def test_fewer_frames_than_planned_is_silent_noop_and_the_outcome_says_partial(
+def test_fewer_frames_than_planned_is_a_partial_flame_api_error_and_the_outcome_says_partial(
     rig: Rig, tmp_path: Path
 ) -> None:
     add_writer(rig, tmp_path, last=8)
     bg(rig).render_frames_limit = 5
     env = render(rig)
-    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
-    assert "5 of 8" in env["error"]
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and "5 of 8" in env["error"]
     result = env["result"]
     assert result["writtenFrames"] == 5 and result["verified"] is False
     row = result["nodes"][0]
@@ -578,7 +600,7 @@ def test_fewer_frames_than_planned_is_silent_noop_and_the_outcome_says_partial(
     assert env["partial"] == {"written": 5, "expected": 8}
     (outcome,) = outcomes(rig)
     assert outcome["ok"] is False and outcome["verdict"] == "partial"
-    assert outcome["errorCode"] == "SILENT_NOOP"
+    assert outcome["errorCode"] == "FLAME_API_ERROR"
     assert states(rig)[env["journal"]["group"]] == "partial"
     assert rig.runtime.guard.blocked() == []  # an answer, not a lost call
 
@@ -1096,15 +1118,16 @@ def test_a_render_that_raised_after_some_frames_reads_partial_by_the_handle(
 def test_a_render_that_returned_short_reads_like_render_batch_does(
     rig: Rig, tmp_path: Path, bridge: FakeBridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same judgement as `render.batch`'s own: returned True, fewer frames -> SILENT_NOOP;
-    returned False -> FLAME_API_ERROR; here as the check's renderOutcome."""
+    """The same judgement as `render.batch`'s own: returned True, some but fewer frames ->
+    FLAME_API_ERROR starting `partial:`; here as the check's renderOutcome."""
     add_writer(rig, tmp_path, last=8)
     bg(rig).render_frames_limit = 5
     group = pending_render(rig, bridge, monkeypatch, handle="ha")["journal"]["group"]
     entry = check(rig, group)
     assert entry["verdict"] == "partial"
     assert entry["renderOutcome"]["ok"] is False
-    assert entry["renderOutcome"]["errorCode"] == "SILENT_NOOP"
+    assert entry["renderOutcome"]["errorCode"] == "FLAME_API_ERROR"
+    assert entry["renderOutcome"]["error"].startswith("partial:")
     assert "5 of 8" in entry["renderOutcome"]["error"]
 
 
@@ -1114,7 +1137,10 @@ def test_the_check_and_the_run_judge_a_render_alike() -> None:
     done = {"returned": True}
     kwargs: dict[str, Any] = {"env_ok": True, "env_code": None, "env_error": None}
     short = judge_render(**kwargs, flame=done, written=5, expected=8, checked=True)
-    assert (short.ok, short.code) == (False, "SILENT_NOOP")
+    assert (short.ok, short.code) == (False, "FLAME_API_ERROR")
+    assert short.message is not None and short.message.startswith("partial:")
+    none = judge_render(**kwargs, flame=done, written=0, expected=8, checked=True)
+    assert (none.ok, none.code) == (False, "SILENT_NOOP")
     false_short = judge_render(
         **kwargs, flame={"returned": False}, written=5, expected=8, checked=True
     )
@@ -1145,6 +1171,7 @@ def test_a_render_node_only_intent_with_a_handle_is_landed_by_the_answer(
     node._owner = bg(rig)
     source = next(n for n in bg(rig).nodes if n.name.get_value() == "blur1")
     bg(rig).connect_nodes(source, "Default", node, "Default")
+    land_a_clip(rig)
     group = pending_render(rig, bridge, monkeypatch)["journal"]["group"]
     entry = check(rig, group)
     assert entry["verdict"] == "landed" and entry["basis"] == "handle"
@@ -1472,3 +1499,461 @@ def test_a_single_journal_group_per_render(rig: Rig, tmp_path: Path) -> None:
     render(rig, allow_overwrite=True)
     groups = Index(rig.journal.read_all().records).groups
     assert len(groups) == 2 and all(len(v) == 1 for v in groups.values())
+
+
+DESKTOP_REEL = "Batch Renders"
+
+
+def add_render_node(
+    rig: Rig,
+    name: str = "render1",
+    destination: list[str] | None = None,
+    *,
+    connected: bool = True,
+    bypass: bool = False,
+) -> PyRenderNode:
+    node = PyRenderNode(name, 1, 24)
+    if destination is not None:
+        node.destination.set_value(tuple(destination))
+    node.bypass.set_value(bypass)
+    batch = bg(rig)
+    batch.nodes.append(node)
+    node._owner = batch
+    if connected:
+        source = next(n for n in batch.nodes if n.name.get_value() == "blur1")
+        batch.connect_nodes(source, "Default", node, "Default")
+    return node
+
+
+def desktop_group(rig: Rig, name: str = "RG") -> PyReelGroup:
+    desktop = rig.flame.projects.current_project.current_workspace.desktop
+    group: PyReelGroup = next(g for g in desktop.reel_groups if g.name.get_value() == name)
+    return group
+
+
+def add_desktop_reel(rig: Rig, group: str = "RG", clips: tuple[str, ...] = ()) -> Any:
+    reel = desktop_group(rig, group).create_reel(DESKTOP_REEL)
+    for clip in clips:
+        reel._children.append(PyClip(clip, wiretap_id=f"/wt/{group}/{clip}"))
+    return reel
+
+
+def desktop_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in rows if r["kind"] == "desktop"]
+
+
+def test_a_render_node_aimed_at_a_desktop_reel_group_reports_the_clip_it_added(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    add_desktop_reel(rig, "RG", clips=("older",))
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    name = f"RG/{DESKTOP_REEL}"
+    assert result["newClips"] == [{"kind": "desktop", "name": name, "clips": ["render1"]}]
+    assert desktop_rows(result["reelsBefore"]) == [
+        {"kind": "desktop", "name": name, "clipCount": 1}
+    ]
+    assert desktop_rows(result["reelsAfter"]) == [{"kind": "desktop", "name": name, "clipCount": 2}]
+    assert result["verified"] is None
+    assert result["destinationUnsupported"] == []
+
+
+def test_a_desktop_reel_that_render_creates_counts_as_zero_clips_before(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    group = desktop_group(rig)
+    assert DESKTOP_REEL not in [r.name.get_value() for r in group.reels]
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    name = f"RG/{DESKTOP_REEL}"
+    assert desktop_rows(result["reelsBefore"]) == [
+        {"kind": "desktop", "name": name, "clipCount": 0, "missing": True}
+    ]
+    assert desktop_rows(result["reelsAfter"]) == [{"kind": "desktop", "name": name, "clipCount": 1}]
+    assert result["newClips"] == [{"kind": "desktop", "name": name, "clips": ["render1"]}]
+
+
+def test_two_render_nodes_aimed_at_one_desktop_reel_make_one_row(rig: Rig) -> None:
+    add_render_node(rig, "render1", ["Reel Groups", "RG"])
+    add_render_node(rig, "render2", ["Reel Groups", "RG"])
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert len(desktop_rows(result["reelsBefore"])) == 1
+    (row,) = result["newClips"]
+    assert row["name"] == f"RG/{DESKTOP_REEL}" and sorted(row["clips"]) == ["render1", "render2"]
+
+
+def test_a_desktop_reel_group_that_is_not_there_is_a_row_marked_group_missing(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "Nowhere"])
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert desktop_rows(result["reelsBefore"]) == [
+        {
+            "kind": "desktop",
+            "name": f"Nowhere/{DESKTOP_REEL}",
+            "clipCount": 0,
+            "missing": True,
+            "groupMissing": True,
+        }
+    ]
+    assert result["newClips"] == []
+
+
+def test_a_render_node_that_is_bypassed_or_unconnected_adds_no_desktop_row(rig: Rig) -> None:
+    add_render_node(rig, "render1", ["Reel Groups", "RG"], bypass=True)
+    add_render_node(rig, "render2", ["Reel Groups", "RG"], connected=False)
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert desktop_rows(plan["reels"]) == []
+
+
+def test_the_default_destination_adds_no_desktop_row_and_the_shelf_reel_is_still_counted(
+    rig: Rig, tmp_path: Path
+) -> None:
+    add_render_node(rig)
+    add_writer(rig, tmp_path, last=4)
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert desktop_rows(result["reelsBefore"]) == [] == desktop_rows(result["reelsAfter"])
+    assert result["destinationUnsupported"] == []
+    assert result["newClips"] == [
+        {"kind": "shelf", "name": "Batch Renders", "clips": ["writefile1"]}
+    ]
+
+
+def test_a_destination_kind_that_is_not_known_is_recorded_and_not_counted(rig: Rig) -> None:
+    add_render_node(rig, destination=["Libraries", "Lib"])
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["destinationUnsupported"] == [
+        {"node": "render1", "destination": ["Libraries", "Lib"]}
+    ]
+    assert desktop_rows(result["reelsBefore"]) == []
+    assert result["newClips"] == []
+
+
+def test_a_desktop_destination_that_writes_nothing_leaves_new_clips_empty(rig: Rig) -> None:
+    """Negative control: when the Desktop reel does not grow, nothing is invented -- newClips
+    stays empty and a Render-node-only render, whose reel can be read, is SILENT_NOOP."""
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    add_desktop_reel(rig, "RG", clips=("older",))
+    bg(rig).render_desktop_writes = False
+    env = render(rig)
+    assert env["ok"] is False and env["errorCode"] == "SILENT_NOOP", env
+    result = env["result"]
+    assert result["newClips"] == []
+    assert desktop_rows(result["reelsBefore"]) == [
+        {"kind": "desktop", "name": f"RG/{DESKTOP_REEL}", "clipCount": 1}
+    ]
+    assert result["reelsBefore"] == result["reelsAfter"]
+    assert result["verified"] is None and env["partial"] is None
+
+
+def test_the_plan_names_the_desktop_reel_a_render_node_writes_to(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    add_desktop_reel(rig, "RG", clips=("a", "b"))
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    (node,) = plan["nodes"]
+    assert node["destinationReel"] == {
+        "kind": "desktop",
+        "group": "RG",
+        "reel": DESKTOP_REEL,
+        "exists": True,
+        "clipCount": 2,
+    }
+    assert "destinationReel" in node["output"] and "Desktop" in node["output"]
+    assert {"kind": "desktop", "name": f"RG/{DESKTOP_REEL}", "clipCount": 2} in plan["reels"]
+    assert plan["destinationUnsupported"] == []
+
+
+def test_the_plan_says_the_desktop_reel_does_not_exist_yet(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    (node,) = rig.do("render.plan", {"target": BG1})["result"]["nodes"]
+    assert node["destinationReel"] == {
+        "kind": "desktop",
+        "group": "RG",
+        "reel": DESKTOP_REEL,
+        "exists": False,
+        "clipCount": 0,
+    }
+
+
+def test_the_plan_says_the_desktop_reel_group_does_not_exist(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "Nowhere"])
+    (node,) = rig.do("render.plan", {"target": BG1})["result"]["nodes"]
+    assert node["destinationReel"] == {
+        "kind": "desktop",
+        "group": "Nowhere",
+        "reel": DESKTOP_REEL,
+        "exists": False,
+        "clipCount": 0,
+        "groupMissing": True,
+    }
+
+
+NAMED_REEL = "Reel 1"
+
+
+def named_reel_clips(rig: Rig, group: str = "RG", reel: str = NAMED_REEL) -> list[str]:
+    found = next(r for r in desktop_group(rig, group).reels if r.name.get_value() == reel)
+    return [str(c.name.get_value()) for c in found._children]
+
+
+def test_the_plan_follows_the_reel_a_three_element_destination_names(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG", NAMED_REEL])
+    held = len(named_reel_clips(rig))
+    reel = next(r for r in desktop_group(rig).reels if r.name.get_value() == NAMED_REEL)
+    reel._children.append(PyClip("older", wiretap_id="/wt/RG/older"))
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    (node,) = plan["nodes"]
+    assert node["destination"] == ["Reel Groups", "RG", NAMED_REEL]
+    assert node["destinationReel"] == {
+        "kind": "desktop",
+        "group": "RG",
+        "reel": NAMED_REEL,
+        "exists": True,
+        "clipCount": held + 1,
+    }
+    assert {"kind": "desktop", "name": f"RG/{NAMED_REEL}", "clipCount": held + 1} in plan["reels"]
+    assert plan["destinationUnsupported"] == []
+
+
+def test_a_render_node_with_a_three_element_destination_lands_in_the_reel_it_names(
+    rig: Rig,
+) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG", NAMED_REEL])
+    held = len(named_reel_clips(rig))
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    name = f"RG/{NAMED_REEL}"
+    assert result["newClips"] == [{"kind": "desktop", "name": name, "clips": ["render1"]}]
+    assert desktop_rows(result["reelsBefore"]) == [
+        {"kind": "desktop", "name": name, "clipCount": held}
+    ]
+    assert desktop_rows(result["reelsAfter"]) == [
+        {"kind": "desktop", "name": name, "clipCount": held + 1}
+    ]
+    assert named_reel_clips(rig)[-1] == "render1"
+    assert DESKTOP_REEL not in [r.name.get_value() for r in desktop_group(rig).reels]
+
+
+def test_a_two_element_destination_still_lands_in_batch_renders(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    before = named_reel_clips(rig)
+    env = render(rig)
+    assert env["ok"] is True, env
+    assert env["result"]["newClips"] == [
+        {"kind": "desktop", "name": f"RG/{DESKTOP_REEL}", "clips": ["render1"]}
+    ]
+    assert named_reel_clips(rig) == before
+
+
+def test_two_and_three_element_destinations_of_one_reel_share_one_desktop_row(rig: Rig) -> None:
+    add_render_node(rig, "render1", destination=["Reel Groups", "RG"])
+    add_render_node(rig, "render2", destination=["Reel Groups", "RG", DESKTOP_REEL])
+    add_desktop_reel(rig, "RG")
+    name = f"RG/{DESKTOP_REEL}"
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert [r for r in desktop_rows(plan["reels"]) if r["name"] == name] == [
+        {"kind": "desktop", "name": name, "clipCount": 0}
+    ]
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert len(result["newClips"]) == 1
+    (row,) = result["newClips"]
+    assert row["kind"] == "desktop" and row["name"] == name
+    assert sorted(row["clips"]) == ["render1", "render2"]
+    assert desktop_rows(result["reelsBefore"]) == [
+        {"kind": "desktop", "name": name, "clipCount": 0}
+    ]
+    assert desktop_rows(result["reelsAfter"]) == [{"kind": "desktop", "name": name, "clipCount": 2}]
+
+
+def test_a_two_element_destination_and_a_named_reel_make_two_desktop_rows(rig: Rig) -> None:
+    add_render_node(rig, "render1", destination=["Reel Groups", "RG"])
+    add_render_node(rig, "render2", destination=["Reel Groups", "RG", NAMED_REEL])
+    held = len(named_reel_clips(rig))
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    by_name = {r["name"]: r["clips"] for r in result["newClips"]}
+    assert by_name == {f"RG/{DESKTOP_REEL}": ["render1"], f"RG/{NAMED_REEL}": ["render2"]}
+    assert {r["name"]: r["clipCount"] for r in desktop_rows(result["reelsAfter"])} == {
+        f"RG/{DESKTOP_REEL}": 1,
+        f"RG/{NAMED_REEL}": held + 1,
+    }
+    assert len(desktop_rows(result["reelsBefore"])) == 2
+
+
+def test_the_plan_names_the_shelf_reel_of_the_default_destination(rig: Rig) -> None:
+    add_render_node(rig)
+    bg(rig).create_shelf_reel("Batch Renders")
+    (node,) = rig.do("render.plan", {"target": BG1})["result"]["nodes"]
+    assert node["destinationReel"] == {
+        "kind": "shelf",
+        "group": None,
+        "reel": "Batch Renders",
+        "exists": True,
+        "clipCount": 0,
+    }
+
+
+def test_the_plan_lists_a_destination_kind_it_cannot_follow(rig: Rig) -> None:
+    add_render_node(rig, destination=["Libraries", "Lib"])
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert plan["nodes"][0]["destinationReel"] is None
+    assert plan["destinationUnsupported"] == [
+        {"node": "render1", "destination": ["Libraries", "Lib"]}
+    ]
+
+
+def test_check_by_disk_reads_landed_when_the_desktop_reel_gained_a_clip(rig: Rig) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    rig.exec.fault("render.batch", "BRIDGE_LOST", when="before")
+    group = render(rig)["journal"]["group"]
+    (entry,) = rig.do("journal.check", {"group": group})["result"]["checked"]
+    assert entry["verdict"] == "not_landed" and "no reel" in entry["detail"]
+    reel = add_desktop_reel(rig, "RG", clips=("x",))  # Flame made the reel, with a clip
+    rig.exec.fault("render.batch", "BRIDGE_LOST", when="before")
+    group2 = render(rig)["journal"]["group"]
+    reel._children.append(PyClip("y", wiretap_id="/wt/RG/y"))
+    (entry2,) = rig.do("journal.check", {"group": group2})["result"]["checked"]
+    assert entry2["verdict"] == "landed" and "more clips" in entry2["detail"]
+
+
+def test_check_by_disk_reads_landed_when_the_desktop_reel_was_created_by_the_render(
+    rig: Rig,
+) -> None:
+    add_render_node(rig, destination=["Reel Groups", "RG"])
+    rig.exec.fault("render.batch", "BRIDGE_LOST", when="before")
+    group = render(rig)["journal"]["group"]
+    add_desktop_reel(rig, "RG", clips=("x",))
+    (entry,) = rig.do("journal.check", {"group": group})["result"]["checked"]
+    assert entry["verdict"] == "landed" and entry["basis"] == "disk"
+
+
+def test_the_requires_name_the_desktop_reading_apis(rig: Rig) -> None:
+    for name in ("render.plan", "render.batch"):
+        op = rig.registry.get(name)
+        assert op is not None
+        for symbol in (
+            "flame.projects",
+            "PyProject.current_workspace",
+            "PyWorkspace.desktop",
+            "PyDesktop.reel_groups",
+            "PyReelGroup.reels",
+            "PyReelGroup.name",
+            "PyReel.name",
+        ):
+            assert symbol in op.requires, (name, symbol)
+
+
+def test_the_fake_destination_is_a_tuple_and_refuses_a_list() -> None:
+    node = PyRenderNode("render1", 1, 24)
+    assert node.destination.get_value() == ("Batch Reels", "Batch Renders")
+    with pytest.raises(RuntimeError, match=r"Wrong input type\. Check values property for help\."):
+        node.destination.set_value(["Reel Groups", "RG"])
+    with pytest.raises(RuntimeError, match="Wrong input type"):
+        node.destination = ["Reel Groups", "RG"]
+    node.destination = ("Reel Groups", "RG")
+    assert node.destination.get_value() == ("Reel Groups", "RG")
+
+
+def test_a_tuple_destination_is_read_as_a_list_and_followed(rig: Rig) -> None:
+    node = add_render_node(rig, destination=["Reel Groups", "RG"])
+    assert isinstance(node.destination.get_value(), tuple)
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert plan["nodes"][0]["destination"] == ["Reel Groups", "RG"]
+    assert plan["nodes"][0]["destinationReel"]["group"] == "RG"
+    assert len(desktop_rows(plan["reels"])) == 1
+
+
+def test_a_destination_that_could_not_be_read_is_unsupported_and_marked_unread(rig: Rig) -> None:
+    node = add_render_node(rig)
+    node.__dict__["destination"] = FakeAttr(None)
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert plan["destinationUnsupported"] == [
+        {"node": "render1", "destination": None, "unread": True}
+    ]
+    assert plan["nodes"][0]["destinationReel"] is None
+    assert desktop_rows(plan["reels"]) == []
+
+
+def test_a_destination_whose_name_is_not_a_string_is_unsupported(rig: Rig) -> None:
+    node = add_render_node(rig)
+    node.__dict__["destination"] = FakeAttr(("Reel Groups", None))
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    assert plan["destinationUnsupported"] == [
+        {"node": "render1", "destination": ["Reel Groups", None]}
+    ]
+    assert desktop_rows(plan["reels"]) == []
+
+
+class UnreadableReel(PyReel):
+    """A reel whose clips cannot be read while `readable` is False."""
+
+    readable = True
+
+    @property
+    def clips(self) -> list[Any]:
+        if not self.readable:
+            raise RuntimeError("cannot read the clips")
+        return super().clips
+
+
+def unreadable_shelf_reel(rig: Rig) -> UnreadableReel:
+    reel = bg(rig).create_shelf_reel("Batch Renders")
+    reel.__class__ = UnreadableReel
+    assert isinstance(reel, UnreadableReel)
+    reel.readable = False
+    return reel
+
+
+def test_a_reel_that_could_not_be_read_before_the_render_is_not_counted_as_gaining_clips(
+    rig: Rig, tmp_path: Path
+) -> None:
+    reel = unreadable_shelf_reel(rig)
+    bg(rig).render_before_write = lambda _batch: setattr(reel, "readable", True)
+    add_writer(rig, tmp_path, last=4)
+    env = render(rig)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["newClips"] == []
+    assert result["newClipsUnknown"] == [{"kind": "shelf", "name": "Batch Renders"}]
+    before = [r for r in result["reelsBefore"] if r["kind"] == "shelf"]
+    assert before == [{"kind": "shelf", "name": "Batch Renders", "clipCount": None}]
+
+
+def test_a_reel_that_was_readable_is_not_listed_as_unknown(rig: Rig, tmp_path: Path) -> None:
+    add_writer(rig, tmp_path, last=4)
+    env = render(rig)
+    assert env["result"]["newClipsUnknown"] == []
+
+
+def test_check_by_disk_does_not_take_a_reel_that_was_unread_before_as_grown(
+    rig: Rig,
+) -> None:
+    add_render_node(rig)
+    reel = unreadable_shelf_reel(rig)
+    rig.exec.fault("render.batch", "BRIDGE_LOST", when="before")
+    group = render(rig)["journal"]["group"]
+    reel.readable = True
+    reel._children.append(PyClip("x", wiretap_id="/w/x"))
+    (entry,) = rig.do("journal.check", {"group": group})["result"]["checked"]
+    assert entry["verdict"] == "not_landed" and "no reel" in entry["detail"]
+
+
+def test_the_descriptions_say_destination_reel_is_a_prediction_and_newclips_is_the_proof(
+    rig: Rig,
+) -> None:
+    for name in ("render.plan", "render.batch"):
+        op = rig.registry.get(name)
+        assert op is not None
+        assert "destinationReel is a prediction" in op.description, name
+        assert "Flame chooses the name of a Desktop reel" in op.description, name
+        assert "result.newClips" in op.description, name

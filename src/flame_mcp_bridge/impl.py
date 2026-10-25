@@ -31,11 +31,12 @@ import platform
 import queue
 import re
 import socket
+import stat
 import threading
 import time
 import traceback
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -59,12 +60,21 @@ ACCEPT_POLL_S: Final[float] = 1.0
 LISTEN_BACKLOG: Final[int] = 64
 RUN_DIR_MODE: Final[int] = 0o700
 SOCK_MODE: Final[int] = 0o600
+RESULT_FILE_MODE: Final[int] = 0o600
 RECV_CHUNK: Final[int] = 65536
 RESULT_FILE_MAX_AGE_S: Final[float] = 24 * 60 * 60
 MAX_CONNECTIONS: Final[int] = 32
 CONNECTION_IDLE_TIMEOUT_S: Final[float] = 300.0
 LOG_FILE_MODE: Final[int] = 0o600
-LOG_DIR_MODE: Final[int] = 0o700
+HARDEN_FILE_MODE: Final[int] = 0o600
+# The directories below the flame-mcp directory that flame-mcp itself uses; they are tightened
+# with everything in them at startup. Anything else there is left as it is; it is out of other
+# users' reach once the flame-mcp directory itself is 0700.
+APP_TREES: Final[tuple[str, ...]] = ("run", "journal", "spill", "logs", "bridge")
+# start() runs on Flame's main thread, so the walk is capped by entries and by time.
+HARDEN_MAX_ENTRIES: Final[int] = 20_000
+HARDEN_BUDGET_S: Final[float] = 1.0
+MAX_LOGGED_FAILURES: Final[int] = 20
 LOG_BACKUP_COUNT: Final[int] = 3
 # Main-thread relay tick interval. Handler threads enqueue onto `_relay_queue`;
 # this QTimer (created in `Bridge.start()`, main thread only) is the only thing
@@ -76,15 +86,19 @@ RELAY_INTERVAL_MS: Final[int] = 10
 STOP_HANDLER_JOIN_TOTAL_S: Final[float] = 1.0
 
 
+def _default_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "flame-mcp"
+
+
 def _default_run_dir() -> Path:
     override = os.environ.get("FLAME_MCP_RUN_DIR")
     if override:
         return Path(override)
-    return Path.home() / "Library" / "Application Support" / "flame-mcp" / "run"
+    return _default_root() / "run"
 
 
 def _default_log_path() -> Path:
-    return Path.home() / "Library" / "Application Support" / "flame-mcp" / "logs" / "bridge.log"
+    return _default_root() / "logs" / "bridge.log"
 
 
 class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -114,13 +128,178 @@ def _tighten_log_files(log_path: Path, backup_count: int) -> None:
             pass  # missing, or not ours: logging itself must still come up
 
 
+def _make_private_dirs(directory: Path) -> None:
+    """Make `directory` and every missing parent with mode 0700; one that exists is not touched.
+    `os.makedirs(mode=...)` and `Path.mkdir(parents=True, mode=...)` give the parents 0777 minus
+    the umask, and Flame runs with umask 0."""
+    missing: list[Path] = []
+    probe = directory
+    while not probe.is_dir():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for path in reversed(missing):
+        try:
+            os.mkdir(path, RUN_DIR_MODE)
+        except FileExistsError:
+            if path.is_dir():
+                continue
+            raise
+        os.chmod(path, RUN_DIR_MODE)
+
+
+_CHMOD_NOFOLLOW: Final[bool] = os.chmod in os.supports_follow_symlinks
+
+
+def _harden_app_dir(
+    root: Path,
+    logger: logging.Logger,
+    *,
+    extra_dirs: Sequence[Path] = (),
+    max_entries: int = HARDEN_MAX_ENTRIES,
+    budget_s: float = HARDEN_BUDGET_S,
+) -> dict[str, Any]:
+    """Makes the flame-mcp directory 0700, and the directories in `APP_TREES` (and any of
+    `extra_dirs` that lie inside `root`) 0700 with every file in them 0600.
+
+    This is a copy of `flame_mcp.private_fs.harden_app_dir` (the bridge is deployed alone into
+    Flame and cannot import the server package); tests/test_private_fs.py holds both to the same
+    tests. Only what the user owns is changed. A link is not followed and not changed, a socket
+    or pipe is left as it is, nothing outside `root`'s device is entered, and no content is
+    changed. A failed chmod is logged and counted, and the walk goes on. The walk stops once
+    `max_entries` entries have been changed (what already has the right mode is not counted, so
+    the next start gets past what an earlier one fixed) or after `budget_s` seconds, and says so.
+    Returns the counts.
+    """
+    report: dict[str, Any] = {
+        "root": str(root),
+        "checked": 0,
+        "fixed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "truncated": False,
+    }
+    uid = os.getuid()
+    deadline = time.monotonic() + budget_s
+    changes = 0
+    logged_failures = 0
+    device: int | None = None
+
+    def out_of_budget() -> bool:
+        if changes >= max_entries:
+            reason = f"{max_entries} entries changed"
+        elif time.monotonic() > deadline:
+            reason = "out of time"
+        else:
+            return False
+        if not report["truncated"]:
+            report["truncated"] = True
+            logger.warning(
+                "permissions: stopped after changing %d entries (%s); the rest is checked at the "
+                "next start",
+                changes,
+                reason,
+            )
+        return True
+
+    def tighten(path: str, st: os.stat_result) -> bool:
+        # True if `path` is a directory to descend into
+        nonlocal device, logged_failures, changes
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != uid:
+            report["skipped"] += 1
+            return False
+        if stat.S_ISDIR(st.st_mode):
+            want = RUN_DIR_MODE
+        elif stat.S_ISREG(st.st_mode):
+            want = HARDEN_FILE_MODE
+        else:
+            return False
+        if device is None:
+            device = st.st_dev
+        elif st.st_dev != device:
+            report["skipped"] += 1
+            return False
+        report["checked"] += 1
+        if stat.S_IMODE(st.st_mode) != want:
+            changes += 1
+            try:
+                if _CHMOD_NOFOLLOW:
+                    os.chmod(path, want, follow_symlinks=False)
+                else:
+                    os.chmod(path, want)
+            except OSError as exc:
+                report["failed"] += 1
+                if logged_failures < MAX_LOGGED_FAILURES:
+                    logged_failures += 1
+                    logger.warning("permissions: could not chmod %s to %04o: %s", path, want, exc)
+            else:
+                report["fixed"] += 1
+        return want == RUN_DIR_MODE
+
+    def enter(top: Path, recurse: bool) -> bool:
+        if out_of_budget():
+            return False
+        try:
+            st = os.lstat(top)
+        except OSError:
+            return False
+        descend = tighten(str(top), st)
+        if descend and recurse:
+            stack = [str(top)]
+            while stack:
+                directory = stack.pop()
+                try:
+                    with os.scandir(directory) as entries:
+                        children = list(entries)
+                except OSError as exc:
+                    logger.warning("permissions: could not list %s: %s", directory, exc)
+                    continue
+                for child in children:
+                    if out_of_budget():
+                        return descend
+                    try:
+                        child_st = child.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if tighten(child.path, child_st) and stat.S_ISDIR(child_st.st_mode):
+                        stack.append(child.path)
+        return descend
+
+    if enter(root, False):
+        root_abs = os.path.abspath(root)
+        tops = [root / name for name in APP_TREES]
+        for extra in extra_dirs:
+            extra_abs = os.path.abspath(extra)
+            if extra_abs == root_abs or os.path.commonpath([root_abs, extra_abs]) != root_abs:
+                continue
+            if any(
+                os.path.commonpath([os.path.abspath(t), extra_abs]) == os.path.abspath(t)
+                for t in tops
+            ):
+                continue
+            tops.append(extra)
+        for top in tops:
+            enter(top, True)
+    if report["fixed"] or report["failed"]:
+        logger.info(
+            "permissions: fixed %d, failed %d, skipped %d, checked %d under %s",
+            report["fixed"],
+            report["failed"],
+            report["skipped"],
+            report["checked"],
+            report["root"],
+        )
+    return report
+
+
 def _make_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger(_LOGGER_NAME)
     logger.setLevel(logging.INFO)
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
-    log_path.parent.mkdir(parents=True, exist_ok=True, mode=LOG_DIR_MODE)
+    _make_private_dirs(log_path.parent)
     _tighten_log_files(log_path, LOG_BACKUP_COUNT)
     file_handler = _PrivateRotatingFileHandler(
         str(log_path), maxBytes=2_000_000, backupCount=LOG_BACKUP_COUNT
@@ -224,7 +403,9 @@ class Bridge:
         results_dir: Path | None = None,
         log_path: Path | None = None,
         make_timer: Callable[[], _TimerProtocol] | None = None,
+        app_root: Path | None = None,
     ) -> None:
+        self._app_root = app_root
         self._schedule = schedule
         self._flame = flame_module
         self._version = version
@@ -242,7 +423,9 @@ class Bridge:
         self._pending_lock = threading.Lock()
         self._bound_dev_ino: tuple[int, int] | None = None
         self._started = False
-        self._logger = _make_logger(log_path if log_path is not None else _default_log_path())
+        effective_log_path = log_path if log_path is not None else _default_log_path()
+        self._log_dir = effective_log_path.parent
+        self._logger = _make_logger(effective_log_path)
         self._connections: set[socket.socket] = set()
         # Which handler thread owns each live connection, so stop() can join them
         # (bounded) instead of closing out from under a handler that is still
@@ -267,8 +450,14 @@ class Bridge:
     def start(self) -> None:
         if self._started:
             return
-        os.makedirs(self._run_dir, exist_ok=True)
+        _make_private_dirs(self._run_dir)
         os.chmod(self._run_dir, RUN_DIR_MODE)
+        if self._app_root is not None:
+            _harden_app_dir(
+                self._app_root,
+                self._logger,
+                extra_dirs=[self._run_dir, self._results_dir, self._log_dir],
+            )
         sock_path = self._run_dir / f"flame-mcp-{self._version}.sock"
         encoded = str(sock_path).encode("utf-8")
         if len(encoded) > MAX_SOCK_PATH_BYTES:
@@ -297,7 +486,7 @@ class Bridge:
         self._bound_dev_ino = (stat_result.st_dev, stat_result.st_ino)
         self._sock_path = sock_path
         self._listener = listener
-        self._results_dir.mkdir(parents=True, exist_ok=True)
+        _make_private_dirs(self._results_dir)
         os.chmod(self._results_dir, RUN_DIR_MODE)
         self._cleanup_stale_results()
         self._relay_queue = queue.SimpleQueue()
@@ -909,10 +1098,15 @@ class Bridge:
         state.event.set()
 
     def _write_result_file(self, handle: str, response: dict[str, Any]) -> None:
-        self._results_dir.mkdir(parents=True, exist_ok=True)
+        _make_private_dirs(self._results_dir)
         final_path = self._results_dir / f"{handle}.json"
         tmp_path = self._results_dir / f".{handle}.json.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, RESULT_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(response, f)
         os.replace(tmp_path, final_path)
 
@@ -936,6 +1130,7 @@ def start(
         results_dir=Path(results_dir) if results_dir else None,
         log_path=Path(log_path) if log_path else None,
         make_timer=make_timer,
+        app_root=_default_root() if not (run_dir or results_dir or log_path) else None,
     )
     bridge.start()
     return bridge

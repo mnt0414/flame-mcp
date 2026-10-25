@@ -1,6 +1,7 @@
 """Stages d, m and g of the plan / delete real-Flame e2e: desktop.delete (clips, sequences, a list,
-a library clip refused, what the Timeline shows, the refusals, a parent that is gone), the Timeline
-after a desktop.move, and journal.purge_checkpoints; see p3_2b_plan_delete_e2e.py."""
+an empty reel, a library clip refused, what the Timeline shows, the refusals, a parent that is
+gone), the Timeline after a desktop.move, and journal.purge_checkpoints; see
+p3_2b_plan_delete_e2e.py."""
 
 from __future__ import annotations
 
@@ -41,6 +42,19 @@ from p3_2b_e2e_common import (  # noqa: E402
     tx_struct,
     uids_of,
 )
+
+GROUP_REELS_CODE = "\n".join(
+    [
+        "_g = flame.find_by_wiretap_node_id(@RG@)",
+        "_result = [[_v(_r.name), _v(_r.uid), len(list(_r.children))] for _r in _g.reels]",
+    ]
+)
+
+
+async def group_reels(ctx: Ctx) -> list[list[Any]] | None:
+    """[name, uid, child count] of every reel of the test reel group, read by transport."""
+    got = await tx_val(ctx, fill(GROUP_REELS_CODE, RG=ctx.ids["rgWt"]), "p32b_group_reels")
+    return None if isinstance(got, str) else got
 
 
 async def make_copies(ctx: Ctx, specs: list[tuple[str, str]], dest_wt: str) -> list[dict[str, Any]]:
@@ -169,7 +183,60 @@ async def stage_d(ctx: Ctx) -> None:
         await library_clip_is_refused(session, ctx, lib_clip, ids["libReelWt"])
         await shown_cases(session, ctx, del_wt)
         await refusals(session, ctx, del_wt)
+        await empty_reel_case(session, ctx)
         await parent_gone(session, ctx)
+
+
+async def empty_reel_case(session: Any, ctx: Ctx) -> None:
+    wt = await make_reel(ctx, "EMPTYR")
+    if wt is None:
+        return
+    name = name_of(ctx, "EMPTYR")
+    before = await group_reels(ctx) or []
+    old = next((r for r in before if r[0] == name), None)
+    rec(ctx, "d9_prepare_an_empty_reel", old is not None and old[2] == 0, reels=before)
+    if old is None:
+        return
+    stash0 = stash_rows(await tx_stash(ctx))
+    checkpoints0 = len(checkpoint_records(ctx))
+    env = await run_call(session, ctx, "d_delete", case={"targets": [wt]})
+    gone = await group_reels(ctx) or []
+    rec(
+        ctx,
+        "d9_an_empty_reel_is_deleted_without_a_stash",
+        env.get("ok") is True
+        and all(r[0] != name for r in gone)
+        and await tx_find_uid(ctx, old[1]) is None
+        and stash_rows(await tx_stash(ctx)) == stash0
+        and len(checkpoint_records(ctx)) == checkpoints0,
+        error=env.get("error"),
+        reelsAfter=[r[0] for r in gone],
+    )
+    back = await revert(session, ctx, env)
+    after = await group_reels(ctx) or []
+    made = next((r for r in after if r[0] == name), None)
+    rec(
+        ctx,
+        "d9_revert_makes_a_new_empty_reel_of_the_same_name",
+        back.get("ok") is True and made is not None and made[1] != old[1] and made[2] == 0,
+        error=back.get("error"),
+        reelsAfter=[r[0] for r in after],
+    )
+    observe(
+        ctx,
+        "d9_where_the_reel_came_back",
+        positionBefore=[r[0] for r in before].index(name),
+        positionAfter=[r[0] for r in after].index(name) if made is not None else None,
+        reelCount=len(after),
+    )
+    again = await revert(session, ctx, env)
+    rec(
+        ctx,
+        "d9_a_second_revert_does_not_make_another_reel",
+        again.get("ok") is False
+        and len([r for r in (await group_reels(ctx) or []) if r[0] == name]) == 1,
+        error=again.get("error"),
+    )
 
 
 async def shown_cases(session: Any, ctx: Ctx, del_wt: str) -> None:
@@ -245,8 +312,8 @@ async def refusals(session: Any, ctx: Ctx, del_wt: str) -> None:
     )
     stash = stash_rows(await tx_stash(ctx))
     cases: list[tuple[str, list[str], str, str]] = [
-        ("d7_a_reel", [del_wt], "PRECONDITION_UNMET", "only a clip or a sequence"),
-        ("d7_a_reel_group", [ids["rgWt"]], "PRECONDITION_UNMET", "only a clip or a sequence"),
+        ("d7_a_reel_with_a_clip", [del_wt], "PRECONDITION_UNMET", "only an empty reel"),
+        ("d7_a_reel_group", [ids["rgWt"]], "PRECONDITION_UNMET", "empty reel"),
         (
             "d7_the_stash_library_entry",
             [stash[-1][4]] if stash else [],

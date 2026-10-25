@@ -166,15 +166,18 @@ def _ts_create(parent, name, tracks, rate, width, height, start_tc, expected, bi
         if type(made).__name__ != 'PySequence':
             out['warnings'].append('the new entry is a ' + type(made).__name__)
         out['sequence'] = _ts_facts(made, want_start)
-        out['warnings'] += [
-            'read-back differs: ' + m
-            for m in _ts_mismatches(out['sequence'], rate, width, height, tracks, bit_depth)
-        ]
         out['state'] = _dm_state(made)
         if len(new) > 1:
             out['warnings'].append(
                 str(len(new)) + ' new entries appeared; the one Flame answered is taken'
             )
+        gaps = _ts_mismatches(out['sequence'], rate, width, height, tracks, bit_depth)
+        if gaps:
+            out['error'] = (
+                'partial: the sequence was made but not all as asked (read back): '
+                + '; '.join(gaps) + '. It is recorded: journal.revert deletes it'
+            )
+            out['errorCode'] = 'FLAME_API_ERROR'
     except BaseException as exc:
         if out['error'] is None:
             out['error'] = (

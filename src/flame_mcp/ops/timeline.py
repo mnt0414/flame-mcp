@@ -26,6 +26,9 @@ CATEGORY = Category(
 _SEQUENCE_TARGET_ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection", "timeline")
 _COMPARE_ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 DEFAULT_COMPARE_LIMIT: Final[int] = 50
+CONNECTION_BUDGET_S: Final[float] = 5.0
+"""`timeline.list_segments` with `include_connections=true` stops reading connections after this
+long (the first segment is always read); the same value as batch.NODE_COUNT_BUDGET_S."""
 
 
 def _resolved_identity_src() -> list[str]:
@@ -168,6 +171,7 @@ def _list_segments_to_python(args: Mapping[str, Any]) -> str:
     track = args["track"]
     limit = args["limit"]
     offset = args["offset"]
+    include_connections = bool(args.get("include_connections", False))
     if args.get("media", "video") == "audio":
         pick = _audio_pick_src(track, args.get("channel", 0))
     else:
@@ -186,9 +190,19 @@ def _list_segments_to_python(args: Mapping[str, Any]) -> str:
                 "    _describe(_i, _s)",
                 "    for _i, _s in enumerate(_segments[_offset : _offset + _limit], start=_offset)",
                 "]",
+                "_conn_stopped = None",
+                f"if {include_connections!r}:",
+                "    _page = _segments[_offset : _offset + _limit]",
+                "    _counts, _conn_stopped = _sc_page_counts(",
+                "        target, _version_idx, _track_idx, _segments, _page,",
+                f"        {CONNECTION_BUDGET_S!r},",
+                "    )",
+                "    for _item, _count in zip(_items, _counts):",
+                "        _item['connections'] = _count",
             ]
         ),
         list_result_src("_items", "_total", "_offset"),
+        "if _conn_stopped is not None:\n    _result['connectionsStoppedEarly'] = _conn_stopped",
         "\n".join(_resolved_identity_src()),
     )
 
@@ -209,6 +223,12 @@ def _list_segments_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | N
         return Refusal(
             "INVALID_ARGS",
             "channel only applies to media='audio' (a video track has no channels)",
+        )
+    if args.get("include_connections") and args.get("media", "video") == "audio":
+        return Refusal(
+            "INVALID_ARGS",
+            "include_connections only applies to media='video' (segment connections are read "
+            "on video segments)",
         )
     return None
 
@@ -343,6 +363,21 @@ def register(registry: Registry) -> None:
                     integer=True,
                     minimum=0,
                 ),
+                OperationParam(
+                    name="include_connections",
+                    type="boolean",
+                    description=(
+                        "Add `connections` to each item: the number of OTHER segments that "
+                        "PySegment.connected_segments() lists (it lists the segment itself, "
+                        "which is left out; measured on a track-0 video segment), null when it "
+                        "cannot be read. Off by default; media='video' only. The page stops "
+                        "after a time budget (the first segment is always read): the segments "
+                        "not read get null and `connectionsStoppedEarly` {reason, budgetS, "
+                        "read} is set."
+                    ),
+                    required=False,
+                    default=False,
+                ),
                 limit_param,
                 offset_param(),
             ),
@@ -363,6 +398,7 @@ def register(registry: Registry) -> None:
                 "PySegment.tail",
                 "PySegment.effects",
                 "PyTimelineFX.type",
+                "PySegment.connected_segments",
             ),
         )
     )

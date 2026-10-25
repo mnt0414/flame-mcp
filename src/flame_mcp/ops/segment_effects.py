@@ -1,9 +1,10 @@
 """The effect ops of a segment: `segment.create_effect`, `delete_effect`, `set_effect`,
-`effect_load_setup` (each behind a Timeline checkpoint, `_segment_edit`) and `effect_save_setup` (a
-file is written, the sequence is not touched: no checkpoint). The Flame side is
-`timeline_edit_prelude`; measured on Flame 2025.2.4: TimelineFX attributes hold almost nothing
-besides `bypass` (so values change by loading a setup file), a saved setup file gets a per-type
-extension, and an effect survives a copy of the sequence. A Resize that Flame adds by itself (the
+`effect_load_setup`, `edit_effect_setup` (each behind a Timeline checkpoint, `_segment_edit`) and
+`effect_save_setup` (a file is written, the sequence is not touched: no checkpoint). The Flame side
+is `timeline_edit_prelude` (and `setup_edit_prelude` for `edit_effect_setup`); measured on Flame
+2025.2.4: Timeline FX attributes hold almost nothing besides `bypass` (so values change by loading
+a setup file), a saved setup file gets a per-type extension, and an effect survives a copy of the
+sequence. A Resize that Flame adds by itself (the
 sequence's bit depth differs from the segment's source bit depth; measured on 2025.2.4 and
 2026.2.3) is not deleted: `segment.delete_effect` refuses it first."""
 
@@ -25,6 +26,13 @@ from flame_mcp.ops._segment_edit import (
     seg_args,
     segment_target_param,
 )
+from flame_mcp.ops._setup_edit import (
+    EDIT_NOTE,
+    keep_files_param,
+    values_param,
+    values_precheck,
+    work_root,
+)
 from flame_mcp.registry import Registry
 from flame_mcp.render_files import is_default_output_dir
 from flame_mcp.types import Effect, OperationParam, OperationSpec, Refusal
@@ -34,6 +42,7 @@ DELETE_OP: Final[str] = "segment.delete_effect"
 SET_OP: Final[str] = "segment.set_effect"
 LOAD_OP: Final[str] = "segment.effect_load_setup"
 SAVE_OP: Final[str] = "segment.effect_save_setup"
+EDIT_OP: Final[str] = "segment.edit_effect_setup"
 
 EFFECT_REQUIRES: Final[tuple[str, ...]] = (
     "PySegment.effects",
@@ -53,7 +62,7 @@ _ONE_OF_EACH = (
 )
 
 _CREATE_DESCRIPTION = (
-    "Put a new TimelineFX on one segment (PySegment.create_effect). "
+    "Put a new Timeline FX on one segment (PySegment.create_effect). "
     + _TYPE_PARAM_NOTE
     + " "
     + _ONE_OF_EACH
@@ -72,7 +81,7 @@ _CREATE_DESCRIPTION = (
 )
 
 _DELETE_DESCRIPTION = (
-    "Take one TimelineFX off a segment (flame.delete(fx, confirm=False)). "
+    "Take one Timeline FX off a segment (flame.delete(fx, confirm=False)). "
     + _TYPE_PARAM_NOTE
     + " A segment that has no effect of that type is refused before anything is copied or "
     "journaled (PRECONDITION_UNMET, result.effectTypes is what it has), and so is a Gap or a "
@@ -93,7 +102,7 @@ _DELETE_DESCRIPTION = (
 )
 
 _SET_DESCRIPTION = (
-    "Set attributes of one TimelineFX of a segment (PyAttribute.set_value on the effect's own "
+    "Set attributes of one Timeline FX of a segment (PyAttribute.set_value on the effect's own "
     "attributes). " + _TYPE_PARAM_NOTE + " Most effect types list only `bypass` (a boolean); "
     "Burn-in Letterbox also has `mode` (one of 18 listed values), `ratio` (0.01 to 100) and "
     "`colour` (three numbers, each 0 to 1). A name the effect does not list is INVALID_ARGS "
@@ -112,7 +121,7 @@ _SET_DESCRIPTION = (
 )
 
 _LOAD_DESCRIPTION = (
-    "Load a setup file into one TimelineFX of a segment (PyTimelineFX.load_setup): the effect's "
+    "Load a setup file into one Timeline FX of a segment (PyTimelineFX.load_setup): the effect's "
     "parameters become those of the file. " + _TYPE_PARAM_NOTE + " The effect must already be on "
     "the segment (segment.create_effect first: PRECONDITION_UNMET otherwise). `path` is the real "
     "file (segment.effect_save_setup's result.files[].path, with its extension), absolute. A "
@@ -136,7 +145,7 @@ _LOAD_DESCRIPTION = (
 )
 
 _SAVE_DESCRIPTION = (
-    "Save one TimelineFX's setup to a file (PyTimelineFX.save_setup); nothing in the project "
+    "Save one Timeline FX's setup to a file (PyTimelineFX.save_setup); nothing in the project "
     "changes (no checkpoint, no journal). " + _TYPE_PARAM_NOTE + " Flame appends an extension "
     "that depends on the effect type ('.blur_node', '.resize_node', '.correct_node', "
     "'.2dtransform_node', '.flip_node', '.timewarp_node'; Burn-in Letterbox writes two files, "
@@ -152,8 +161,26 @@ _SAVE_DESCRIPTION = (
     "Works on a segment inside a library too (it only reads), and on the segment of a reel clip "
     "on the Desktop (parent = the clip's wiretap, version 0, track 0, index 0; measured on Flame "
     "2025.2.4). "
+    "The files written under that name are made 0600 (result.madePrivate); a file that could "
+    "not be changed, or that appeared but is not named after `path`, is in "
+    "result.notMadePrivate. "
     "result: type, requestedPath, files, overwritten, returned, warnings. Undo: none "
     "(a file was written, delete it by hand; the project is not changed)."
+)
+
+_EDIT_DESCRIPTION = (
+    "Replace the value of tags in one Timeline FX's setup file and load the file back "
+    "(PyTimelineFX.save_setup, then load_setup). "
+    + _TYPE_PARAM_NOTE
+    + " Example: type 'Timewarp', values {'TW_FrameMode': 0}. The effect must already be on the "
+    "segment (segment.create_effect first). Only a clip or sequence on the Desktop is edited: a "
+    "Gap, a sequence inside a library or Batch group and a clip in a Batch reel are refused "
+    "(PRECONDITION_UNMET) before anything is copied or journaled. "
+    + EDIT_NOTE
+    + " result: type, requestedType, tags, tagCounts, unchanged, mismatched, files {original, "
+    "edited, readback}, filesKept, returned, attributes {before, after}, trackChanged, position, "
+    "otherDifferences. In plan.run the tags are checked when the step runs, so a step that "
+    "fails them stops the plan there. " + CHECKPOINTED_SEGMENT_NOTE
 )
 
 
@@ -206,6 +233,17 @@ def _load_to_python(args: Mapping[str, Any]) -> str:
         args,
         f"_te_load_check(target, target__parent, {fx_type!r}, {path!r})",
         f"_te_load_setup({seg_args(args)}, {fx_type!r}, {path!r})",
+    )
+
+
+def _edit_to_python(args: Mapping[str, Any]) -> str:
+    fx_type, values = args["type"], dict(args["values"])
+    keep, base = bool(args.get("keep_files", False)), work_root()
+    tail = f"{fx_type!r}, {values!r}, {keep!r}, {base!r}"
+    return edit_source(
+        args,
+        f"_te_edit_setup_check(target, target__parent, {tail})",
+        f"_te_edit_setup({seg_args(args)}, {tail})",
     )
 
 
@@ -357,6 +395,15 @@ def register(registry: Registry) -> None:
         to_python=_load_to_python,
         precheck=_load_precheck,
         requires=("PyTimelineFX.load_setup", *EFFECT_REQUIRES),
+    )
+    checkpointed(
+        EDIT_OP,
+        "reversible",
+        _EDIT_DESCRIPTION,
+        (values_param("effect"), keep_files_param()),
+        to_python=_edit_to_python,
+        precheck=values_precheck,
+        requires=("PyTimelineFX.save_setup", "PyTimelineFX.load_setup", *EFFECT_REQUIRES),
     )
     registry.register(
         OperationSpec(

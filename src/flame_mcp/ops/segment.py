@@ -109,7 +109,7 @@ _SEGMENT_TARGET = (
 )
 
 _LIST_EFFECTS_DESCRIPTION = (
-    "List the timeline effects (TimelineFX) on one segment: `effects` = [{index, type, "
+    "List the timeline effects (Timeline FX) on one segment: `effects` = [{index, type, "
     "attributes: {name: value}}], each attribute read on its own (one that cannot be read is "
     "{'error': ...} and the call still succeeds). A segment holds at most one effect of each "
     "type (Flame refuses a second one), and the list is not in the order "
@@ -197,6 +197,12 @@ def register(registry: Registry) -> None:
         accepts=("segment",),
         target_description="A 'segment' selector identifying one segment. " + REEL_CLIP_NOTE,
         stable_src=_segment_stable_src,
+        write_guard_src=lambda _args: "_tl_check_not_library(target__parent, 'the sequence')",
+        note=(
+            "A segment of a sequence or clip inside a library is refused with PRECONDITION_UNMET "
+            "before anything is read for the write, nothing is written and nothing is "
+            "journaled (this holds for a plan.run step too)."
+        ),
         revert_kinds=("segment",),
         requires=attribute_requires("PySegment.attributes", "PyClip.get_wiretap_node_id"),
     )

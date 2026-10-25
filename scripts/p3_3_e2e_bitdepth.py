@@ -2,7 +2,7 @@
 p3_3_segment_e2e.py.
 
 JUDGED: behaviour measured on Flame 2025.2.4 and 2026.2.3. A sequence whose bit depth
-differs from the bit depth of the media put on it gets a TimelineFX Resize on that segment from
+differs from the bit depth of the media put on it gets a Timeline FX Resize on that segment from
 Flame itself, and a sequence of the same bit depth gets none; `timeline.create_sequence(bit_depth=)`
 makes the sequence with the depth asked for and reads it back; `segment.delete_effect` refuses the
 Resize Flame added (Flame 2026.2.3 raised "The Timeline FX cannot be deleted." for it after the

@@ -1,0 +1,60 @@
+name: Usage report
+description: Tell how you used flame-mcp, even when nothing went wrong.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        flame-mcp is in beta, and reports like this one decide when it leaves beta. Only the first box is required: one line is enough, and you can fill in only what you know. You can write in any language.
+
+        Remove anything that you don't want to make public, such as project names, file paths, and client names.
+  - type: textarea
+    id: used-for
+    attributes:
+      label: What you used it for, and how it went
+      description: For example "renamed shots in a test project, worked" or "conform prep on a real job, one replace needed a manual fix".
+    validations:
+      required: true
+  - type: dropdown
+    id: flame-version
+    attributes:
+      label: Flame version
+      options:
+        - "2025.2.4"
+        - "2026.2.3"
+        - Other
+    validations:
+      required: false
+  - type: dropdown
+    id: kind-of-work
+    attributes:
+      label: Kind of work
+      multiple: true
+      options:
+        - Organizing a project (reels, clips, names)
+        - Conform or prep
+        - Batch setup or render
+        - Delivery
+        - Reading or checking only
+        - Other
+    validations:
+      required: false
+  - type: textarea
+    id: ops
+    attributes:
+      label: Ops you used
+    validations:
+      required: false
+  - type: textarea
+    id: trouble
+    attributes:
+      label: What was hard or missing
+      description: Including any place where you used `eval.run` or did a step by hand.
+    validations:
+      required: false
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Code, Claude Desktop, ...
+    validations:
+      required: false

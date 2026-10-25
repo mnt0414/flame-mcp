@@ -1,5 +1,5 @@
 """Prelude source for `plan.run`'s up-front resolution of a bundled plan's segment selectors and for
-`segment.trim` (`ops/segment_trim.py`, `plan_timeline.py`).
+`segment.trim` (`ops/segment_trim.py`, `plan_bundle_timeline.py`).
 
 Like `timeline_prelude`: real Python source that `execution.build_exec_code` places ahead of an op's
 own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_OpError`, `_segment_list`,
@@ -157,6 +157,7 @@ def _tl_trim_check(seg, parent, edge, offset):
     _tl_judge_source(seg, out)
     if out['error'] is not None:
         return out
+    _tl_judge_handles(out)
     handle = out['before']['head'] if edge == 'head' else out['before']['tail']
     out['handle'] = handle
     if offset < 0:
@@ -234,16 +235,37 @@ def _tl_judge_source(seg, out):
     )
 
 
-def _tl_expected_shown(expected, source_judged):
-    # the source side of an unjudged segment has no expected value (None)
-    if source_judged:
-        return expected
-    return dict(expected, sourceIn=None, sourceOut=None)
+def _tl_judge_handles(out):
+    # Says in `out` which of head / tail are judged: not one that was 'infinite' before the edit
+    # (afterwards it may still be 'infinite' or be a number, so no difference can be read).
+    before = out['before']
+    judged = {'head': before['head'] != 'infinite', 'tail': before['tail'] != 'infinite'}
+    why = []
+    if not judged['head']:
+        why.append("head was 'infinite' before the edit")
+    if not judged['tail']:
+        why.append("tail was 'infinite' before the edit")
+    out['handleJudged'] = judged
+    out['handleNotJudgedBecause'] = '; '.join(why) if why else None
 
 
-def _tl_deltas_match(deltas, expected, source_judged):
+def _tl_expected_shown(expected, source_judged, handle_judged):
+    # a side that is not judged has no expected value (None)
+    shown = dict(expected)
+    if not source_judged:
+        shown['sourceIn'] = None
+        shown['sourceOut'] = None
+    for key in ('head', 'tail'):
+        if not handle_judged[key]:
+            shown[key] = None
+    return shown
+
+
+def _tl_deltas_match(deltas, expected, source_judged, handle_judged):
     for key in ('recordIn', 'recordOut', 'sourceIn', 'sourceOut', 'head', 'tail'):
         if not source_judged and key in ('sourceIn', 'sourceOut'):
+            continue
+        if key in ('head', 'tail') and not handle_judged[key]:
             continue
         if deltas[key] != expected[key]:
             return False
@@ -289,7 +311,7 @@ def _tl_trim(seg, parent, version, track, edge, offset, ripple):
         trackEnds=None,
         returned=None,
         deltas=None,
-        expectedDeltas=_tl_expected_shown(expected, out['sourceJudged']),
+        expectedDeltas=_tl_expected_shown(expected, out['sourceJudged'], out['handleJudged']),
         ran=True,
     )
     if edge == 'head':
@@ -327,12 +349,14 @@ def _tl_trim_judge(out, parent, version, track, numbers, expected, after_rows, w
     out['after'] = _tl_seg_facts(found)
     out['deltas'] = _tl_deltas(numbers, _tl_seg_numbers(found))
     out['position'] = _tl_position(parent, version, track, index, found)
-    if not _tl_deltas_match(out['deltas'], expected, out['sourceJudged']):
+    if not _tl_deltas_match(out['deltas'], expected, out['sourceJudged'], out['handleJudged']):
         out['error'] = (
             'the segment changed, but not the way ' + what + ' is measured to change it '
             '(expected ' + repr(out['expectedDeltas']) + ', read back ' + repr(out['deltas'])
             + (', source side not judged: ' + out['sourceNotJudgedBecause']
-               if not out['sourceJudged'] else '') + ')'
+               if not out['sourceJudged'] else '')
+            + (', handle not judged: ' + out['handleNotJudgedBecause']
+               if out['handleNotJudgedBecause'] is not None else '') + ')'
         )
         out['errorCode'] = 'FLAME_API_ERROR'
     return out

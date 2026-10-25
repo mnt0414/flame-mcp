@@ -4,7 +4,7 @@ The script runs end to end (tests/e2e_inprocess.py). NOT evidence about a real F
 that the stages, selectors and judgements of the script hang together and agree with what the fake
 does, that no scenario writes through transport, and that the pure parts (the dry run) compile.
 The fake is modelled on Flame 2025.2.4 measurements of segment replace, copy and match,
-TimelineFX, and Timeline checkpoint and restore."""
+Timeline FX, and Timeline checkpoint and restore."""
 
 from __future__ import annotations
 

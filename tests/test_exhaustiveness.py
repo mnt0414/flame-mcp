@@ -4,6 +4,7 @@ automatically grows this test until every registered branch function handles it.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any, get_args
 
@@ -104,7 +105,7 @@ BRANCHES: dict[Any, list[Callable[[Any], Any]]] = {
 @pytest.mark.parametrize(
     "enum_type,member,fn",
     [(et, m, f) for et, fns in BRANCHES.items() for m in get_args(et) for f in fns],
-    ids=lambda v: str(v),
+    ids=lambda v: v.__name__ if inspect.isfunction(v) else str(v),
 )
 def test_every_member_is_handled(enum_type: object, member: str, fn: object) -> None:
     fn(member)  # type: ignore[operator]  # assert_never must not raise here
