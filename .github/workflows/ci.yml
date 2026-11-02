@@ -21,7 +21,7 @@ jobs:
     # repository is public.
     if: ${{ !github.event.repository.private }}
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -50,4 +50,4 @@ jobs:
       - name: Type check
         run: python -m mypy
       - name: Unit tests
-        run: python -m pytest -q
+        run: python -m pytest -q -n auto
