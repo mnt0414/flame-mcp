@@ -405,7 +405,7 @@ def test_a_bool_is_not_a_number() -> None:
     assert h["comp"].pos_x.set_calls == []
 
 
-def test_pytime_attribute_is_rejected_for_now() -> None:
+def test_a_pytime_attribute_other_than_current_time_is_rejected() -> None:
     registry = make_registry()
     flame, h = make_batch_world()
     add_attr(h["comp"], "start", SpyAttr(_FakePyTime("00:00:01+00", 24)))

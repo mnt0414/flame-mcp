@@ -90,6 +90,7 @@ from p1_mcp_e2e import (  # noqa: E402
     check_rider,
 )
 
+from flame_mcp.compact import RESPONSE_ENV  # noqa: E402
 from flame_mcp.journal import Index, Journal  # noqa: E402
 
 OUTPUT_DIR: Final[Path] = Path.home() / "Library" / "Application Support" / "flame-mcp" / "p2"
@@ -189,6 +190,7 @@ async def server_session(
     env["PYTHONPATH"] = str(REPO_ROOT / "src")
     env["FLAME_MCP_RUN_DIR"] = str(ctx.run_dir)
     env["FLAME_MCP_JOURNAL_DIR"] = str(ctx.journal_dir)
+    env[RESPONSE_ENV] = "full"  # the checks read the full envelope, whatever the default is
     if readonly:
         env["FLAME_MCP_READONLY"] = "1"
     else:

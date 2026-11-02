@@ -1,6 +1,6 @@
-"""`project` category: a single read-only op reporting identity that
-every other op's rider already reads piecemeal (project/workspace name,
-library count, current desktop name)."""
+"""`project` category: `info`, a read-only op reporting identity that every other op's rider
+already reads piecemeal (project/workspace name, library count, current desktop name), and `save`,
+which saves the project the way Ctrl+S (Save Project) does."""
 
 from __future__ import annotations
 
@@ -34,6 +34,30 @@ def _info_to_python(_args: Mapping[str, Any]) -> str:
     )
 
 
+def _save_to_python(_args: Mapping[str, Any]) -> str:
+    return "\n".join(
+        [
+            "import time as _time",
+            "_project = flame.projects.current_project",
+            "_ws = _project.current_workspace",
+            "_t0 = _time.monotonic()",
+            "_returned = _ws.commit()",
+            "_elapsed = _time.monotonic() - _t0",
+            "_result = {",
+            "    'projectName': _v(_project.name),",
+            "    'workspaceName': _v(_ws.name),",
+            "    'elapsedS': round(_elapsed, 3),",
+            "    'returned': repr(_returned),",
+            "    'readBackDecisive': False,",
+            "}",
+        ]
+    )
+
+
+def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
+    return 0
+
+
 def register(registry: Registry) -> None:
     registry.register_category(CATEGORY)
     registry.register(
@@ -54,6 +78,37 @@ def register(registry: Registry) -> None:
                 "PyWorkspace.libraries",
                 "PyWorkspace.desktop",
                 "PyDesktop.name",
+            ),
+        )
+    )
+    registry.register(
+        OperationSpec(
+            name="project.save",
+            category="project",
+            description=(
+                "Save the project, like Flame's Ctrl+S (Save Project): PyWorkspace.commit() of "
+                "the current workspace. This server does not read the save back, so the call is "
+                "ok when commit returns without an exception and result.readBackDecisive is "
+                "false; result has projectName, workspaceName, elapsedS and returned (the repr "
+                "of what commit returned). Runs main-async: a save that outlives the wait comes "
+                "back ok with pending.handle, and journal.poll(handle) gives its result. After "
+                "a TIMEOUT or BRIDGE_LOST it is not known whether the project was saved; calling "
+                "project.save again saves the current state. "
+                "Undo: unsupported -- this server has no op that moves the saved point back. "
+                "This is not Save Desktop (PyDesktop.save), which puts a copy of the Desktop "
+                "into a library. Not allowed in plan.run."
+            ),
+            effect="create",
+            undo="unsupported",
+            thread="main-async",
+            to_python=_save_to_python,
+            undo_steps=_no_undo_steps,
+            requires=(
+                "flame.projects",
+                "PyProject.current_workspace",
+                "PyProject.name",
+                "PyWorkspace.name",
+                "PyWorkspace.commit",
             ),
         )
     )

@@ -25,7 +25,7 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 | Batch | Create, connect, and set up nodes. Save and load setups. Render. |
 | Multi-step plans | Run several operations as one procedure (`plan.run`). |
 
-There are 98 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
+There are 110 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
 
 ## Before you start
 
@@ -207,7 +207,7 @@ Changes made in one `plan.run` are undone together.
 
 The following can't be undone. The description of each operation in [docs/ops.md](docs/ops.md) says whether it can be undone.
 
-- Files written by a render, the clips that the render created, and the Timeline FX that `render.clip` rendered
+- Files written by a render, by `render.export` or by `render.still`, the clips that the render created, and the Timeline FX that `render.clip` rendered
 - Saved setup files
 - Shelf reels and Batch iterations that were created
 - Copies saved for undo that were deleted with `journal.purge_checkpoints`
@@ -228,6 +228,10 @@ Usually, you don't need to configure anything. To change a setting, pass an envi
 | `FLAME_MCP_ALLOW_EFFECTS` | All | The effects that can be used, separated by commas (`read`, `reversible`, `create`, `destructive`) |
 | `FLAME_MCP_ENABLE_EVAL` | Off | `1`: turn on `eval.run` |
 | `FLAME_MCP_CHECKPOINT_LIBRARY` | `flame_mcp_checkpoints` | The library where copies saved for undo are kept |
+| `FLAME_MCP_RESPONSE` | `full` | `compact`: send smaller responses to the assistant (see [Smaller responses](#smaller-responses)) |
+| `FLAME_MCP_FFMPEG` | Search the PATH, then the `imageio_ffmpeg` package | The ffmpeg that `render.still` uses to make its PNG |
+| `FLAME_MCP_STILLS_DIR` | `~/Library/Application Support/flame-mcp/stills` | Where `render.still` puts its files |
+| `FLAME_MCP_PRESETS_DIR` | `/opt/Autodesk/presets` | The directory that holds Flame's export presets, one folder per Flame version; `render.still` reads its preset from there |
 
 - Include `read` in `FLAME_MCP_ALLOW_EFFECTS`. Without it, every read is refused too.
 - Without `journal` in `FLAME_MCP_ALLOW_CATEGORIES`, the assistant can't check its changes or undo them.
@@ -249,6 +253,30 @@ Use read-only mode to review or audit a project without changing anything.
 ```
 
 Only operations that change nothing are listed, and only they can run. `eval.run` is refused. To read a closed library by name, the server opens the library, reads it, and closes it again.
+
+### Smaller responses
+
+With `FLAME_MCP_RESPONSE=compact`, the server leaves out of each response what the assistant can do without, so the conversation uses fewer tokens. The values that are sent don't change.
+
+- Fields that are empty (null, an empty list or object, an empty string) aren't sent. `execution` is sent only when a call fails.
+- Inside `result`, members that are null aren't sent, and neither is a `wiretapId` that repeats the selector next to it.
+- A list of three or more objects of the same shape is sent as a table, `{columns, rows}`.
+- What the assistant passes back to undo or repeat a call (`revert`, `inverse`, `args`) keeps its full form.
+
+The server explains this form to the assistant in its instructions and in `flame_context` (`responseFormat`).
+
+```json
+{
+  "mcpServers": {
+    "flame": {
+      "command": "/path/to/flame-mcp/scripts/flame_mcp_server.sh",
+      "env": { "FLAME_MCP_RESPONSE": "compact" }
+    }
+  }
+}
+```
+
+In either mode, `desktop.list_children`, `desktop.list_all`, `desktop.find`, and `timeline.list_segments` take `fields`, the members of each item to return (for example `["name", "uid"]`). An item that couldn't be read keeps its `error`. A name that the operation's items never have is refused with `INVALID_ARGS`.
 
 ### Running arbitrary Python code (`eval.run`)
 
@@ -315,14 +343,14 @@ Report security vulnerabilities as described in [SECURITY.md](.github/SECURITY.m
 ## Limitations
 
 - Not supported:
-  - exporting media (Flame's Export)
-  - saving a frame as an image for the assistant to look at
   - markers
   - transitions
   - editing keyframes
-  - saving the Desktop or the project
+  - Save Desktop (putting a copy of the Desktop into a library). To save the project, use `project.save`
   - deleting folders, and deleting reels that hold anything (an empty Desktop reel can be deleted)
   - Linux
+- `render.export` writes only into an empty directory and never overwrites. Use a new directory for each export.
+- `render.export` and `render.still` can't be undone. The files that they write stay on disk. The PNG of `render.still` is a small image for checking, not a deliverable.
 - You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays).
 - A sequence or clip that's restored by an undo goes to the end of its reel. Flame's API has no way to set the order of items in a reel. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
 - The `flame_context` tool lists known pitfalls in its `pitfalls` field.

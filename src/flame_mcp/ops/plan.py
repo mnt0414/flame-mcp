@@ -37,6 +37,7 @@ from flame_mcp.checkpoints import BATCH_KIND, TIMELINE_KIND
 from flame_mcp.errors import as_error_code
 from flame_mcp.journal import new_id, now_iso
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.list_fields import unknown_fields_message
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import deny_operation
 from flame_mcp.registry import RegisteredOperation, Registry
@@ -97,6 +98,18 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "undone, so it has no place in a group that journal.revert is meant to put back; call "
         "it on its own"
     ),
+    "render.export": (
+        "render.export cannot be a plan step: a Foreground export occupies Flame for as long as "
+        "it runs (no MCP call gets through meanwhile) and the files it writes cannot be undone, "
+        "so it has no place in a group that journal.revert is meant to put back; call it on its "
+        "own"
+    ),
+    "render.still": (
+        "render.still cannot be a plan step: it occupies Flame while it writes the frame (no MCP "
+        "call gets through meanwhile), makes and deletes a temporary copy on the Desktop, and the "
+        "files it writes cannot be undone, so it has no place in a group that journal.revert is "
+        "meant to put back; call it on its own"
+    ),
     "desktop.create": (
         "desktop.create cannot be a plan step: it journals a `desktop_create` intent that is "
         "reverted by deleting what it made (with its own compare-and-swap), and a plan's single "
@@ -121,6 +134,12 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "moving the things back (they get new uids), and a plan's single group is reverted by "
         "putting attribute values back -- it would skip such an intent without saying so. Call "
         "it on its own"
+    ),
+    "desktop.reorder": (
+        "desktop.reorder cannot be a plan step: it journals a `desktop_move` intent that is "
+        "reverted by moving the entries back (they get new uids), and a plan's single group is "
+        "reverted by putting attribute values back -- it would skip such an intent without "
+        "saying so. Call it on its own"
     ),
     "mediahub.import": (
         "mediahub.import cannot be a plan step: it journals a `desktop_import` intent that is "
@@ -174,6 +193,21 @@ REFUSED_IN_PLAN: Final[Mapping[str, str]] = {
         "clip that is reverted by restoring the clip's stashed copy (a new uid) or by deleting "
         "the duplicate it made, and a plan's single group is reverted by putting attribute "
         "values back -- it would skip such an intent without saying so. Call it on its own"
+    ),
+    "batch.delete": (
+        "batch.delete cannot be a plan step: it deletes a Batch group, which journal.revert "
+        "cannot bring back (the saved setup is loaded into a new group by hand), so it has no "
+        "place in a group that journal.revert is meant to put back; call it on its own"
+    ),
+    "desktop.sync_record_tc": (
+        "desktop.sync_record_tc cannot be a plan step: it journals one `desktop.set_record_tc` "
+        "intent per clip into a group of its own and reports a row per clip; call it on its own "
+        "(desktop.set_record_tc is the step to use in a plan)"
+    ),
+    "project.save": (
+        "project.save cannot be a plan step: it saves the whole project, which journal.revert "
+        "has no way to move back, so it has no place in a group that journal.revert is meant to "
+        "put back; call it on its own"
     ),
     "segment.create_connection": _connection_refusal("segment.create_connection", journaled=True),
     "segment.remove_connection": _connection_refusal("segment.remove_connection", journaled=True),
@@ -316,6 +350,10 @@ def _check_step(ctx: ServerContext, index: int, raw: Any) -> _Step:
         step.problems.extend(f"{issue.path}: {issue.message}" for issue in validation.issues)
         return step
     step.args = dict(validation.value or {})
+    unknown_fields = unknown_fields_message(op.name, step.args)
+    if unknown_fields is not None:
+        step.problems.append(unknown_fields)
+        return step
     if owns_journal_group(op, step.args):
         step.problems.append(
             f"{op.name} cannot be a plan step{' (destructive)' if op.category == 'eval' else ''}: "
@@ -742,12 +780,14 @@ def register(registry: Registry) -> None:
                 "Foreground "
                 "render occupies Flame for as long as it runs and its output "
                 "(files on disk, clips in the shelf reel) cannot be undone. So is render.clip "
-                "(the Timeline FX it renders cannot be undone either). So are "
+                "(the Timeline FX it renders cannot be undone either), and so is render.export "
+                "(the files it writes stay), and render.still. So is project.save "
+                "(a project save cannot be undone). So are "
                 "desktop.create and desktop.copy: their revert deletes what they made, which a "
                 "plan's group (reverted by putting values back) does not do. Nor can "
                 "mediahub.import, desktop.duplicate, desktop.move, desktop.arrange, "
-                "desktop.delete and desktop.reformat (deleting / moving back / copying back / "
-                "restoring a stashed copy), segment.copy_to_media_panel and "
+                "desktop.reorder, desktop.delete and desktop.reformat (deleting / moving back / "
+                "copying back / restoring a stashed copy), segment.copy_to_media_panel and "
                 "segment.match (deleting the clip they made), timeline.create_sequence (deleting "
                 "the sequence it made), journal.purge_checkpoints, or "
                 "segment.create_connection / remove_connection / sync_connections (their "

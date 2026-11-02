@@ -119,12 +119,6 @@ def _entry_row(entry: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _no_refusal(
-    op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any], started: float
-) -> dict[str, Any] | None:
-    return None
-
-
 def _stable_args(
     op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
@@ -272,7 +266,6 @@ def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
 
 
 MEDIA_PROFILE: Final[WriteProfile] = WriteProfile(
-    refuse=_no_refusal,
     stable_args=_stable_args,
     intent=_intent_record,
     created=created_record,

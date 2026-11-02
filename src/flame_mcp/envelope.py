@@ -377,7 +377,7 @@ def take_degraded_notes(value: object) -> list[str]:
     return [note for note in notes if isinstance(note, str)]
 
 
-def _byte_len(envelope: Mapping[str, Any]) -> int:
+def byte_len(envelope: Mapping[str, Any]) -> int:
     return len(json.dumps(envelope, default=str).encode("utf-8"))
 
 
@@ -414,7 +414,7 @@ def degrade_for_size(
     degraded = list(out.get("degraded") or [])
     preexisting_degraded = list(degraded)
 
-    if _byte_len(out) <= max_bytes:
+    if byte_len(out) <= max_bytes:
         return out
 
     tb = out.get("traceback")
@@ -428,7 +428,7 @@ def degrade_for_size(
         out["logs"] = logs[-LOGS_TAIL_LINES:]
         degraded.append(f"logs truncated to last {LOGS_TAIL_LINES} lines")
     out["degraded"] = degraded
-    if _byte_len(out) <= max_bytes:
+    if byte_len(out) <= max_bytes:
         return out
 
     new_result, changed = _collapse_lists(out.get("result"))
@@ -436,7 +436,7 @@ def degrade_for_size(
         out["result"] = new_result
         degraded.append("result list(s) collapsed to {count, omitted}")
     out["degraded"] = degraded
-    if _byte_len(out) <= max_bytes:
+    if byte_len(out) <= max_bytes:
         return out
 
     effective_spill_dir = spill_dir if spill_dir is not None else _default_spill_dir()

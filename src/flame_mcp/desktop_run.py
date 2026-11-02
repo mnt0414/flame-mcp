@@ -60,6 +60,7 @@ from flame_mcp.journal import (
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.library_open import merge_into_envelope
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
@@ -80,9 +81,6 @@ PHASE_REVERT: Final[str] = "revert"
 PHASE_REVERT_PLAN: Final[str] = "revert_plan"
 PHASE_ALIVE: Final[str] = "alive"
 PHASE_PROBE: Final[str] = "probe"
-RESERVED_ARGS: Final[frozenset[str]] = frozenset({PHASE_ARG, EXPECTED_ARG, CREATED_ARG})
-"""Keys only this module puts into an op's args (never declared parameters, so a caller cannot send
-them: `validate_op_args` rejects an unknown key). `to_python` of both ops reads them."""
 WRITE_TIMEOUT_S: Final[float] = 30.0
 MAX_SOURCES: Final[int] = 50
 
@@ -122,10 +120,6 @@ LAST_REEL_NOTE: Final[str] = (
 )
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
 def _refusal(
     op: RegisteredOperation,
     code: ErrorCode,
@@ -141,7 +135,7 @@ def _refusal(
         error=message,
         error_code=code,
         execution=envelope_mod.execution_meta(op),
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint_override=hint,
     )
 
@@ -361,6 +355,19 @@ def _no_read_back(env: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def no_refusal(
+    op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any], started: float
+) -> dict[str, Any] | None:
+    return None
+
+
+def read_back_returned(env: Mapping[str, Any]) -> dict[str, Any] | None:
+    result = env.get("result")
+    if not isinstance(result, Mapping) or "returned" not in result:
+        return None
+    return {"returned": result["returned"], "made": result.get("created") is not None}
+
+
 def partial_verdict(ok: bool, created: Mapping[str, Any] | None) -> dict[str, str]:
     """The outcome key that makes the intent's state `partial` (`IntentView.state`): the call
     ended in an error after it had made or changed something that `created` records, so a
@@ -375,10 +382,6 @@ class WriteProfile:
     answer that never came). `desktop.create` / `desktop.copy` are `DEFAULT_PROFILE`;
     `desktop_media_run` brings one for import / duplicate / move."""
 
-    refuse: Callable[
-        [RegisteredOperation, dict[str, Any], dict[str, Any], float], dict[str, Any] | None
-    ]
-    """After a good pre-read: an envelope that ends the call (nothing written), or None."""
     stable_args: Callable[
         [RegisteredOperation, dict[str, Any], dict[str, Any]],
         tuple[dict[str, Any], dict[str, Any] | None, str | None],
@@ -387,6 +390,10 @@ class WriteProfile:
     created: Callable[[str, Mapping[str, Any] | None], dict[str, Any] | None]
     notes: Callable[[RegisteredOperation, Mapping[str, Any], dict[str, Any]], None]
     pre_hint: Callable[[RegisteredOperation, Mapping[str, Any]], str | None]
+    refuse: Callable[
+        [RegisteredOperation, dict[str, Any], dict[str, Any], float], dict[str, Any] | None
+    ] = no_refusal
+    """After a good pre-read: an envelope that ends the call (nothing written), or None."""
     read_back: Callable[[Mapping[str, Any]], dict[str, Any] | None] = _no_read_back
     """What goes into the outcome's `readBack` (a count that explains a SILENT_NOOP)."""
     prepare: Callable[..., dict[str, Any] | None] | None = None
@@ -422,7 +429,7 @@ def run_write_flow(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
 

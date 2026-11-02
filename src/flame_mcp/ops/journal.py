@@ -33,6 +33,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from flame_mcp import transport
+from flame_mcp.batch_delete_run import BATCH_DELETE_KIND, check_batch_delete_intent
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
 from flame_mcp.checkpoints import (
     ATTRIBUTES_SECTION,
@@ -52,8 +53,12 @@ from flame_mcp.desktop_delete_run import (
 from flame_mcp.desktop_media_run import check_media_intent, is_media_intent, revert_media_group
 from flame_mcp.desktop_reformat_check import check_reformat_intent, is_reformat_intent
 from flame_mcp.desktop_reformat_revert import revert_reformat_group
+from flame_mcp.desktop_reorder_revert import revert_reorder_group
+from flame_mcp.desktop_reorder_run import REORDER_GROUP_KIND
 from flame_mcp.desktop_revert import check_desktop_intent, revert_desktop_group
 from flame_mcp.errors import as_error_code
+from flame_mcp.export_check import check_export_intent
+from flame_mcp.export_run import EXPORT_KIND
 from flame_mcp.journal import (
     STATE_DIVERGED,
     STATE_LANDED,
@@ -68,7 +73,7 @@ from flame_mcp.journal import (
     now_iso,
 )
 from flame_mcp.newer_groups import NEWER_GROUPS_KEY, newer_groups, newer_groups_sentence
-from flame_mcp.ops._common import offset_param
+from flame_mcp.ops._common import limit_param, offset_param
 from flame_mcp.registry import Registry
 from flame_mcp.render_check import check_render_intent, poll_handle
 from flame_mcp.render_clip_check import check_render_clip_intent
@@ -82,6 +87,8 @@ from flame_mcp.segment_extract_run import (
     revert_extract_group,
 )
 from flame_mcp.segment_remove_run import REMOVE_KIND, check_remove_intent
+from flame_mcp.still_check import check_still_intent
+from flame_mcp.still_run import STILL_KIND
 from flame_mcp.timeline_create_run import (
     check_sequence_intent,
     is_sequence_intent,
@@ -397,6 +404,12 @@ def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
         return check_render_intent(ctx, view)
     if intent.get("kind") == RENDER_CLIP_KIND:
         return check_render_clip_intent(ctx, view)
+    if intent.get("kind") == EXPORT_KIND:
+        return check_export_intent(ctx, view)
+    if intent.get("kind") == STILL_KIND:
+        return check_still_intent(ctx, view)
+    if intent.get("kind") == BATCH_DELETE_KIND:
+        return check_batch_delete_intent(ctx, view)
     if intent.get("kind") == REMOVE_KIND:
         return check_remove_intent(ctx, view)
     if view.desktop_kind is not None:
@@ -491,6 +504,24 @@ def _nothing_to_revert(index: Index, group: str) -> ServerOpError:
             "PRECONDITION_UNMET",
             f"group {group} is a render of a clip's Timeline FX: it cannot be undone, so there is "
             "nothing to revert",
+        )
+    if any(view.intent.get("kind") == EXPORT_KIND for view in index.groups[group]):
+        return ServerOpError(
+            "PRECONDITION_UNMET",
+            f"group {group} is an export: the files it wrote cannot be undone, so there is "
+            "nothing to revert",
+        )
+    if any(view.intent.get("kind") == STILL_KIND for view in index.groups[group]):
+        return ServerOpError(
+            "PRECONDITION_UNMET",
+            f"group {group} is a still: the frame it wrote cannot be undone, so there is "
+            "nothing to revert",
+        )
+    if any(view.intent.get("kind") == BATCH_DELETE_KIND for view in index.groups[group]):
+        return ServerOpError(
+            "PRECONDITION_UNMET",
+            f"group {group} deleted a Batch group: it cannot be put back by a revert; create a "
+            "Batch group and batch.load_setup the file in the intent's setupPath",
         )
     state = index.group_state(group)
     if state == STATE_REVERTED:
@@ -730,6 +761,8 @@ def _revert_desktop(
     """The revert of a group of Desktop writes, by the kind of the write."""
     if index.group_meta.get(group, {}).get("kind") == ARRANGE_GROUP_KIND:
         return revert_arrange_group(ctx, index, group, desktop_views)
+    if index.group_meta.get(group, {}).get("kind") == REORDER_GROUP_KIND:
+        return revert_reorder_group(ctx, index, group, desktop_views)
     if any(is_delete_intent(v) for v in desktop_views):
         return revert_delete_group(ctx, index, group, desktop_views)
     if any(is_media_intent(v) for v in desktop_views):
@@ -857,9 +890,6 @@ def _revert(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
 
 def register(registry: Registry) -> None:
     registry.register_category(CATEGORY)
-    limit_param = OperationParam(
-        name="limit", type="number", description="Max groups to return.", required=False
-    )
     group_param = OperationParam(
         name="group",
         type="string",
@@ -884,7 +914,7 @@ def register(registry: Registry) -> None:
                 "One page at a time (limit / offset)."
             ),
             effect="read",
-            params=(limit_param, offset_param()),
+            params=(limit_param("Max groups to return."), offset_param()),
             server_handler=_list,
         )
     )
@@ -915,8 +945,10 @@ def register(registry: Registry) -> None:
                 "wait ended with a bridge pending handle is decided by asking the bridge for "
                 "that handle's result first (the answer, not the files, says the render has "
                 "ended; the result is handed over once and journaled at once), then counting "
-                "the planned output files: landed / partial (some frames) / failed (the "
-                "render reported a failure), basis 'handle'. A render still running, or a "
+                "the planned output files: landed / partial (some frames) / not_landed (no "
+                "error reported, nothing written; for Render nodes only, no new clip) / failed "
+                "(the render reported a failure), "
+                "basis 'handle'. A render still running, or a "
                 "bridge that does not answer, is unknown (the intent stays open and writes stay "
                 "refused; call journal.check again later, which is a read and not a retry of "
                 "the render). "
@@ -927,7 +959,14 @@ def register(registry: Registry) -> None:
                 "same way, the bridge's answer first (basis 'handle'); without one Flame is "
                 "read again and is_rendered() decides: true = landed, false = not_landed (basis "
                 "'flame', an estimate; when the intent's isRenderedBefore was true, a true read is "
-                "not evidence that the render ran). Each finding is "
+                "not evidence that the render ran). An open render.export intent is decided the "
+                "same way, the bridge's answer first (basis 'handle'); without one the output "
+                "directory is listed again (basis 'disk', an estimate): every expected file "
+                "written since the intent = landed (any file when the count was not known), some "
+                "= partial, none = not_landed. An open render.still intent is decided like a "
+                "render.export one (one new file = landed) and then also removes the "
+                "temporary reference copy of the clip that the call left in Flame, if its name, "
+                "duration and marks are the call's. Each finding is "
                 "appended to the journal. "
                 "A finding of any kind other than unknown lifts this server's refusal of writes "
                 "that followed a write with no answer. "
@@ -999,7 +1038,7 @@ def register(registry: Registry) -> None:
                 "listed). Nothing is removed. One page at a time (limit / offset)."
             ),
             effect="read",
-            params=(limit_param, offset_param()),
+            params=(limit_param("Max groups to return."), offset_param()),
             server_handler=_inflight,
         )
     )
@@ -1028,6 +1067,10 @@ def register(registry: Registry) -> None:
                 "its old parent, at the end, with a new uid); one that cannot be put back leaves "
                 "the others reverted (result.notReverted, result.partial) and a second revert "
                 "does the rest. "
+                "A desktop.reorder group: the fewest entries are moved to the end of the reel in "
+                "the old order (a desktop.move; the entries it moves get new uids, and they can "
+                "include ones the reorder did not move), CONFLICT with nothing moved when the "
+                "reel no longer holds the entries the reorder left. "
                 "A segment.copy_to_media_panel / segment.match group: the clip the call "
                 "made is deleted by uid (flame.delete), only while its name, duration and content "
                 "(segments and effects, by fingerprint) are still what they were right after the "

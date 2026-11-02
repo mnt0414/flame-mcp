@@ -61,7 +61,9 @@ p2_3a_batch|standard|p2|yes|no|no|-|stages a-e, z
 p2_3b_node_action|standard|p2|yes|no|no|-|stages a-f, z
 p2_3r_reel_fidelity|standard|p2|yes|no|no|-|stages a-e, z
 p2_3c_render|standard|p2|yes|no|no|-|setup, stages a-h, z
-p2_3d_desktop|standard|p2|yes|no|no|-|setup, stages a-f, z
+p2_3d_desktop|standard|p2|yes|no|no|-|setup, stages a-g, z
+p94_arrange_insert|standard|p2|yes|no|no|-|setup, stages a-e, g, z
+p95_prep_ops|standard|p2|yes|no|no|-|setup, stages c, t, b, r, u, s, o, z
 p2_4_scenario4|standard|p2|yes|yes|yes|-|all stages
 p2_4_stress|standard|p2|yes|yes|yes|-|all stages
 p2_4_restart|dedicated|-|-|-|-|-|-

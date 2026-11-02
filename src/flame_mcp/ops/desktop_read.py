@@ -7,7 +7,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp import selectors
-from flame_mcp.ops._common import build_source, list_result_src, offset_param
+from flame_mcp.list_fields import fields_note, fields_param
+from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.registry import Registry
 from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
 
@@ -24,7 +25,7 @@ _FIND_DESCRIPTION = (
     "Each item: type, name, uid, `selector` (wiretap; null when the entry has no wiretap id, "
     "e.g. a Batch group) and `parent` {type, name}. A search lists nothing from inside a closed "
     "library (a closed library reads as empty; library.list says which are closed); a library "
-    "that `parent` names is opened for the call and closed again."
+    "that `parent` names is opened for the call and closed again. " + fields_note()
 )
 
 _INFO_DESCRIPTION = (
@@ -126,10 +127,9 @@ def register(registry: Registry) -> None:
                     required=False,
                     item_type="string",
                 ),
-                OperationParam(
-                    name="limit", type="number", description="Max items to return.", required=False
-                ),
+                limit_param(),
                 offset_param(),
+                fields_param("desktop.find"),
             ),
             accepts=_FIND_PARENT_KINDS,
             precheck=_find_precheck,

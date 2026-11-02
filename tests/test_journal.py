@@ -201,6 +201,44 @@ def test_attribute_values_equal_ignores_letter_case_only_for_colour_labels(
     assert attribute_values_equal(key, a, b) is expected
 
 
+TIME = {"timecode": "01:00:00+10", "frame": 86410}
+RES = {
+    "type": "PyResolution",
+    "width": 1920,
+    "height": 1080,
+    "bit_depth": 16,
+    "frame_ratio": 1.7778,
+    "scan_mode": "P",
+}
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "expected"),
+    [
+        pytest.param(TIME, {"frame": 86410}, True, id="frame-same-timecode-not-asked"),
+        pytest.param(TIME, {"frame": 86411}, False, id="frame-differs"),
+        pytest.param(TIME, {"timecode": "01:00:00+10"}, True, id="timecode-same"),
+        pytest.param(TIME, {"timecode": "01:00:00+11"}, False, id="timecode-differs"),
+        pytest.param(TIME, {"timecode": "01:00:00:10"}, False, id="timecode-other-spelling"),
+        pytest.param(TIME, dict(TIME), True, id="both-keys-same"),
+        pytest.param(TIME, {"timecode": "01:00:00+10", "frame": 1}, False, id="both-frame-differs"),
+        pytest.param(TIME, {}, False, id="empty-expected"),
+        pytest.param(TIME, {"frame": 86410, "fps": "23.976 fps"}, False, id="extra-key"),
+        pytest.param(
+            {"type": "PyX", "name": "a", "n": 1}, {"name": "a"}, False, id="other-object-is-exact"
+        ),
+        pytest.param({"type": "PyX", "name": "a"}, {"type": "PyX", "name": "a"}, True, id="same"),
+        pytest.param(RES, {"width": 1920}, False, id="resolution-is-not-partial"),
+        pytest.param(RES, dict(RES), True, id="resolution-same"),
+        pytest.param(RES, {**RES, "width": 800}, False, id="resolution-differs"),
+    ],
+)
+def test_attribute_values_equal_takes_a_time_naming_only_one_of_its_keys(
+    a: Any, b: Any, expected: bool
+) -> None:
+    assert attribute_values_equal("current_time", a, b) is expected
+
+
 def state_of(*records: dict[str, Any], group: str = "g1") -> str:
     return Index(list(records)).group_state(group)
 

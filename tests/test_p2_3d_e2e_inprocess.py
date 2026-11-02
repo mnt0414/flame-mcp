@@ -83,13 +83,23 @@ def test_the_desktop_e2e_runs_to_the_end_against_the_fake(
         "d10_",
         "e1_",
         "e4_",
+        "f2_",
+        "f3_",
+        "f5_",
+        "f6_",
+        "f7_",
+        "f9_",
+        "f10_",
     ):
         assert any(n.startswith(stage) for n in names), stage
     assert "z_everything_this_run_made_is_deleted" in names and flame.exited is True
     assert results["opsUsed"] == [
+        "batch.add_clips",
+        "batch.create_reel",
         "desktop.arrange",
         "desktop.copy",
         "desktop.create",
+        "desktop.delete",
         "desktop.rename",
         "journal.list",
         "journal.revert",

@@ -48,7 +48,7 @@ Stages
      selector works, END of the destination) / a sequence (same segments) / a list of 2 (order) / a
      library reel / library -> Desktop (observed); revert puts them back with new selectors; a
      thing removed from the destination or an old parent that is gone = CONFLICT and nothing is
-     moved; Batch reels refused; same reel / selection destination / reel source refused;
+     moved; Batch reels refused; selection destination / reel source refused;
      `journal.check`.
   e  plan.run refuses the three ops; a READONLY server denies them.
   g  the journal: every group of this run is landed / reverted / conflict / failed / not_landed,

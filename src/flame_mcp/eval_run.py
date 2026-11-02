@@ -44,6 +44,7 @@ from flame_mcp.checkpointed import (
 from flame_mcp.eval_check import check_eval_code
 from flame_mcp.policy import Policy, deny_eval_effect
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ErrorCode, Refusal
 
 if TYPE_CHECKING:
@@ -102,10 +103,6 @@ def code_sha256(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
 def _execution_meta(op: RegisteredOperation) -> dict[str, Any]:
     meta = envelope_mod.execution_meta(op)
     meta["effect"] = "destructive"
@@ -126,7 +123,7 @@ def _refused(
         error=message,
         error_code=code,
         execution=_execution_meta(op),
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint_override=hint,
     )
 

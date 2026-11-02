@@ -762,6 +762,7 @@ def test_every_real_journaled_op_passes_reference_validation() -> None:
         "batch.set_attributes",
         "desktop.rename",
         "desktop.set_attributes",
+        "desktop.set_record_tc",
         "node.set_attributes",
         "segment.set_attributes",
     ]

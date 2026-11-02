@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Real-Flame end-to-end: `desktop.create` (Batch group / reel group / reel) and
-`desktop.copy`, with their journal groups and `journal.revert` (run with the `.venv` Python;
-`scripts/run_e2e.sh p2_3d_desktop` starts Flame).
+"""Real-Flame end-to-end: `desktop.create` (Batch group / reel group / reel), `desktop.copy` and
+`desktop.delete` (an empty schematic reel of a Batch group), with their journal groups and
+`journal.revert` (run with the `.venv` Python; `scripts/run_e2e.sh p2_3d_desktop` starts Flame).
 
-Checks: `desktop.create` (Batch group, reel group, reel), `desktop.copy` and `desktop.arrange`:
-names, `allow_rename`, refusals, the order a reel is built in, and `journal.revert`, including the
-cases where a revert is refused or skips an item that changed. A default Batch group is compared
-with one that Flame itself makes with only a name (the number of reels differs by Flame version).
+Checks: `desktop.create` (Batch group, reel group, reel), `desktop.copy`, `desktop.arrange` and
+`desktop.delete` of an empty schematic reel of a Batch group: names, `allow_rename`, refusals, the
+order a reel is built in, and `journal.revert`, including the cases where a revert is refused or
+skips an item that changed. A default Batch group is compared with one that Flame itself makes with
+only a name (the number of reels differs by Flame version). A deleted empty schematic reel leaves
+the node count, the other reels and the shelf reels as they were, comes back at the end under the
+same name, and a shelf reel, a reel with a clip and the last schematic reel of a group are refused.
 
 Same shape and helpers as scripts/p2_3c_render_e2e.py (imported from p2_2a / p1 / p2_4_common): a
 real MCP stdio client drives `python -m flame_mcp` against a live Flame + dev bridge;
@@ -46,11 +49,19 @@ Stages
   e  arrange: a Desktop reel with clip1, clip2 and clip3, another one built from it by one
      `desktop.arrange` of [move clip3, copy clip1, move clip2, copy clip1] (the reel lists the new
      clips in the order of the items, the copies' source stays, the moved ones are gone from the
-     source reel under their old uids), a move inside the source reel refused with nothing
-     journaled, and the revert (both reels read by transport are as they were; the source reel
-     keeps its order here because the moved clips were its last ones: a move goes back to the
-     end of its reel).
-  f  the journal: every group of this run is landed / reverted / conflict, none unknown; no intent
+     source reel under their old uids), a move inside the source reel with `position` refused with
+     nothing journaled, and the revert (both reels read by transport are as they were; the source
+     reel keeps its order here because the moved clips were its last ones: a move goes back to
+     the end of its reel).
+  f  desktop.delete of an empty schematic reel of a Batch group: a group that is not
+     current gets an empty reel from `batch.create_reel`, `desktop.delete` removes it (transport:
+     the reel is gone, `find_by_uid` finds nothing, the node count, the other reels' uids and the
+     shelf reels are as before), `journal.revert` makes a new empty schematic reel of the same
+     name at the end, a second revert is refused, a revert meets a reel of that name (CONFLICT);
+     a shelf reel, a reel that holds a clip and the last schematic reel of a group (also all of
+     a group's reels in one call) are refused with nothing journaled; an empty reel of the
+     current group is deleted too.
+  g  the journal: every group of this run is landed / reverted / conflict, none unknown; no intent
      left undecided, writes not blocked.
   z  cross-cutting checks; everything this run made is deleted by transport; then flame.exit().
 """
@@ -183,6 +194,30 @@ BATCH_CODE = "\n".join(
     ]
 )
 
+BATCH_REELS_CODE = "\n".join(
+    [
+        "def _wt(r):",
+        "    try:",
+        "        return r.get_wiretap_node_id()",
+        "    except BaseException as _e:",
+        "        return 'ERR:' + type(_e).__name__",
+        "_d = flame.projects.current_project.current_workspace.desktop",
+        "_m = [g for g in _d.batch_groups if _v(g.uid) == @UID@]",
+        "_cur = _v(_d.current_batch_group)",
+        "_g = _m[0] if _m else None",
+        "_result = None if _g is None else {",
+        "    'nodes': len(list(_g.nodes)),",
+        "    'currentUid': None if _cur is None else _v(_cur.uid),",
+        "    'reels': [[_v(r.name), str(_v(r.type)), _v(r.uid), len(list(r.clips)),",
+        "              len(list(r.sequences))] for r in _g.reels],",
+        "    'shelf': [[_v(r.name), str(_v(r.type)), _v(r.uid), _wt(r)] for r in _g.shelf_reels],",
+        "}",
+    ]
+)
+"""A Batch group's schematic reels [name, type, uid, clips, sequences] in list order, its shelf
+reels [name, type, uid, wiretap id], its node count and which group is current (read by transport,
+never by the ops under test)."""
+
 REFERENCE_BATCH_CODE = "\n".join(
     [
         "_d = flame.projects.current_project.current_workspace.desktop",
@@ -251,6 +286,10 @@ async def tx_current(ctx: Ctx) -> Any:
 
 async def tx_batch(ctx: Ctx, uid: str) -> Any:
     return await tx_val(ctx, fill(BATCH_CODE, UID=uid), "p23d_batch")
+
+
+async def tx_batch_reels(ctx: Ctx, uid: str) -> Any:
+    return await tx_val(ctx, fill(BATCH_REELS_CODE, UID=uid), "p23d_batch_reels")
 
 
 async def tx_batch_names(ctx: Ctx) -> Any:
@@ -1269,18 +1308,22 @@ async def stage_e(ctx: Ctx) -> None:
             session,
             ctx,
             "desktop.arrange",
-            {"destination": src, "items": [{"action": "move", "source": sel["clip1"]}]},
+            {
+                "destination": src,
+                "position": 0,
+                "items": [{"action": "move", "source": sel["clip1"]}],
+            },
         )
         src_same = await tx_reel(ctx, str(wt(src).get("id")))
         ok, parts = judged(
-            refused=a2.get("ok") is False and a2.get("errorCode") == "PRECONDITION_UNMET",
-            says_it_is_already_there="already in the destination" in str(a2.get("error")),
+            refused=a2.get("ok") is False and a2.get("errorCode") == "INVALID_ARGS",
+            says_position_cannot_be_combined="position" in str(a2.get("error")),
             nothing_was_journaled=len(groups_of(ctx)) == journal_before,
             the_reel_is_as_it_was=clip_uids(src_same) == clip_uids(src_after),
         )
         rec(
             ctx,
-            "e3_a_move_inside_the_source_reel_is_refused_and_nothing_is_written",
+            "e3_a_move_inside_the_destination_reel_with_position_is_refused_and_nothing_is_written",
             ok,
             clauses=parts,
             error=a2.get("error"),
@@ -1319,16 +1362,291 @@ async def stage_e(ctx: Ctx) -> None:
         )
 
 
+def reel_pairs(row: Any) -> list[list[Any]]:
+    """[name, uid] of every schematic reel in a `tx_batch_reels` row, in list order."""
+    return [[r[0], r[2]] for r in row["reels"]] if isinstance(row, dict) else []
+
+
+def delete_row(env: dict[str, Any]) -> dict[str, Any]:
+    rows = _result_of(env).get("deleted") or []
+    return rows[0] if rows and isinstance(rows[0], dict) else {}
+
+
 async def stage_f(ctx: Ctx) -> None:
-    written = groups_of(ctx)
+    g1, g2 = name_of(ctx, "BGDEL"), name_of(ctx, "BGDEL2")
+    only1, only2, empty = name_of(ctx, "ONLY1"), name_of(ctx, "ONLY2"), name_of(ctx, "EMPTY")
     async with server_session(ctx, "d-f") as session:
+        m1 = await wdo(session, ctx, "desktop.create", {"kind": "batch_group", "name": g1})
+        m2 = await wdo(
+            session,
+            ctx,
+            "desktop.create",
+            {"kind": "batch_group", "name": g2, "reels": [only1, only2]},
+        )
+        uid1, uid2 = str(_result_of(m1).get("uid")), str(_result_of(m2).get("uid"))
+        base1, base2 = await tx_batch_reels(ctx, uid1), await tx_batch_reels(ctx, uid2)
+        ok, parts = judged(
+            both_groups_made=m1.get("ok") is True and m2.get("ok") is True,
+            transport_reads_both=isinstance(base1, dict) and isinstance(base2, dict),
+            group_1_is_not_current=isinstance(base1, dict) and base1.get("currentUid") != uid1,
+            group_2_is_current=isinstance(base2, dict) and base2.get("currentUid") == uid2,
+            group_2_has_the_two_named_reels=reel_names(base2.get("reels") if base2 else [])
+            == [only1, only2],
+        )
+        rec(ctx, "f0_two_batch_groups_one_not_current_one_with_two_named_reels", ok, clauses=parts)
+        if not ok:
+            return
+
+        mk = await wdo(
+            session,
+            ctx,
+            "batch.create_reel",
+            {"target": {"kind": "batch", "uid": uid1}, "name": empty},
+        )
+        before = await tx_batch_reels(ctx, uid1)
+        names_before = reel_names(before["reels"]) if isinstance(before, dict) else []
+        old_uid = next((r[2] for r in before["reels"] if r[0] == empty), None)
+        ok, parts = judged(
+            op_ok=mk.get("ok") is True,
+            the_reel_is_last_and_empty=isinstance(before, dict)
+            and names_before == [*reel_names(base1["reels"]), empty]
+            and before["reels"][-1][3:] == [0, 0],
+            reel_type_is_schematic=isinstance(before, dict)
+            and before["reels"][-1][1].endswith("Schematic"),
+        )
+        rec(ctx, "f1_an_empty_schematic_reel_is_added_with_batch_create_reel", ok, clauses=parts)
+
+        target = {"kind": "path", "root": "desktop", "path": [g1, empty]}
+        d1 = await wdo(session, ctx, "desktop.delete", {"targets": [target]})
+        after = await tx_batch_reels(ctx, uid1)
+        found = await tx_find(ctx, str(old_uid))
+        row = delete_row(d1)
+        ok, parts = judged(
+            op_ok=d1.get("ok") is True,
+            group_was_not_current=isinstance(before, dict) and before.get("currentUid") != uid1,
+            the_row_names_the_reel_its_group_and_no_stash=(
+                row.get("from", {}).get("name") == empty
+                and row.get("from", {}).get("uid") == old_uid
+                and row.get("from", {}).get("parent", {}).get("uid") == uid1
+                and row.get("stash") is None
+            ),
+            transport_no_longer_lists_it=isinstance(after, dict)
+            and reel_pairs(after) == [p for p in reel_pairs(before) if p[0] != empty],
+            find_by_uid_finds_nothing=found is None,
+            node_count_is_the_same=isinstance(after, dict)
+            and isinstance(before, dict)
+            and after["nodes"] == before["nodes"],
+            the_op_read_the_same_node_count=row.get("nodeCountBefore")
+            == row.get("nodeCountAfter")
+            == (before or {}).get("nodes"),
+            shelf_reels_are_the_same=isinstance(after, dict)
+            and isinstance(before, dict)
+            and after["shelf"] == before["shelf"],
+            a_revert_is_offered=(d1.get("journal") or {}).get("revert", {}).get("op")
+            == "journal.revert",
+        )
+        rec(
+            ctx,
+            "f2_an_empty_schematic_reel_of_a_group_that_is_not_current_is_deleted_and_nothing_else",
+            ok,
+            clauses=parts,
+            error=d1.get("error"),
+            before=before,
+            after=after,
+        )
+
+        v1 = await revert(session, ctx, d1)
+        back = await tx_batch_reels(ctx, uid1)
+        new_row = back["reels"][-1] if isinstance(back, dict) and back["reels"] else None
+        ok, parts = judged(
+            op_ok=v1.get("ok") is True,
+            same_name_at_the_end=isinstance(back, dict)
+            and reel_names(back["reels"]) == names_before,
+            a_new_empty_schematic_reel=new_row is not None
+            and new_row[2] != old_uid
+            and new_row[1].endswith("Schematic")
+            and new_row[3:] == [0, 0],
+            the_other_reels_keep_their_uids=reel_pairs(back)[:-1]
+            == [p for p in reel_pairs(before) if p[0] != empty],
+            node_count_is_the_same=isinstance(back, dict)
+            and isinstance(before, dict)
+            and back["nodes"] == before["nodes"],
+        )
+        rec(
+            ctx,
+            "f3_revert_makes_a_new_empty_schematic_reel_of_the_same_name_at_the_end",
+            ok,
+            clauses=parts,
+            error=v1.get("error"),
+            back=back,
+        )
+        v2 = await revert(session, ctx, d1)
+        back2 = await tx_batch_reels(ctx, uid1)
+        rec(
+            ctx,
+            "f4_a_second_revert_is_refused_and_makes_no_second_reel",
+            v2.get("ok") is False and isinstance(back2, dict) and back2["reels"] == back["reels"],
+            error=v2.get("error"),
+        )
+
+        d2 = await wdo(session, ctx, "desktop.delete", {"targets": [target]})
+        again = await wdo(
+            session,
+            ctx,
+            "batch.create_reel",
+            {"target": {"kind": "batch", "uid": uid1}, "name": empty},
+        )
+        mid = await tx_batch_reels(ctx, uid1)
+        v3 = await revert(session, ctx, d2)
+        end = await tx_batch_reels(ctx, uid1)
+        ok, parts = judged(
+            deleted_then_made_again=d2.get("ok") is True and again.get("ok") is True,
+            revert_is_conflict=v3.get("ok") is False and v3.get("errorCode") == "CONFLICT",
+            no_reel_was_added=isinstance(mid, dict)
+            and isinstance(end, dict)
+            and end["reels"] == mid["reels"],
+        )
+        rec(
+            ctx,
+            "f5_revert_is_a_conflict_when_a_schematic_reel_of_that_name_exists",
+            ok,
+            clauses=parts,
+            error=v3.get("error"),
+        )
+
+        shelf = (base1["shelf"] or [[None, None, None, None]])[0]
+        shelf_wt = shelf[3]
+        journal_before = len(groups_of(ctx))
+        if isinstance(shelf_wt, str) and shelf_wt and not shelf_wt.startswith("ERR:"):
+            d3 = await wdo(
+                session, ctx, "desktop.delete", {"targets": [{"kind": "wiretap", "id": shelf_wt}]}
+            )
+            shelf_after = await tx_batch_reels(ctx, uid1)
+            ok, parts = judged(
+                refused=d3.get("ok") is False and d3.get("errorCode") == "PRECONDITION_UNMET",
+                says_shelf="shelf" in str(d3.get("error")),
+                shelf_reels_are_the_same=isinstance(shelf_after, dict)
+                and shelf_after["shelf"] == base1["shelf"],
+                nothing_was_journaled=len(groups_of(ctx)) == journal_before,
+            )
+            rec(ctx, "f6_a_shelf_reel_is_refused", ok, clauses=parts, error=d3.get("error"))
+        else:
+            observe(
+                ctx,
+                "f6_a_shelf_reel_has_no_wiretap_id_so_its_refusal_cannot_be_asked_for_here",
+                shelfWiretap=shelf_wt,
+            )
+
+        filled = reel_names(base1["reels"])[0]
+        add = await wdo(
+            session,
+            ctx,
+            "batch.add_clips",
+            {
+                "target": {"kind": "batch", "uid": uid1},
+                "reel": filled,
+                "clips": [ctx.ids["clipSelectors"][0]],
+            },
+        )
+        held = await tx_batch_reels(ctx, uid1)
+        journal_before = len(groups_of(ctx))
+        d4 = await wdo(
+            session,
+            ctx,
+            "desktop.delete",
+            {"targets": [{"kind": "path", "root": "desktop", "path": [g1, filled]}]},
+        )
+        held_after = await tx_batch_reels(ctx, uid1)
+        ok, parts = judged(
+            clip_was_added=add.get("ok") is True
+            and isinstance(held, dict)
+            and held["reels"][0][3] == 1,
+            refused=d4.get("ok") is False and d4.get("errorCode") == "PRECONDITION_UNMET",
+            says_only_an_empty_reel="only an empty reel" in str(d4.get("error")),
+            reels_and_nodes_are_the_same=isinstance(held_after, dict)
+            and isinstance(held, dict)
+            and held_after["reels"] == held["reels"]
+            and held_after["nodes"] == held["nodes"],
+            nothing_was_journaled=len(groups_of(ctx)) == journal_before,
+        )
+        rec(
+            ctx,
+            "f7_a_schematic_reel_that_holds_a_clip_is_refused",
+            ok,
+            clauses=parts,
+            error=d4.get("error"),
+        )
+
+        t_one = {"kind": "path", "root": "desktop", "path": [g2, only1]}
+        t_two = {"kind": "path", "root": "desktop", "path": [g2, only2]}
+        d5 = await wdo(session, ctx, "desktop.delete", {"targets": [t_one]})
+        g2_after = await tx_batch_reels(ctx, uid2)
+        ok, parts = judged(
+            op_ok=d5.get("ok") is True,
+            group_is_current=isinstance(g2_after, dict) and g2_after.get("currentUid") == uid2,
+            only_the_other_reel_is_left=reel_names(g2_after["reels"] if g2_after else [])
+            == [only2],
+            current_is_unchanged=isinstance(g2_after, dict)
+            and g2_after.get("currentUid") == base2.get("currentUid"),
+        )
+        rec(
+            ctx,
+            "f8_an_empty_schematic_reel_of_the_current_group_is_deleted",
+            ok,
+            clauses=parts,
+            error=d5.get("error"),
+        )
+
+        journal_before = len(groups_of(ctx))
+        d6 = await wdo(session, ctx, "desktop.delete", {"targets": [t_two]})
+        g2_last = await tx_batch_reels(ctx, uid2)
+        ok, parts = judged(
+            refused=d6.get("ok") is False and d6.get("errorCode") == "PRECONDITION_UNMET",
+            says_last="last" in str(d6.get("error")),
+            the_reel_is_still_there=reel_names(g2_last["reels"] if g2_last else []) == [only2],
+            nothing_was_journaled=len(groups_of(ctx)) == journal_before,
+        )
+        rec(
+            ctx,
+            "f9_the_last_schematic_reel_of_a_group_is_refused",
+            ok,
+            clauses=parts,
+            error=d6.get("error"),
+        )
+
+        v4 = await revert(session, ctx, d5)
+        g2_back = await tx_batch_reels(ctx, uid2)
+        journal_before = len(groups_of(ctx))
+        d7 = await wdo(session, ctx, "desktop.delete", {"targets": [t_two, t_one]})
+        g2_all = await tx_batch_reels(ctx, uid2)
+        ok, parts = judged(
+            revert_ok=v4.get("ok") is True,
+            two_reels_again=reel_names(g2_back["reels"] if g2_back else []) == [only2, only1],
+            refused=d7.get("ok") is False and d7.get("errorCode") == "PRECONDITION_UNMET",
+            both_reels_are_still_there=isinstance(g2_all, dict)
+            and isinstance(g2_back, dict)
+            and g2_all["reels"] == g2_back["reels"],
+            nothing_was_journaled=len(groups_of(ctx)) == journal_before,
+        )
+        rec(
+            ctx,
+            "f10_listing_every_schematic_reel_of_a_group_in_one_call_is_refused",
+            ok,
+            clauses=parts,
+            error=d7.get("error"),
+        )
+
+
+async def stage_g(ctx: Ctx) -> None:
+    written = groups_of(ctx)
+    async with server_session(ctx, "d-g") as session:
         listing = await do(session, ctx, "journal.list", {"limit": 100})
         items = _result_of(listing).get("items", [])
         states = {i.get("group"): i.get("state") for i in items}
         own = journal_states(ctx)
         rec(
             ctx,
-            "f_every_group_of_this_run_is_landed_reverted_or_conflict",
+            "g_every_group_of_this_run_is_landed_reverted_or_conflict",
             listing.get("ok") is True
             and len(own) == len(written)
             and set(own.values()) <= GOOD_STATES
@@ -1339,7 +1657,7 @@ async def stage_f(ctx: Ctx) -> None:
         info = _result_of(await version_info(session, ctx)).get("journal", {})
         rec(
             ctx,
-            "f_no_intent_is_left_undecided_and_writes_are_not_blocked",
+            "g_no_intent_is_left_undecided_and_writes_are_not_blocked",
             info.get("unresolvedIntents") == 0 and info.get("writesBlocked") is False,
             journal={k: info.get(k) for k in ("unresolvedIntents", "writesBlocked")},
         )
@@ -1397,6 +1715,7 @@ async def async_main(ctx: Ctx) -> None:
                 ("d", stage_d),
                 ("e", stage_e),
                 ("f", stage_f),
+                ("g", stage_g),
             ):
                 await guarded(ctx, name, stage)
         else:

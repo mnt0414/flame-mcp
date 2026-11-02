@@ -2,7 +2,8 @@
 
 `journal.check` uses the check of each step's own op.
 
-A group holds one intent per item, a `desktop_copy` or a `desktop_move` (`desktop_arrange_run`).
+A group holds one intent per item, a `desktop_copy` or a `desktop_move`, and with `position` one
+more `desktop_move` last, the shift of the entries that were behind it (`desktop_arrange_run`).
 The revert goes through them newest first and puts each back by the revert of its own op
 (`desktop_revert.DEFAULT_REVERT` deletes the copies, `desktop_media_run.MEDIA_REVERT` moves the
 things back), each as a revert group of its own. A step that cannot be put back (a copy that was

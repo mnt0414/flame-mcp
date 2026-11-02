@@ -40,7 +40,7 @@ from flame_mcp.timeline_checkpoints import (
     REEL_PREFIX,
     checkpoint_library_name,
 )
-from flame_mcp.types import Category, OperationSpec, ServerOpError, ServerResult
+from flame_mcp.types import Category, OperationSpec, Refusal, ServerOpError, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -62,6 +62,7 @@ UNRECORDED_NOTE: Final[str] = (
     "purge's deleted copies show as `missing` in a dry run."
 )
 DEFAULT_OLDER_THAN_DAYS: Final[int] = 30
+MAX_GROUPS: Final[int] = 50
 TOKEN_LENGTH: Final[int] = 32
 
 
@@ -165,13 +166,81 @@ def _stash_uid(record: Mapping[str, Any]) -> str | None:
     return uid if isinstance(uid, str) and uid else None
 
 
-def _candidates(index: Index, cutoff: datetime) -> list[dict[str, Any]]:
-    """The recorded, not yet purged timeline checkpoints older than `cutoff`, oldest first."""
+def groups_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
+    """Refuse with INVALID_ARGS a `groups` argument that is not 1 to 50 distinct non-empty strings,
+    or that comes with `older_than_days` (which has no default filled in, so its presence in
+    `args` is the caller's own); nothing is sent to Flame. The type of the array and its elements
+    and ASCII are checked against the schema before this runs."""
+    if "groups" not in args:
+        return None
+    groups = args["groups"]
+    problems: list[str] = []
+    if "older_than_days" in args:
+        problems.append(
+            "`groups` and `older_than_days` cannot be given together: groups selects by journal "
+            "group and does not look at the date"
+        )
+    if not 1 <= len(groups) <= MAX_GROUPS:
+        problems.append(f"`groups` must be 1 to {MAX_GROUPS} journal group ids")
+    if "" in groups:
+        problems.append("`groups` must hold non-empty strings")
+    if len(set(groups)) != len(groups):
+        problems.append("`groups` must not list a group twice")
+    if not problems:
+        return None
+    return Refusal(
+        "INVALID_ARGS",
+        "nothing was sent to Flame: " + "; ".join(problems),
+        result={"ran": False, "problems": problems},
+    )
+
+
+def _timeline_records_by_group(index: Index, groups: list[str]) -> dict[str, list[str]]:
+    """`groups` -> the ids of the timeline checkpoints the journal records for each."""
+    wanted = set(groups)
+    found: dict[str, list[str]] = {}
+    for record in recorded_timeline_checkpoints(index):
+        group = record.get("group")
+        if isinstance(group, str) and group in wanted:
+            found.setdefault(group, []).append(str(record.get("id")))
+    return found
+
+
+def check_groups(index: Index, groups: list[str]) -> list[str]:
+    """Refuse (INVALID_ARGS) a group the journal holds no Timeline checkpoint for; return the
+    groups whose checkpoints are all purged already."""
+    by_group = _timeline_records_by_group(index, groups)
+    missing = [g for g in groups if g not in by_group]
+    if missing:
+        listed = ", ".join(missing)
+        raise ServerOpError(
+            "INVALID_ARGS",
+            f"nothing was deleted: the journal records no Timeline checkpoint for group(s) "
+            f"{listed}. Check the id (journal.list_checkpoints shows each checkpoint's `group`). "
+            "A group that only has a Batch checkpoint is not selectable either: the setup file of "
+            "a Batch checkpoint is not touched by this op",
+            result={"ran": False, "groupsWithoutTimelineCheckpoint": missing},
+            hint="Nothing was changed.",
+        )
+    return [g for g in groups if all(i in index.purged for i in by_group[g])]
+
+
+def _candidates(
+    index: Index, cutoff: datetime | None, groups: list[str] | None
+) -> list[dict[str, Any]]:
+    """The recorded, not yet purged timeline checkpoints that were recorded before `cutoff`, or
+    (when `groups` is given, and the date is not looked at) that belong to one of `groups`,
+    oldest first."""
     found = []
     for record in recorded_timeline_checkpoints(index):
         ts = _parse_ts(record.get("ts"))
         uid = _stash_uid(record)
-        if record.get("id") in index.purged or ts is None or uid is None or ts >= cutoff:
+        if record.get("id") in index.purged or ts is None or uid is None:
+            continue
+        if groups is not None:
+            if record.get("group") not in groups:
+                continue
+        elif cutoff is None or ts >= cutoff:
             continue
         found.append(record)
     return sorted(found, key=lambda r: str(r.get("ts")))
@@ -198,9 +267,13 @@ def _candidate_row(record: Mapping[str, Any], found: Mapping[str, Any]) -> dict[
 
 
 def _scan(
-    ctx: ServerContext, index: Index, library: str, cutoff: datetime
+    ctx: ServerContext,
+    index: Index,
+    library: str,
+    cutoff: datetime | None,
+    groups: list[str] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    records = _candidates(index, cutoff)
+    records = _candidates(index, cutoff, groups)
     known = [
         uid for r in recorded_timeline_checkpoints(index) if (uid := _stash_uid(r)) is not None
     ]
@@ -241,14 +314,17 @@ def _purge_batches(
     return done, None
 
 
-def purge_token(rows: list[dict[str, Any]]) -> str:
+def purge_token(rows: list[dict[str, Any]], groups: list[str] | None = None) -> str:
     """A digest of the candidate list (id, recorded uid and name, whether the copy is there and
-    still has that name): the dry run hands it out, and a real run is only allowed when the list
-    it would delete from still digests to the same value."""
-    material = [
+    still has that name) and, when the candidates were chosen by `groups`, of the sorted groups:
+    the dry run hands it out, and a real run is only allowed when the list it would delete from
+    still digests to the same value."""
+    material: list[Any] = [
         [r["id"], r["stash"]["uid"], r["stash"]["name"], r["exists"], r["nameMatches"]]
         for r in rows
     ]
+    if groups is not None:
+        material = [material, sorted(groups)]
     return hashlib.sha256(json.dumps(material).encode("utf-8")).hexdigest()[:TOKEN_LENGTH]
 
 
@@ -258,7 +334,7 @@ def _token_refusal(given: Any, current: str, count: int) -> ServerOpError | None
     elif given != current:
         reason = (
             "the `token` is not the one for what would be deleted now (the candidates changed "
-            "since that dry run, or it was run with another older_than_days)"
+            "since that dry run, or it was run with another older_than_days / groups)"
         )
     else:
         return None
@@ -349,14 +425,17 @@ def _not_deleted_error(result: dict[str, Any], purged: int, failed: int) -> Serv
 
 
 def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
-    days = int(args["older_than_days"])
+    raw_groups = args.get("groups")
+    groups = [str(g) for g in raw_groups] if raw_groups is not None else None
+    days = None if groups is not None else int(args.get("older_than_days", DEFAULT_OLDER_THAN_DAYS))
     dry_run = bool(args["dry_run"])
     library = checkpoint_library_name()
-    cutoff = datetime.now(UTC) - timedelta(days=days)
+    cutoff = datetime.now(UTC) - timedelta(days=days) if days is not None else None
     with ctx.write_lock:
         index = Index(ctx.journal.read_all().records)
-        rows, scan = _scan(ctx, index, library, cutoff)
-        token = purge_token(rows)
+        already_purged = check_groups(index, groups) if groups is not None else []
+        rows, scan = _scan(ctx, index, library, cutoff, groups)
+        token = purge_token(rows, groups)
         if not dry_run:
             refusal = _token_refusal(args.get("token"), token, len(rows))
             if refusal is not None:
@@ -366,6 +445,8 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
         base: dict[str, Any] = {
             "dryRun": dry_run,
             "olderThanDays": days,
+            "groups": groups,
+            "groupsAlreadyPurged": already_purged,
             "library": library,
             "libraryFound": scan.get("libraryFound"),
             "candidates": rows,
@@ -399,6 +480,7 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
             "id": record_id,
             "ts": now_iso(),
             "olderThanDays": days,
+            "groups": groups,
             "library": library,
             "purged": purged,
             "gone": [r["id"] for r in gone] if failure is None else [],

@@ -267,9 +267,51 @@ _TE_TIMEWARP_NOTICE = (
 )
 
 
+_TE_REPLACE_READS = (
+    ('name', 'name'),
+    ('sourceWidth', 'source_width'),
+    ('sourceHeight', 'source_height'),
+    ('filePath', 'file_path'),
+    ('sourceUid', 'source_uid'),
+)
+_TE_REPLACE_JUDGED = ('name', 'sourceWidth', 'sourceHeight')
+_TE_UNVERIFIED_NOTICE = (
+    'the replace changed nothing a read can see (name, source size, source name, range, head, '
+    'tail) and the new clip looks like the segment as it is, so it '
+    'cannot be told from a swap that did happen (a comp swapped for one of the same name and '
+    'size looks like this): export the segment and compare the pixels'
+)
+
+
 def _te_replace_key(facts, key):
     value = facts[key]
     return value['frame'] if isinstance(value, dict) else value
+
+
+def _te_replace_reads(seg):
+    # None = could not be read (a name Flame does not carry answers None): left out of comparisons
+    return {
+        key: _try(lambda attr=attr: _j(getattr(seg, attr, None))) for key, attr in _TE_REPLACE_READS
+    }
+
+
+def _te_replace_moved(before, after):
+    moved = [k for k in _TE_REPLACE_KEYS if _te_replace_key(before, k) != _te_replace_key(after, k)]
+    for key in _TE_REPLACE_JUDGED:
+        if before[key] is not None and after[key] is not None and before[key] != after[key]:
+            moved.append(key)
+    return moved
+
+
+def _te_replace_differs(source, after):
+    # whether the new clip is not what the segment shows now (a swap that happened would have made
+    # it so); a pair with an unreadable side says nothing
+    wanted = (
+        ('name', _try(lambda: _j(source.name))),
+        ('sourceWidth', _try(lambda: _j(source.width))),
+        ('sourceHeight', _try(lambda: _j(source.height))),
+    )
+    return any(v is not None and after[k] is not None and v != after[k] for k, v in wanted)
 
 
 def _te_replace(seg, parent, version, track, source, mode):
@@ -283,6 +325,7 @@ def _te_replace(seg, parent, version, track, source, mode):
         after=None,
         position=None,
         returned=None,
+        verified=None,
         effects={'before': _te_fx_types(seg), 'after': None},
         connected={'count': connected, 'error': problem},
         notices=[_sc_replace_notice(connected)] if connected else [],
@@ -292,6 +335,7 @@ def _te_replace(seg, parent, version, track, source, mode):
     if 'Timewarp' in out['effects']['before']:
         out['notices'].append(_TE_TIMEWARP_NOTICE)
     before = out['before']
+    before.update(_te_replace_reads(seg))
     if mode == 'media':
         returned = seg.smart_replace_media(source)
     else:
@@ -307,17 +351,25 @@ def _te_replace(seg, parent, version, track, source, mode):
             + repr(_tl_track_rows(parent, version, track)[:40]),
         )
     after = _tl_seg_facts(found)
+    after.update(_te_replace_reads(found))
     out['after'] = after
     out['effects']['after'] = _te_fx_types(found)
     out['position'] = _tl_position(parent, version, track, index, found)
-    moved = [k for k in _TE_REPLACE_KEYS if _te_replace_key(before, k) != _te_replace_key(after, k)]
+    moved = _te_replace_moved(before, after)
     out['changed'] = moved
-    if not moved:
+    if moved:
+        out['verified'] = True
+    elif not _te_replace_differs(source, after):
+        out['verified'] = False
+        out['notices'].append(_TE_UNVERIFIED_NOTICE)
+    else:
         return _te_fail(
             out,
             'SILENT_NOOP',
             'smart_replace' + ('_media' if mode == 'media' else '') + ' returned '
-            + repr(out['returned']) + ' and the segment is the same (source '
+            + repr(out['returned']) + ' and the segment is the same (name '
+            + repr(before['name']) + ', source size ' + repr(before['sourceWidth']) + 'x'
+            + repr(before['sourceHeight']) + ', source '
             + repr(before['sourceName']) + ', source range '
             + str(before['sourceIn']['frame']) + '-' + str(before['sourceOut']['frame'])
             + ', head ' + repr(before['head']) + ', tail ' + repr(before['tail'])

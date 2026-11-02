@@ -37,6 +37,7 @@ from flame_mcp.callargs import apply_param_defaults
 from flame_mcp.journal import attribute_values_equal, new_id, now_iso
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
@@ -63,10 +64,6 @@ EXPECTED_ARG: Final[str] = "_expected"
 declared parameter, so `validate_op_args` rejects it from a caller."""
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
 def _fail(
     op: RegisteredOperation,
     code: ErrorCode,
@@ -84,7 +81,7 @@ def _fail(
         error=message,
         error_code=code,
         execution=envelope_mod.execution_meta(op),
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint_override=hint,
     )
 
@@ -150,16 +147,33 @@ def _read_values(pre: Mapping[str, Any], keys: list[str]) -> tuple[dict[str, Any
     return before, rejected
 
 
+_TIME_FORM: Final[frozenset[str]] = frozenset({"timecode", "frame"})
+
+
+def _completed_value(before: Any, value: Any) -> Any:
+    """One value of `_completed_after`."""
+    if not isinstance(value, dict) or not isinstance(before, dict):
+        return value
+    if before.get("type") == "PyResolution":
+        return {**before, **value}
+    if set(before) == _TIME_FORM:
+        # a PyTime reads as {timecode, frame}; keep the one thing the write named (the frame
+        # wins), so a read can be compared with it: a timecode of the old value, or an fps,
+        # would never match. A value naming neither is left as it is: `values` is the raw
+        # argument and the op's own preflight refuses it.
+        if "frame" in value:
+            return {"frame": value["frame"]}
+        if "timecode" in value:
+            return {"timecode": value["timecode"]}
+    return value
+
+
 def _completed_after(before: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
-    """`values` as the attributes will read once written. An object value (a resolution) names
-    only the fields it changes; the others keep what the pre-read found, so the intent's `after`
-    can be compared with a later read of the whole object (`journal.check`, a revert)."""
-    return {
-        key: {**before[key], **value}
-        if isinstance(value, dict) and isinstance(before.get(key), dict)
-        else value
-        for key, value in values.items()
-    }
+    """`values` as the attributes will read once written. A resolution names only the fields it
+    changes; the others keep what the pre-read found, so the intent's `after` can be compared
+    with a later read of the whole object (`journal.check`, a revert). A time keeps only the
+    `frame` (or, when none was given, the `timecode`) that was written."""
+    return {key: _completed_value(before.get(key), value) for key, value in values.items()}
 
 
 def _outcome_record(
@@ -232,7 +246,7 @@ def run_journaled_write(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
 

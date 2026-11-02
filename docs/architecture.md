@@ -332,12 +332,28 @@ Every tool returns one shape.
 | `notices` | Short warnings, such as an untested Flame version or an unavailable Media Panel. |
 | `durationMs` | Time spent on the call. |
 
+With `FLAME_MCP_RESPONSE=compact`, fields are left out of this shape (see [Compact responses](#compact-responses)). The default, `full`, sends every field. Any other value stops the server at start-up.
+
 ### Limiting response size
 
-Two mechanisms keep a response small:
+Three mechanisms keep a response small:
 
 1. **Paging.** Operations that list things take `limit` and `offset` and return `total`, `shown`, and `truncated`. The server fills a default `limit` of 50 and clamps it to a maximum of 500 (an operation can declare its own values). A `limit` of 0 or less becomes 1, not "no limit". Each change appears in `degraded`.
 2. **A byte budget of 60,000 bytes** for the whole envelope. If the envelope is larger, the server applies these steps in order and stops when it fits: cut the traceback and the logs to their last 20 lines, replace lists in `result` with a count, and finally write the envelope as it was before those cuts (full traceback, logs and `result`) to a file in the `spill` directory and return its path in `result.spilledTo`. Each step is recorded in `degraded`. The spill file is named `<32 lowercase hex characters>.json`. When the server starts, it removes spill files older than 7 days that have this form of name, and it leaves other files in the folder alone.
+3. **`fields`.** `desktop.list_children`, `desktop.list_all`, `desktop.find`, and `timeline.list_segments` take `fields`, the members of each item to keep. The code sent to Flame is the same with or without it: the server checks the names before it sends anything (an unknown name is `INVALID_ARGS`, also in a step of `plan.run`) and cuts the items after the operation answers. An item that could not be read keeps its `error`.
+
+### Compact responses
+
+With `FLAME_MCP_RESPONSE=compact`, the server rewrites each envelope before it returns it. Both the text and the structured content of the tool result carry the compact form.
+
+* A field that is null, `[]`, `{}`, or an empty string is not sent, so `affected` and `undoSteps` are missing when they are 0. `ok` is always sent. `execution` is sent only when `ok` is false. `context` is kept.
+* Inside `result`, a member that is null is not sent, and a `wiretapId` equal to the id of the wiretap selector next to it is not sent.
+* Inside `result`, a list of 3 or more objects whose members are all plain values is sent as `{columns, rows}`. A nested object becomes dotted column names (`selector.id`), and a list of plain values can be a cell. Row *i* is the *i*-th object, and a null cell is a member that object did not have. Any other list keeps its form.
+* What sits under `revert`, `inverse`, and `args` is left as it is, because the assistant passes it back in a later call.
+
+When the compact envelope is over the byte budget, the server applies the budget to the full envelope first and then makes the result compact. Making it compact first would turn the lists into tables that the budget no longer recognizes as lists, and the envelope would go to a spill file instead of having its lists replaced with a count.
+
+In compact mode, the server adds one sentence about the form to its instructions, and `flame_context` returns the full description as `responseFormat`. Clients that start their own server for a fixed purpose (the end-to-end tests) set `FLAME_MCP_RESPONSE=full`, whatever the environment they inherit.
 
 ## Selectors
 

@@ -2,8 +2,8 @@
 
 Like `timeline_build_prelude`: real Python source that `execution.build_exec_code` places ahead
 of an op's own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try`,
-`_OpError`, `_segment_list` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` / `_sc_*`
-helpers already defined.
+`_OpError`, `_segment_list`, `_te_fail` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` /
+`_sc_*` helpers already defined.
 
 What it encodes (measured on Flame 2025.2.4; the extract first with the sequence open in the
 Timeline, then lift, a sequence that is not shown in the Timeline, a Gap, several
@@ -333,7 +333,7 @@ def _td_delete_check(seq, version, track, record_ins, expect, ripple):
         return out
     method = _TD_METHODS[ripple]
     if not callable(getattr(seq, method, None)):
-        return _tb_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'this Flame has no PySequence.' + method + ': nothing was done',
@@ -341,11 +341,11 @@ def _td_delete_check(seq, version, track, record_ins, expect, ripple):
     out['before'] = _td_state(seq, version, track)
     found, code, message = _td_resolve(seq, version, track, record_ins, expect)
     if message is not None:
-        return _tb_fail(out, code, message)
+        return _te_fail(out, code, message)
     out['targets'] = [_td_removed(i, s) for i, s in found]
     unselectable = _td_unselectable(seq)
     if unselectable:
-        return _tb_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'the sequence has a selection that selecting segments cannot clear: '
@@ -356,7 +356,7 @@ def _td_delete_check(seq, version, track, record_ins, expect, ripple):
     try:
         _td_selected(found[0][1])
     except BaseException as exc:
-        return _tb_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'PySegment.selected cannot be read (' + type(exc).__name__ + ': ' + str(exc)
@@ -652,7 +652,7 @@ def _td_delete(seq, version, track, record_ins, expect, ripple, library_name, re
             )
     if problem is not None:
         out['ran'] = False
-        return _tb_fail(out, 'FLAME_API_ERROR', problem + ': nothing was removed')
+        return _te_fail(out, 'FLAME_API_ERROR', problem + ': nothing was removed')
     got, shape = _ex_answer(returned)
     out['returned'] = {'shape': shape, 'types': [type(o).__name__ for o in got]}
     new = _dm_new_entries(before_uids, _dm_media_children(reel))
@@ -675,14 +675,14 @@ def _td_delete(seq, version, track, record_ins, expect, ripple, library_name, re
     duration = _try(lambda: _v(seq.duration).frame)
     out['changed'] = video_changed or audio_changed
     if out['exception'] is not None:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             what + ' raised ' + out['exception'] + ' (the track '
             + ('CHANGED: read result.after' if out['changed'] else 'is unchanged') + ')',
         )
     if not out['changed']:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             method + '() returned ' + repr(out['returned']['shape']) + ' and nothing in the '
@@ -709,7 +709,7 @@ def _td_delete(seq, version, track, record_ins, expect, ripple, library_name, re
     )
     out['warnings'].extend(notes)
     if problems and ripple:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'the sequence changed, but not the way ' + method + ' is measured to change it: '

@@ -61,7 +61,7 @@ from flame_mcp.render_files import (
     written_since,
 )
 from flame_mcp.render_plan import frames_of, preflight_problems
-from flame_mcp.transport import BridgeProtocolError
+from flame_mcp.transport import BridgeProtocolError, elapsed_ms
 from flame_mcp.types import ErrorCode, ServerOpError
 from flame_mcp_bridge.impl import FEATURE_CLIENT_HANDLE
 
@@ -84,10 +84,6 @@ HANDLE_SOURCE_CLIENT: Final[str] = "client"
 _PENDING_NOTE: Final[str] = (
     "the bridge answered with a pending handle: the render was still running when timeout_s elapsed"
 )
-
-
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
 
 
 def _new_client_handle(rt: Runtime) -> str | None:
@@ -113,7 +109,7 @@ def _refusal(
         error=message,
         error_code=code,
         execution=envelope_mod.execution_meta(op),
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint_override=hint,
     )
 
@@ -264,7 +260,9 @@ def _unknown_end(
     client_handle: str | None,
     *,
     reads: str = "Flame and the output files",
+    noun: str = "render",
 ) -> dict[str, Any]:
+    """`noun` is what the hint and the notes call the thing that may still be running."""
     ctx.guard.block(intent_id, group_id, op.name, code)
     note_unresolved(ctx, intent_id, group_id, env)
     handle = (env.get("pending") or {}).get("handle")
@@ -289,20 +287,20 @@ def _unknown_end(
         except OSError:
             pass  # the intent alone says "in doubt"; without the handle check falls back to files
     if env.get("pending") is not None or env.get("ok") is True:
-        _fail_env(env, "TIMEOUT", _PENDING_NOTE)
+        _fail_env(env, "TIMEOUT", _PENDING_NOTE.replace("render", noun))
     hint = str(env.get("hint") or "")
     handle_note = (
-        f" If the bridge received the call it keeps the render's result under handle "
+        f" If the bridge received the call it keeps the {noun}'s result under handle "
         f"{client_handle} (chosen by this server), and journal.check fetches it once the "
         "bridge answers again."
         if client_handle is not None
         else ""
     )
     env["hint"] = (
-        f"{hint} It is not known whether the render finished: a Foreground render keeps "
+        f"{hint} It is not known whether the {noun} finished: a Foreground {noun} keeps "
         "Flame occupied and a TIMEOUT does not stop it. This server now refuses every "
         f"write until journal.check (group={group_id!r}) has read {reads} "
-        f"again.{handle_note} {BRIDGE_BUSY_NOTE}"
+        f"again.{handle_note} {BRIDGE_BUSY_NOTE.replace('render', noun)}"
     ).strip()
     env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
     return env
@@ -361,7 +359,7 @@ def run_render(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         try:
@@ -611,7 +609,7 @@ def _finish(
     env["partial"] = {"written": written, "expected": expected} if checked else None
     env["degraded"] = [*env.get("degraded", []), *degraded]
     env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    env["durationMs"] = _elapsed_ms(started)
+    env["durationMs"] = elapsed_ms(started)
     record = _outcome_record(intent_id, group_id, ok, code, message, rows, written, expected, flame)
     try:
         rt.journal.append(record)

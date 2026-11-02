@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import fake_media_tree  # noqa: F401  (first: it imports the fakes that extend it, in its order)
 import fake_segment_edit as fse
 from fake_media_tree import (
     FakeFlame,

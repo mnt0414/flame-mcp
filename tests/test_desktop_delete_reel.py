@@ -114,10 +114,11 @@ def test_a_reel_of_the_library_is_refused_even_when_empty(rig: Rig) -> None:
     assert LIBREEL["kind"] == "wiretap"
 
 
-def test_a_reel_of_a_batch_group_is_refused(rig: Rig) -> None:
+def test_the_only_schematic_reel_of_a_batch_group_is_refused(rig: Rig) -> None:
     batch_reel = rig.handles["bg1"].create_reel("Schematic Reel 1")
     env = delete(rig, [wt(batch_reel.get_wiretap_node_id())])
-    assert env["errorCode"] == "INVALID_ARGS" and "Batch group" in env["error"]
+    assert env["errorCode"] == "PRECONDITION_UNMET" and "last" in env["error"]
+    assert [str(r.name.get_value()) for r in rig.handles["bg1"].reels] == ["Schematic Reel 1"]
     assert untouched_world(rig)
 
 

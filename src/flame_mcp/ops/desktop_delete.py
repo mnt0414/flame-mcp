@@ -24,7 +24,6 @@ from flame_mcp.desktop_run import (
     PHASE_WRITE,
 )
 from flame_mcp.ops._common import build_source, raise_on_error_src
-from flame_mcp.ops._media_phases import alive_source
 from flame_mcp.registry import Registry
 from flame_mcp.timeline_checkpoints import (
     DEFAULT_LIBRARY,
@@ -40,22 +39,36 @@ from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
 _DESCRIPTION = (
-    "Delete clips / sequences, and reels that hold no clip and no sequence (flame.delete, "
-    "confirm=False). Each clip / sequence is first copied into the "
+    "Delete clips / sequences, and empty reels: a reel of a Desktop reel group, or a schematic "
+    "reel of a Batch group (flame.delete, confirm=False). Each clip / sequence is first copied "
+    "into the "
     f"stash reel of the checkpoint library ('{DEFAULT_LIBRARY}', reel '{REEL_PREFIX}<YYMMDD>'; the "
     f"environment variable {LIBRARY_ENV} names another library) so that journal.revert can put it "
     f"back. `targets`: 1 to {MAX_SOURCES} wiretap / path / selection selectors, each a PyClip or "
-    "a PySequence on the Desktop, or an empty PyReel of a Desktop reel group. Refused before "
-    "anything is copied or "
+    "a PySequence on the Desktop, an empty PyReel of a Desktop reel group, or an empty schematic "
+    "PyReel of a Batch group on the Desktop (the group need not be current; a path selector "
+    "reaches it as root='desktop', [batch group, reel]). Refused before anything is copied or "
     "written: something inside a library, whichever library (PRECONDITION_UNMET: library "
     "contents are never deleted by this server; what the checkpoint library holds is cleaned up "
     "with journal.purge_checkpoints), a reel that holds a clip or a sequence (PRECONDITION_UNMET: "
     "deleting a reel of a Batch group also deletes the Clip nodes that use its clips), a "
     "reel group, a folder, a library or a Batch group (PRECONDITION_UNMET: only clips, "
-    "sequences and empty reels are deleted), a reel of a Batch group or something inside "
-    "one (INVALID_ARGS), the same thing listed twice (INVALID_ARGS), a reel whose type "
-    "cannot be read (PRECONDITION_UNMET). An empty reel has no stash and no checkpoint "
-    "(result.deleted[].stash is null) and is checked empty again at the write (else CONFLICT). "
+    "sequences and empty reels are deleted; batch.delete deletes a Batch group), a shelf reel "
+    "of a Batch group (PRECONDITION_UNMET), "
+    "a schematic reel that is, or together with the other targets of the call would leave, the "
+    "last schematic reel of its Batch group (PRECONDITION_UNMET: at least one stays), a clip "
+    "or a sequence inside a reel of a Batch group (INVALID_ARGS), the same thing listed twice "
+    "(INVALID_ARGS), a reel whose type cannot be read (PRECONDITION_UNMET). An empty reel has "
+    "no stash and no checkpoint (result.deleted[].stash is null) and is checked empty again at "
+    "the write (else CONFLICT). A Batch reel is found by looking for its uid in the Batch "
+    "groups of the Desktop, so a reel of a Batch group that is not on the Desktop is refused "
+    "(PRECONDITION_UNMET), and so is a reel of a Batch group whose nodes cannot be counted. At "
+    "the write the reel must still be a schematic reel of the same Batch group and not the "
+    "group's last one, else CONFLICT and nothing is deleted. For a reel of a Batch group the "
+    "Batch group's node count is read before and after each delete "
+    "(result.deleted[].nodeCountBefore / nodeCountAfter); a count that changed is "
+    "FLAME_API_ERROR (the reel stays journaled: nodes deleted with it are not brought back by "
+    "journal.revert). "
     "FLOW: every target's type, name, uid, parent and fingerprint (timeline.fingerprint: segments "
     "and effects) are read and journaled first; each target is copied into the stash and the "
     "copy's fingerprint must equal the original's (a copy that fails ends the call before anything "
@@ -81,7 +94,8 @@ _DESCRIPTION = (
     "deleted, journaled and revertible. "
     "JOURNAL as desktop.move (intent -> compare-and-swap -> outcome with the deletes). Envelope "
     "journal = {group, id, revert}. journal.check of a call whose answer was lost: every old "
-    "uid gone = landed, every one still there = not_landed, else diverged. "
+    "uid gone = landed, every one still there = not_landed, else diverged; a Batch reel whose "
+    "Batch group is gone cannot be told (unknown). "
     "Undo: journal.revert(group) copies each stashed copy back into the thing's old parent "
     "(flame.media_panel.copy): the thing has a new uid and wiretap id and is at the end of the "
     "reel (its old place is not restored) -- result.reverted[].to.selector; a sequence that was "
@@ -89,7 +103,9 @@ _DESCRIPTION = (
     "new empty reel of the same name and type at the end of its old reel group (new uid; its "
     "old place, colour and other attributes are not restored; a CONFLICT if that group already "
     "has a reel of that name; a made reel with another name is deleted again and reported). A "
-    "thing whose old parent is gone, "
+    "schematic reel of a Batch group is made again the same way with PyBatch.create_reel (the "
+    "end of the group's schematic reels; a CONFLICT if the group is gone or already has a "
+    "schematic reel of that name). A thing whose old parent is gone, "
     "or whose stashed copy is gone (journal.purge_checkpoints) or changed, stays a CONFLICT "
     "while the others are put back (result.partial); a second revert puts back only what the "
     "first one did not. The stashed copies stay in the checkpoint library until "
@@ -105,7 +121,8 @@ def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
 def _delete_to_python(args: Mapping[str, Any]) -> str:
     phase = args.get(PHASE_ARG, PHASE_WRITE)
     if phase == PHASE_ALIVE:
-        return alive_source(args)
+        items = list(args[CREATED_ARG]["items"])
+        return build_source(f"_result = _dd_alive({items!r})", "_affected = 0")
     if phase == PHASE_REVERT:
         return build_source(
             f"_result = _dd_revert({dict(args[CREATED_ARG])!r})",
@@ -177,8 +194,8 @@ def register(registry: Registry) -> None:
                     description=(
                         f"1 to {MAX_SOURCES} selectors of clips / sequences / empty reels: "
                         "wiretap, path (root='desktop' for the Desktop) or selection; each must "
-                        "resolve to one PyClip / PySequence, or an empty PyReel of a Desktop reel "
-                        "group."
+                        "resolve to one PyClip / PySequence, an empty PyReel of a Desktop reel "
+                        "group, or an empty schematic PyReel of a Batch group."
                     ),
                     required=True,
                     item_type="selector",
@@ -203,6 +220,13 @@ def register(registry: Registry) -> None:
                 "PyReel.sequences",
                 "PyReel.name",
                 "PyReelGroup.create_reel",
+                "PyBatch.create_reel",
+                "PyBatch.reels",
+                "PyBatch.shelf_reels",
+                "PyBatch.nodes",
+                "PyBatch.name",
+                "PyBatch.uid",
+                "PyDesktop.batch_groups",
                 "PyReelGroup.reels",
                 "PyLibrary.children",
                 "PyLibrary.reels",

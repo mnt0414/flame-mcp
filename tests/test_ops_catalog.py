@@ -1,6 +1,6 @@
 """Completion check of the op catalog.
 
-The 98 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
+The 110 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
 the actual MCP tool surface, and READONLY hides/rejects exactly the write ops (`desktop.rename`
 and every `*.set_attributes`) in all 3 policy checkpoints. No bridge/socket is needed here:
 `flame_catalog`/`flame_do`'s POLICY_DENIED path and `tools/list` never touch the bridge.
@@ -25,7 +25,7 @@ from flame_mcp.registry import Registry, sample_selector_for
 from flame_mcp.server import create_server
 from flame_mcp.types import SelectorKind
 
-PROJECTED_OP_COUNT = 98
+PROJECTED_OP_COUNT = 110
 """The number of real ops the listing is projected for; the whole listing must still fit."""
 PROJECTED_BUDGET_SHARE = 0.8
 LISTING_KEYS = {"name", "category", "effect", "undo", "summary", "params", "accepts"}
@@ -63,6 +63,7 @@ SEGMENT_FIELDS = {"parent", "version", "track", "index", "record_in", "expect_so
 
 EXPECTED_OP_NAMES = {
     "project.info",
+    "project.save",
     "library.list",
     "library.create",
     "desktop.list_children",
@@ -111,6 +112,7 @@ EXPECTED_OP_NAMES = {
     "node.save_setup",
     "node.load_setup",
     "node.edit_setup",
+    "node.read_setup",
     "action.list_nodes",
     "action.create_node",
     "action.connect",
@@ -119,6 +121,13 @@ EXPECTED_OP_NAMES = {
     "render.plan",
     "render.batch",
     "render.clip",
+    "render.export",
+    "render.still",
+    "batch.delete",
+    "desktop.sync_record_tc",
+    "desktop.get_record_tc",
+    "desktop.set_record_tc",
+    "timeline.colour_spaces",
     "desktop.create",
     "desktop.copy",
     "segment.list_effects",
@@ -130,6 +139,7 @@ EXPECTED_OP_NAMES = {
     "desktop.duplicate",
     "desktop.move",
     "desktop.arrange",
+    "desktop.reorder",
     "timeline.fingerprint",
     "timeline.checkpoint",
     "segment.trim",
@@ -143,6 +153,7 @@ EXPECTED_OP_NAMES = {
     "segment.set_effect",
     "segment.effect_load_setup",
     "segment.edit_effect_setup",
+    "segment.read_effect_setup",
     "segment.effect_save_setup",
     "segment.copy_to_media_panel",
     "segment.match",
@@ -156,12 +167,14 @@ EXPECTED_OP_NAMES = {
     "timeline.move_track",
     "timeline.shorten",
     "timeline.compare",
+    "timeline.usage",
     "segment.connections",
     "segment.create_connection",
     "segment.remove_connection",
     "segment.sync_connections",
 }
 WRITE_OP_NAMES = {
+    "project.save",
     "eval.run",  # READONLY refuses eval.run whatever effect the call declares
     "node.create",
     "node.delete",
@@ -191,6 +204,11 @@ WRITE_OP_NAMES = {
     "node.set_attributes",
     "render.batch",
     "render.clip",
+    "render.export",
+    "render.still",
+    "batch.delete",
+    "desktop.sync_record_tc",
+    "desktop.set_record_tc",
     "desktop.create",
     "library.create",
     "desktop.copy",
@@ -198,6 +216,7 @@ WRITE_OP_NAMES = {
     "desktop.duplicate",
     "desktop.move",
     "desktop.arrange",
+    "desktop.reorder",
     "timeline.checkpoint",
     "segment.trim",
     "desktop.delete",
@@ -247,13 +266,13 @@ def _structured(result: Any) -> dict[str, Any]:
     return sc
 
 
-def test_registered_op_count_is_98() -> None:
+def test_registered_op_count_is_103() -> None:
     registry = make_full_registry()
-    assert len(registry.list_ops()) == 98
+    assert len(registry.list_ops()) == 110
     assert {op.name for op in registry.list_ops()} == EXPECTED_OP_NAMES
 
 
-def test_flame_catalog_lists_all_98_ops(run_dir: Path) -> None:
+def test_flame_catalog_lists_all_103_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
@@ -270,7 +289,7 @@ def test_flame_catalog_lists_all_98_ops(run_dir: Path) -> None:
     anyio.run(main)
 
 
-def test_flame_do_tool_enum_lists_all_98_ops(run_dir: Path) -> None:
+def test_flame_do_tool_enum_lists_all_103_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
@@ -436,6 +455,7 @@ def test_a_category_listing_is_compact_too(run_dir: Path) -> None:
                     "node.save_setup",
                     "node.load_setup",
                     "node.edit_setup",
+                    "node.read_setup",
                 }
                 for entry in env["result"]["operations"]:
                     assert LISTING_KEYS <= set(entry), entry["name"]
@@ -456,7 +476,13 @@ def test_the_render_category_is_listed_with_its_three_ops(run_dir: Path) -> None
                 env = _structured(await session.call_tool("flame_catalog", {"category": "render"}))
                 assert env["degraded"] == []
                 rows = {op["name"]: op for op in env["result"]["operations"]}
-                assert set(rows) == {"render.plan", "render.batch", "render.clip"}
+                assert set(rows) == {
+                    "render.plan",
+                    "render.batch",
+                    "render.clip",
+                    "render.export",
+                    "render.still",
+                }
                 assert (rows["render.batch"]["effect"], rows["render.batch"]["undo"]) == (
                     "create",
                     "unsupported",

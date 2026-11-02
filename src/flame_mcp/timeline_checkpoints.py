@@ -32,6 +32,7 @@ from flame_mcp import execution
 from flame_mcp.checkpoints import CHECKPOINT_TIMEOUT_S
 from flame_mcp.journal import new_id, now_iso
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
@@ -54,10 +55,6 @@ def checkpoint_library_name() -> str:
 
 def stash_reel_name() -> str:
     return f"{REEL_PREFIX}{datetime.now().astimezone():%y%m%d}"
-
-
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
 
 
 def stash_record(stash: Any) -> dict[str, Any] | None:
@@ -173,7 +170,7 @@ def run_timeline_checkpoint(
                 ),
                 error_code="POLICY_DENIED",
                 execution=envelope_mod.execution_meta(op),
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint_override=(
                     f"Make {rt.journal.directory} writable, then take the checkpoint again."
                 ),

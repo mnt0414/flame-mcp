@@ -31,6 +31,9 @@ _ATTRIBUTE_SYMBOLS = (
     "PyResolution.bit_depth",
     "PyResolution.frame_ratio",
     "PyResolution.scan_mode",
+    "flame.PyTime",
+    "PyTime.frame",
+    "PyTime.timecode",
 )
 
 
@@ -172,8 +175,16 @@ def register_attribute_ops(
                 "Every key is checked before anything is written (it must be an attribute "
                 "of the target; an enumerated attribute needs one of its `values`, a "
                 "numeric one a number inside its range, and an integer attribute takes an "
-                "integer -- 123.0 is refused; PyTime attributes are not "
-                "supported yet); if any key is rejected nothing is written. Keys are then "
+                "integer -- 123.0 is refused); if any key is rejected nothing is written. "
+                "Of the PyTime attributes only `current_time` can be written, as "
+                "{'frame': int} or {'timecode': str} (or both, which must agree; the "
+                "`timecode` / `frame` pair a read returns is accepted as it is), with an "
+                "optional 'fps' that must be the object's own frame_rate; pass a timecode as "
+                "'hh:mm:ss+ff', the form a read returns (another spelling can be taken for a "
+                "different value by journal.check); a time outside "
+                "start_time .. start_time + duration - 1 is rejected before anything is "
+                "written, and every other PyTime attribute (start_time ...) is rejected. "
+                "Keys are then "
                 "written in order, each re-read through a freshly fetched attribute: a "
                 "write that raises nothing but does not stick (e.g. PySegment.dynamic_*) "
                 "counts as failed (errorCode SILENT_NOOP) and stops the call, leaving "

@@ -65,6 +65,21 @@ clip (`target`, a stable selector; `uid`, `name`), the arguments of the render a
 answer for the handle first (`basis: "handle"`), else `is_rendered()` read from Flame again
 (`basis: "flame"`: true = `landed`, false = `not_landed`, an estimate).
 
+An "export intent" (`render.export`) is an intent with `kind: "export"` that names the clip
+(`target`, a stable selector; `uid`, `name`), the `preset`, the `outputDir`, `directoryBefore`
+(every file below it, a few levels down, with size and mtime) and `expectedFrames` (None when the
+number of files is not known); its outcome carries `verdict` (landed / partial / not_landed) and
+`writtenCount`. Nothing brings it back. `journal.check` decides an open one
+(`export_check.check_export_intent`): the bridge's answer for the handle first (`basis:
+"handle"`), else the output directory alone (`basis: "disk"`, an estimate).
+
+A "still intent" (`render.still`) is an intent with `kind: "still"`: an export intent for one
+frame (`frame`, `marks`, `duration`, `expectedFrames` 1) that also names the temporary reference
+copy of the clip (`tempReel`, `tempReelPreexisting`, `tempName`). Its outcome carries `verdict`,
+`writtenCount`, `tempRemoved` and `tempReelCreated`. `journal.check` decides an open one
+(`still_check.check_still_intent`) like an export intent, and then deletes the leftover copy of the
+call from Flame when its name, duration and marks are the intent's.
+
 A "desktop intent" (`desktop.create` / `desktop.copy`) is an intent with `kind:
 "desktop_create"` / `"desktop_copy"`; it has no `before` / `after` and no `revertCheckpoint`. It
 lists `existing` (the uids of what the parent / destination held before) and, for a create, the
@@ -105,12 +120,14 @@ selector, parent, state: {name, duration, fingerprint}, sourceUid}`; the revert 
 uid, only while its name, duration and fingerprint are still the recorded ones.
 `journal.check` of an open one reads the destination again (`segment_extract_run`).
 
-`purge` {type, id, ts, olderThanDays, library, purged: [checkpoint ids], gone: [checkpoint ids],
-skipped, reelsDeleted} is written by `journal.purge_checkpoints` after it deleted stashed copies
-(`purged`) or found them already gone (`gone`); `Index.purged` maps those checkpoint ids to the
-record. A purged checkpoint cannot be restored. `cleanup_old` keeps a journal file that holds a
-timeline checkpoint no `purge` record covers: dropping the record while the stash is still in the
-library would leave the stash with nothing that says what it is (reported as `unknown`).
+`purge` {type, id, ts, olderThanDays, groups, library, purged: [checkpoint ids], gone: [checkpoint
+ids], skipped, reelsDeleted} is written by `journal.purge_checkpoints` after it deleted stashed
+copies (`purged`) or found them already gone (`gone`); `Index.purged` maps those checkpoint ids to
+the record. `groups` is the journal group ids the caller chose, or null; when it is given the
+candidates were not selected by age and `olderThanDays` is null. A purged checkpoint cannot be
+restored. `cleanup_old` keeps a journal file that holds a timeline checkpoint no `purge` record
+covers: dropping the record while the stash is still in the library would leave the stash with
+nothing that says what it is (reported as `unknown`).
 
 `id` is the intent's id; `group` is one `flame_do` call or one `plan.run`; a revert is a new
 group whose intents carry `reverts: <original group>` (and `revertsIntent: <intent id>`, the one
@@ -238,11 +255,25 @@ def values_equal(a: Any, b: Any) -> bool:
     return bool(a == b)
 
 
+_TIME_KEYS = frozenset({"timecode", "frame"})
+
+
 def attribute_values_equal(key: str, a: Any, b: Any) -> bool:
     """`values_equal` for attribute `key`: a colour label Flame stored in its colour coding
-    table's spelling equals the one that was written (the rule of the in-Flame read-back)."""
+    table's spelling equals the one that was written (the rule of the in-Flame read-back).
+    `a` is the value read; a PyTime reads as {timecode, frame}, and `b` may name only one of
+    the two (what a write of a frame or of a timecode leaves in an intent): then every key it
+    names must match."""
     if key in CASE_FOLDED_ATTRIBUTES and isinstance(a, str) and isinstance(b, str):
         return a.lower() == b.lower()
+    if (
+        isinstance(a, dict)
+        and isinstance(b, dict)
+        and set(a) == _TIME_KEYS
+        and b
+        and set(b) < _TIME_KEYS
+    ):
+        return all(values_equal(a[k], b[k]) for k in b)
     return values_equal(a, b)
 
 

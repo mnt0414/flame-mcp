@@ -28,8 +28,6 @@ CHECKPOINTED_NODE_NOTE: Final[str] = (
     + " "
 )
 
-ROLE_TARGET: Final[str] = "the target"
-
 SelectorMap = Mapping[str, Any]
 
 

@@ -14,6 +14,7 @@ driving the stdio transport is never blocked.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -27,19 +28,22 @@ import mcp_types as types
 from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 
+from flame_mcp import compact as compact_mod
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import opschema, selectors, transport
+from flame_mcp import opschema, selectors, still_proxy, transport
 from flame_mcp import policy as policy_mod
 from flame_mcp import registry as registry_mod
+from flame_mcp.compact import ResponseMode
 from flame_mcp.execution import V_HELPER
 from flame_mcp.journal import Journal
 from flame_mcp.policy import Policy, deny_category, deny_operation, deny_tool
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.runtime import Runtime, TestHooks
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import NO_DEFAULT, SelectorKind
 from flame_mcp_bridge.impl import BRIDGE_ABI
 
-SERVER_VERSION: Final[str] = "0.2.0"
+SERVER_VERSION: Final[str] = "0.3.0"
 TESTED_FLAME_VERSIONS: Final[tuple[str, ...]] = ("2025.2.4", "2026.2.3")
 
 TOOL_VERSION_INFO: Final[str] = "flame_version_info"
@@ -66,11 +70,20 @@ INSTRUCTIONS: Final[str] = "\n".join(
         "refused with INVALID_ARGS.",
         "flame_context lists known pitfalls. Read them before writing eval.run code.",
         "Before an operation that cannot be undone or that overwrites (render.batch, "
-        "render.clip, overwrite=true, journal.purge_checkpoints, desktop.delete, "
-        "desktop.reformat (in place), journal.revert force=true, journal.restore_checkpoint, "
-        "batch.load_setup, eval.run), ask the user to confirm.",
+        "render.clip, render.export, overwrite=true, journal.purge_checkpoints, "
+        "desktop.delete, desktop.reformat (in place), journal.revert force=true, "
+        "journal.restore_checkpoint, batch.load_setup, batch.delete, eval.run), ask the user to "
+        "confirm.",
     ]
 )
+
+
+def instructions_for(mode: ResponseMode) -> str:
+    """INSTRUCTIONS as the client gets them: compact adds the one sentence about its format."""
+    if mode == "compact":
+        return INSTRUCTIONS + "\n" + compact_mod.INSTRUCTIONS_NOTE
+    return INSTRUCTIONS
+
 
 # None of the 4 dedicated tools mutates the project (only the op a flame_do call
 # names does, gated separately). The map exists so tool registration still runs
@@ -148,15 +161,35 @@ _CONTEXT_CODE = "\n".join(
 )
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
+def _compact_within_limit(env: Mapping[str, Any]) -> dict[str, Any]:
+    """The compact envelope when it fits the response limit, as it is.
+
+    Over the limit, the size limit is applied to the full envelope first (its lists collapse to
+    {count, omitted}, and a spill file holds the full envelope) and that result is compacted.
+    Compacting first would make `{columns, rows}` of a list the collapse no longer sees.
+    """
+    compacted = compact_mod.compact_envelope(env)
+    if envelope_mod.byte_len(compacted) <= envelope_mod.MAX_RESPONSE_BYTES:
+        return compacted
+    return compact_mod.compact_envelope(envelope_mod.degrade_for_size(env))
 
 
-def _tool_result(env: Mapping[str, Any]) -> types.CallToolResult:
-    degraded_env = envelope_mod.degrade_for_size(env)
+def _tool_result(
+    env: Mapping[str, Any], mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE
+) -> types.CallToolResult:
+    degraded_env = (
+        _compact_within_limit(env) if mode == "compact" else envelope_mod.degrade_for_size(env)
+    )
     text = json.dumps(degraded_env, default=str)
+    content: list[types.ContentBlock] = [types.TextContent(type="text", text=text)]
+    for data, mime in still_proxy.attachment_images(env):
+        content.append(
+            types.ImageContent(
+                type="image", data=base64.b64encode(data).decode("ascii"), mime_type=mime
+            )
+        )
     return types.CallToolResult(
-        content=[types.TextContent(type="text", text=text)],
+        content=content,
         structured_content=degraded_env,
         is_error=not bool(degraded_env["ok"]),
     )
@@ -381,8 +414,28 @@ PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
     },
     {
         "text": "Deleting a Batch schematic reel that holds clips also deletes the Clip nodes that "
-        "reference it. desktop.delete refuses a Desktop reel that holds a clip or a sequence for "
-        "the same reason.",
+        "reference it. desktop.delete refuses a reel (Desktop or Batch) that holds a clip or a "
+        "sequence for the same reason; it deletes only an empty schematic reel of a Batch group, "
+        "and never the last one of a group.",
+    },
+    {
+        "text": "desktop.delete refuses a Batch group. batch.delete deletes one after saving its "
+        "setup (result.setupPath); load it into a new Batch group with batch.load_setup to get "
+        "the nodes back (not shelf reels, iterations or empty reels). It refuses the current or "
+        "an open group (allow_current), a group whose reels or iterations hold anything "
+        "(allow_content_loss) and a name that differs from expect_name. journal.revert cannot "
+        "put a deleted group back.",
+    },
+    {
+        "text": "desktop.sync_record_tc writes only the clips it can judge: a row is synced, "
+        "in_sync or skipped with a reason (several segments, a Gap before the media, a "
+        "frame-rate difference, a DPX source, a source with no Source TC). journal.revert writes "
+        "the earlier Record TC back.",
+    },
+    {
+        "text": "render.export of a sequence reads the colour space of every segment first "
+        "(timeline.colour_spaces). A sequence that is mixed, or whose colour spaces could not all "
+        "be read, is refused with PRECONDITION_UNMET; skip_colour_check=true exports anyway.",
     },
     {
         "text": "shared_source_segments() does not return copies inside a library "
@@ -489,7 +542,9 @@ def _static_context(registry: Registry) -> dict[str, Any]:
             "library.create has the same journal and revert: it deletes the library only while "
             "it is empty. desktop.arrange is one journal group of one desktop.copy / "
             "desktop.move intent per item, and journal.revert(group) puts the items back "
-            "newest first. desktop.copy of a Batch group (into a library, or back from a "
+            "newest first. desktop.reorder is one journal group of one desktop.move, and "
+            "journal.revert(group) moves the entries back into the old order (new uids again). "
+            "desktop.copy of a Batch group (into a library, or back from a "
             "library onto the Desktop) deletes the copy only while it is as made (in a "
             "library its name and reels; on the Desktop also its nodes, connections and node "
             "attribute values), and before it deletes a group on the Desktop it saves the "
@@ -593,10 +648,11 @@ def _flame_version_info_sync(runtime: Runtime) -> dict[str, Any]:
         "bridge": bridge,
         "inflight": {"count": inflight.count, "newest": inflight.newest},
         "journal": runtime.journal_summary(),
+        "ffmpeg": still_proxy.ffmpeg_info(),
     }
     if runtime.permissions is not None:
         result["permissions"] = runtime.permissions
-    env = envelope_mod.build_envelope(ok=True, result=result, duration_ms=_elapsed_ms(started))
+    env = envelope_mod.build_envelope(ok=True, result=result, duration_ms=elapsed_ms(started))
     env["notices"].extend(notices)
     return env
 
@@ -613,7 +669,7 @@ def _flame_catalog_sync(
         op = registry.get(op_name)
         if op is None:
             env = _suggest_unknown_operation(registry, op_name)
-            env["durationMs"] = _elapsed_ms(started)
+            env["durationMs"] = elapsed_ms(started)
             return env
         denial = deny_operation(op, policy)
         if denial is not None:
@@ -621,7 +677,7 @@ def _flame_catalog_sync(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         by_name_result: dict[str, Any] = {
@@ -629,7 +685,7 @@ def _flame_catalog_sync(
             "operation": _catalog_entry(op, policy, detailed=True),
         }
         return envelope_mod.build_envelope(
-            ok=True, result=by_name_result, duration_ms=_elapsed_ms(started)
+            ok=True, result=by_name_result, duration_ms=elapsed_ms(started)
         )
 
     if category is not None:
@@ -639,7 +695,7 @@ def _flame_catalog_sync(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=None,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         category_ops = [
@@ -651,7 +707,7 @@ def _flame_catalog_sync(
             "operations": [_catalog_entry(op, policy) for op in category_ops],
         }
         return envelope_mod.build_envelope(
-            ok=True, result=by_category_result, duration_ms=_elapsed_ms(started)
+            ok=True, result=by_category_result, duration_ms=elapsed_ms(started)
         )
 
     visible = policy_mod.visible_ops(registry, policy)
@@ -660,7 +716,7 @@ def _flame_catalog_sync(
         "categories": list(registry.list_categories()),
         "operations": [_catalog_entry(op, policy) for op in visible],
     }
-    return envelope_mod.build_envelope(ok=True, result=all_result, duration_ms=_elapsed_ms(started))
+    return envelope_mod.build_envelope(ok=True, result=all_result, duration_ms=elapsed_ms(started))
 
 
 def _flame_do_sync(runtime: Runtime, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -671,15 +727,20 @@ def _flame_do_sync(runtime: Runtime, args: Mapping[str, Any]) -> dict[str, Any]:
             error="'op' is required and must be a string",
             error_code="INVALID_ARGS",
             op=None,
-            duration_ms=_elapsed_ms(started),
+            duration_ms=elapsed_ms(started),
         )
     return runtime.call(op_name, args.get("args"))
 
 
 def _flame_context_sync(
-    registry: Registry, _policy: Policy, run_dir: Path | None
+    registry: Registry,
+    _policy: Policy,
+    run_dir: Path | None,
+    mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
 ) -> dict[str, Any]:
     static = _static_context(registry)
+    if mode == "compact":
+        static["responseFormat"] = compact_mod.RESPONSE_FORMAT
     br = transport.exec(
         _CONTEXT_CODE,
         thread="main",
@@ -734,6 +795,7 @@ def create_server(
     journal: Journal | None = None,
     hooks: TestHooks | None = None,
     permissions: dict[str, Any] | None = None,
+    response_mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
 ) -> Server[Any]:
     runtime = Runtime(
         registry=registry,
@@ -754,24 +816,26 @@ def create_server(
         args = params.arguments or {}
         if name == TOOL_VERSION_INFO:
             env = await anyio.to_thread.run_sync(_flame_version_info_sync, runtime)
-            return _tool_result(env)
+            return _tool_result(env, response_mode)
         if name == TOOL_CATALOG:
             env = await anyio.to_thread.run_sync(
                 _flame_catalog_sync, registry, policy, args.get("category"), args.get("op")
             )
-            return _tool_result(env)
+            return _tool_result(env, response_mode)
         if name == TOOL_DO:
             env = await anyio.to_thread.run_sync(_flame_do_sync, runtime, args)
-            return _tool_result(env)
+            return _tool_result(env, response_mode)
         if name == TOOL_CONTEXT:
-            env = await anyio.to_thread.run_sync(_flame_context_sync, registry, policy, run_dir)
-            return _tool_result(env)
+            env = await anyio.to_thread.run_sync(
+                _flame_context_sync, registry, policy, run_dir, response_mode
+            )
+            return _tool_result(env, response_mode)
         raise MCPError(types.METHOD_NOT_FOUND, f"unknown tool: {name}")
 
     return Server(
         "flame-mcp",
         version=SERVER_VERSION,
-        instructions=INSTRUCTIONS,
+        instructions=instructions_for(response_mode),
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )

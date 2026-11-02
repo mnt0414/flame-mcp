@@ -24,6 +24,14 @@ What it encodes (measured on Flame 2025.2.4):
     CONFLICT); the old place, the colour and other attributes do not come back. Stashing and
     putting back any other container (a reel group, a folder, a library, a Batch group) is
     refused.
+  - an empty schematic reel of a Batch group on the Desktop is deleted too, current or not
+    (P-D1, Flame 2025.2.4: the node count and the other reels stay). A shelf reel, a reel with
+    anything in it, a reel whose type cannot be read and the last schematic reel of a group
+    (not tried) are refused. The group is found by scanning the Desktop's Batch groups for the
+    reel's uid, never by `reel.parent` (not measured for a Batch reel); the node count is read
+    before and after the delete. A revert makes a new empty schematic reel of the same name
+    with `PyBatch.create_reel` (the end; uid, place and colour do not come back); a name a
+    schematic reel of the group already has is a CONFLICT.
   - nothing inside a library is deleted (`_dd_check_target`, before anything is copied): library
     contents are never deleted by this server. `PURGE_HELPER` is the one exception, for the copies
     the journal recorded in the checkpoint library.
@@ -57,6 +65,28 @@ def _dd_reel_counts(reel):
     return counts
 
 
+def _dd_alive(items):
+    found = {}
+    for item in items:
+        uid = item.get('uid')
+        entry = item.get('parent') or {}
+        group = None
+        if entry.get('type') == 'PyBatch' and entry.get('uid'):
+            group = _dc_scan(list(_dc_desktop().batch_groups), entry['uid'])
+        if entry.get('type') == 'PyBatch' and group is None:
+            raise _OpError(
+                'PRECONDITION_UNMET',
+                'the Batch group ' + repr(entry.get('name')) + ' (uid ' + str(entry.get('uid'))
+                + ') that held the reel is gone, so whether the delete of the reel landed or the '
+                'group went with it cannot be told',
+            )
+        if group is not None:
+            found[uid] = _dd_still_there(uid, group) is not None
+        else:
+            found[uid] = _dm_find(uid, item.get('parent')) is not None
+    return {'alive': found, 'error': None, 'errorCode': None}
+
+
 def _dd_fingerprint(obj):
     if type(obj).__name__ != 'PyReel':
         return _tl_fingerprint(obj)
@@ -69,6 +99,107 @@ def _dd_fingerprint(obj):
         'versions': 0,
         'unreadable': 0,
     }
+
+
+def _dd_batch_find(group, uid):
+    for attr in ('reels', 'shelf_reels'):
+        hit = _dc_scan(list(getattr(group, attr)), uid)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _dd_batch_owner(reel):
+    # (the Batch group on the Desktop that lists this reel, 'Schematic' or 'Shelf' by the list it
+    # is in) or None
+    uid = _dm_uid(reel)
+    if not uid:
+        return None
+    for group in list(_dc_desktop().batch_groups):
+        for attr, kind in (('reels', 'Schematic'), ('shelf_reels', 'Shelf')):
+            try:
+                pool = list(getattr(group, attr))
+            except BaseException:
+                continue
+            if _dc_scan(pool, uid) is not None:
+                return group, kind
+    return None
+
+
+def _dd_still_there(uid, group):
+    found = _dc_find_by_uid(uid)
+    if found is None and group is not None:
+        found = _dd_batch_find(group, uid)
+    return found
+
+
+def _dd_node_count(group):
+    return _try(lambda: len(list(group.nodes)))
+
+
+def _dd_last_reel_problems(targets):
+    asked = {}
+    for obj in targets:
+        if type(obj).__name__ != 'PyReel':
+            continue
+        owner = _dd_batch_owner(obj)
+        if owner is None or owner[1] != 'Schematic':
+            continue
+        key = _dm_uid(owner[0])
+        if key not in asked:
+            asked[key] = [owner[0], []]
+        asked[key][1].append(_try(lambda o=obj: _v(o.name)))
+    problems = []
+    for key in asked:
+        group, names = asked[key]
+        have = len(list(group.reels))
+        if len(names) >= have:
+            problems.append(
+                'deleting ' + repr(names) + ' would leave the Batch group '
+                + repr(_try(lambda g=group: _v(g.name))) + ' with no schematic reel (it has '
+                + str(have) + '): the last schematic reel of a Batch group is not deleted'
+            )
+    return problems
+
+
+def _dd_check_batch_reel(obj, label, owner):
+    if owner is None:
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a reel of a Batch group that is not found among the Batch groups of '
+            'the Desktop, so it could not be found again or put back',
+        )
+    if _dd_node_count(owner[0]) is None:
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a reel of the Batch group ' + repr(_try(lambda: _v(owner[0].name)))
+            + ', whose nodes could not be counted: the count before and after the delete is how '
+            'a delete that took nodes with it is told, so nothing is deleted',
+        )
+    reel_type = _try(lambda: _ja(obj.type))
+    if owner[1] == 'Shelf' or reel_type == 'Shelf':
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a shelf reel of a Batch group: only an empty schematic reel of a Batch '
+            'group is deleted',
+        )
+    if reel_type != 'Schematic':
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a reel of a Batch group whose type (' + repr(reel_type) + ') could not '
+            'be read as Schematic, so it could not be made again as the same kind of reel by a '
+            'revert',
+        )
+    clips, sequences, children = _dd_reel_counts(obj)
+    if clips or sequences or children:
+        raise _OpError(
+            'PRECONDITION_UNMET',
+            label + ' is a reel that holds ' + str(clips) + ' clip(s), ' + str(sequences)
+            + ' sequence(s) and ' + str(children) + ' entry(ies) in all: only an empty reel '
+            'is deleted (deleting a reel of a Batch group also deletes the Clip nodes that use '
+            'its clips)',
+        )
+    return owner[0]
 
 
 def _dd_inside_library(obj, library_name):
@@ -89,11 +220,10 @@ def _dd_check_target(obj, label, library_name):
             'group, a folder, a library, a Batch group) is not deleted here, only a clip, a '
             'sequence or an empty reel is',
         )
-    if _dc_is_batch_reel(obj):
-        raise _OpError(
-            'INVALID_ARGS',
-            label + ' is a reel of a Batch group: a Batch group is not deleted from here',
-        )
+    if kind == 'PyReel':
+        owner = _dd_batch_owner(obj)
+        if owner is not None or _dc_is_batch_reel(obj):
+            return _dd_check_batch_reel(obj, label, owner)
     parent = _dm_parent(obj, label)
     where = _tl_location(obj)
     if _dc_is_batch_reel(parent) or where == 'batch':
@@ -152,7 +282,12 @@ def _dd_snapshot(targets, library_name):
         parent = _dd_check_target(obj, label, library_name)
         row = _dc_with_selector(obj)
         parent_row = _dc_with_selector(parent)
-        if row['uid'] is None or row['selector'] is None or parent_row['selector'] is None:
+        batch_reel = type(parent).__name__ == 'PyBatch'
+        if (
+            row['uid'] is None
+            or (row['selector'] is None and not batch_reel)
+            or parent_row['selector'] is None
+        ):
             raise _OpError(
                 'PRECONDITION_UNMET',
                 label + ' or its parent has no uid / wiretap id, so it could not be found again '
@@ -171,6 +306,9 @@ def _dd_snapshot(targets, library_name):
         row['displayed'] = _tl_is_displayed(obj)
         row['location'] = _tl_location(obj)
         rows.append(row)
+    last = _dd_last_reel_problems(targets)
+    if last:
+        raise _OpError('PRECONDITION_UNMET', '; '.join(last))
     return {
         'sources': rows,
         'existing': [{'uid': r['uid']} for r in rows],
@@ -235,6 +373,20 @@ def _dd_stash(targets, library_name, reel_name):
     return out
 
 
+def _dd_batch_reel_problem(obj, info):
+    # why a target that was a schematic reel of a Batch group at the read is not one now
+    owner = _dd_batch_owner(obj)
+    if owner is None:
+        return 'it is not in a Batch group of the Desktop any more'
+    if _dm_uid(owner[0]) != info.get('batchUid'):
+        return 'it is in another Batch group than the one the read saw'
+    if owner[1] != 'Schematic' or _try(lambda: _ja(obj.type)) != 'Schematic':
+        return 'it is not a schematic reel of the Batch group any more'
+    if _dd_node_count(owner[0]) is None:
+        return 'the nodes of its Batch group could not be counted'
+    return None
+
+
 def _dd_delete_conflicts(targets, uids, snapshot, expected):
     if _dm_changed(uids, expected):
         return ['a target is not the one the read saw (the uids found are ' + repr(uids) + ')']
@@ -244,25 +396,36 @@ def _dd_delete_conflicts(targets, uids, snapshot, expected):
         info = snapshot.get(uid)
         if info is None:
             problems.append(repr(name) + ' (uid ' + str(uid) + ') has no stashed copy on record')
-        elif _dd_fingerprint(obj)['fingerprint'] != info['fingerprint']:
+            continue
+        if info.get('batchReel'):
+            why = _dd_batch_reel_problem(obj, info)
+            if why is not None:
+                problems.append(repr(name) + ' (uid ' + str(uid) + '): ' + why)
+                continue
+        if _dd_fingerprint(obj)['fingerprint'] != info['fingerprint']:
             problems.append(
                 repr(name) + ' (uid ' + str(uid) + ') changed between the read and the write'
             )
-    return problems
+    if problems:
+        return problems
+    return _dd_last_reel_problems(targets)
 
 
 def _dd_delete_one(obj, uid, info, shown_before):
-    parent = _try(lambda: obj.parent)
+    owner = _dd_batch_owner(obj) if type(obj).__name__ == 'PyReel' else None
+    group = owner[0] if owner is not None else None
+    parent = group if group is not None else _try(lambda: obj.parent)
     origin = _dc_with_selector(obj)
     origin['parent'] = _dc_with_selector(parent) if parent is not None else None
     if origin['type'] == 'PyReel':
         origin['reelType'] = _try(lambda: _ja(obj.type))
+    nodes_before = _dd_node_count(group) if group is not None else None
     try:
         returned = flame.delete(obj, confirm=False)
         error = None
     except BaseException as exc:
         returned, error = None, type(exc).__name__ + ': ' + str(exc)
-    still = _dc_find_by_uid(uid)
+    still = _dd_still_there(uid, group)
     row = {
         'from': {
             'parent': origin['parent'],
@@ -279,13 +442,17 @@ def _dd_delete_one(obj, uid, info, shown_before):
         'deleteReturned': _ja(returned),
         'deleteError': error,
     }
+    if group is not None:
+        row['nodeCountBefore'] = nodes_before
+        row['nodeCountAfter'] = _dd_node_count(group)
     return still is None, row, still
 
 
 def _dd_unread_one(obj, uid, info, shown_before, exc):
     # a read before flame.delete raised: the target is looked up by uid to see whether it is
     # still there; its old parent was not read, so a revert cannot put it back if it is gone
-    still = _dc_find_by_uid(uid)
+    owner = _try(lambda: _dd_batch_owner(obj))
+    still = _dd_still_there(uid, owner[0] if owner is not None else None)
     row = {
         'from': {
             'parent': None,
@@ -378,6 +545,28 @@ def _dd_delete(targets, snapshot, expected):
         )
         out['error'] = note if out['error'] is None else out['error'] + '; ' + note
         out['errorCode'] = 'FLAME_API_ERROR'
+    changed = []
+    for row in out['deleted']:
+        if 'nodeCountBefore' not in row:
+            continue
+        if row['nodeCountBefore'] is None or row['nodeCountAfter'] is None:
+            out['warnings'].append(
+                'the node count of the Batch group of ' + repr(row['from']['name'])
+                + ' could not be read before or after the delete'
+            )
+        elif row['nodeCountBefore'] != row['nodeCountAfter']:
+            changed.append(
+                repr(row['from']['name']) + ' (' + str(row['nodeCountBefore']) + ' -> '
+                + str(row['nodeCountAfter']) + ')'
+            )
+    if changed:
+        note = (
+            'the node count of a Batch group changed with the delete, so nodes were deleted '
+            'beyond the empty reel: ' + ', '.join(changed) + '. The reel is journaled and '
+            'journal.revert makes an empty reel again, but it does not bring the nodes back'
+        )
+        out['error'] = note if out['error'] is None else out['error'] + '; ' + note
+        out['errorCode'] = 'FLAME_API_ERROR'
     return out
 
 
@@ -396,20 +585,34 @@ def _dd_revert_reel(item):
     origin = item.get('from') or {}
     base = {'from': origin, 'checkpoint': None, 'stash': None}
     name = origin.get('name')
-    parent = _dm_container(origin.get('parent'))
+    entry = origin.get('parent') or {}
+    in_batch = entry.get('type') == 'PyBatch'
+    if in_batch:
+        parent = None
+        if entry.get('uid'):
+            parent = _dc_scan(list(_dc_desktop().batch_groups), entry['uid'])
+    else:
+        parent = _dm_container(origin.get('parent'))
     problem = None
     if parent is None:
         problem = (
-            'its original reel group ' + repr((origin.get('parent') or {}).get('name')) + ' is gone'
+            'its original ' + ('Batch group ' if in_batch else 'reel group ')
+            + repr(entry.get('name')) + ' is gone'
         )
-    elif type(parent).__name__ != 'PyReelGroup':
+    elif not in_batch and type(parent).__name__ != 'PyReelGroup':
         problem = 'its original parent is a ' + type(parent).__name__ + ', not a reel group'
     elif name in [_try(lambda r=r: _v(r.name)) for r in list(parent.reels)]:
-        problem = 'the reel group already has a reel named ' + repr(name)
+        problem = (
+            'the Batch group already has a schematic reel named ' + repr(name) if in_batch
+            else 'the reel group already has a reel named ' + repr(name)
+        )
     if problem is not None:
         return None, dict(base, reason=problem, errorCode='CONFLICT')
     try:
-        made = parent.create_reel(name, sequence=origin.get('reelType') == 'Sequences')
+        if in_batch:
+            made = parent.create_reel(name)
+        else:
+            made = parent.create_reel(name, sequence=origin.get('reelType') == 'Sequences')
     except BaseException as exc:
         reason = 'the reel could not be made again: ' + type(exc).__name__ + ': ' + str(exc)
         return None, dict(base, reason=reason, errorCode='FLAME_API_ERROR')
@@ -428,7 +631,8 @@ def _dd_revert_reel(item):
             'create_reel made a reel named ' + repr(made_name) + ', not ' + repr(name) + '; '
         )
         row = dict(base, errorCode='FLAME_API_ERROR')
-        if made_uid is not None and _dc_find_by_uid(made_uid) is None:
+        left = _dd_still_there(made_uid, parent if in_batch else None)
+        if made_uid is not None and left is None:
             row['reason'] = reason + 'it was deleted again'
         else:
             row['reason'] = reason + 'it could not be deleted and is still there (leftover)'

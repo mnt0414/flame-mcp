@@ -20,6 +20,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from flame_mcp import envelope, transport
+from flame_mcp.compact import ResponseModeConfigError, response_mode_from_env
 from flame_mcp.journal import JOURNAL_DIR_ENV, Journal, default_journal_dir
 from flame_mcp.ops import register_all
 from flame_mcp.opschema import find_non_ascii
@@ -72,6 +73,11 @@ def build_server(*, run_dir: Path | None = None, app_root: Path | None = None) -
     except PolicyConfigError as exc:
         print(f"flame-mcp: invalid policy configuration: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    try:
+        response_mode = response_mode_from_env(os.environ)
+    except ResponseModeConfigError as exc:
+        print(f"flame-mcp: invalid response configuration: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     permissions = None
     if app_root is not None:
         in_use = [
@@ -102,7 +108,13 @@ def build_server(*, run_dir: Path | None = None, app_root: Path | None = None) -
     registry = Registry()
     register_all(registry)
     return create_server(
-        registry, policy, run_dir=run_dir, journal=journal, hooks=hooks, permissions=permissions
+        registry,
+        policy,
+        run_dir=run_dir,
+        journal=journal,
+        hooks=hooks,
+        permissions=permissions,
+        response_mode=response_mode,
     )
 
 

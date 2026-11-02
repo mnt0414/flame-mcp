@@ -17,7 +17,7 @@ from flame_mcp import selectors
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
 from flame_mcp.effective_effect import overwrite_precheck
 from flame_mcp.ops._attributes import attribute_requires, register_attribute_ops
-from flame_mcp.ops._common import build_source, list_result_src, offset_param
+from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.reel_kinds import reel_kinds_named
 from flame_mcp.registry import Registry
 from flame_mcp.types import (
@@ -653,9 +653,7 @@ def register(registry: Registry) -> None:
             ),
             effect="read",
             params=(
-                OperationParam(
-                    name="limit", type="number", description="Max items to return.", required=False
-                ),
+                limit_param(),
                 offset_param(),
                 OperationParam(
                     name="node_counts",

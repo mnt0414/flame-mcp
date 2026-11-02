@@ -469,7 +469,7 @@ def read_inflight_records(run_dir: Path | None = None) -> InflightListing:
     return InflightListing(items=items, total=len(entries), unreadable=unreadable)
 
 
-def _elapsed_ms(started: float) -> int:
+def elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
@@ -509,7 +509,7 @@ def _simple_result(
         app_log_note=app_log_note,
         crash=None,
         inflight_path=inflight_path,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint=hint,
     )
 
@@ -545,7 +545,7 @@ def _bridge_lost_result(
         app_log_note=_app_log_note(app_read),
         crash=crash,
         inflight_path=inflight_path,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
     )
 
 
@@ -580,7 +580,7 @@ def _result_from_response(
         app_log_note=_app_log_note(app_read),
         crash=None,
         inflight_path=inflight_path,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
     )
 
 

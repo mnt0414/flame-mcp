@@ -44,6 +44,7 @@ from flame_mcp.desktop_run import (
     PHASE_PROBE,
     PHASE_REVERT,
     WriteProfile,
+    read_back_returned,
     rows_uids,
     run_write_flow,
 )
@@ -66,7 +67,6 @@ if TYPE_CHECKING:
 
 COPY_OP: Final[str] = "segment.copy_to_media_panel"
 MATCH_OP: Final[str] = "segment.match"
-EXTRACT_OPS: Final[tuple[str, ...]] = (COPY_OP, MATCH_OP)
 _NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
 
 EXTRACT_NOTE: Final[str] = (
@@ -87,12 +87,6 @@ def is_extract_intent(view: IntentView) -> bool:
         view.desktop_kind == KIND_DESKTOP_REVERT
         and view.intent.get("revertOf") == KIND_DESKTOP_EXTRACT
     )
-
-
-def _no_refusal(
-    op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any], started: float
-) -> dict[str, Any] | None:
-    return None
 
 
 def _stable_args(
@@ -159,13 +153,6 @@ def created_record(op_name: str, result: Mapping[str, Any] | None) -> dict[str, 
     }
 
 
-def _read_back(env: Mapping[str, Any]) -> dict[str, Any] | None:
-    result = env.get("result")
-    if not isinstance(result, Mapping) or "returned" not in result:
-        return None
-    return {"returned": result["returned"], "made": result.get("created") is not None}
-
-
 def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, Any]) -> None:
     result = env.get("result")
     if not isinstance(result, dict):
@@ -188,13 +175,12 @@ def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
 
 
 EXTRACT_PROFILE: Final[WriteProfile] = WriteProfile(
-    refuse=_no_refusal,
     stable_args=_stable_args,
     intent=_intent_record,
     created=created_record,
     notes=_notes,
     pre_hint=_pre_hint,
-    read_back=_read_back,
+    read_back=read_back_returned,
 )
 
 
@@ -227,16 +213,11 @@ def _revert_count(view: IntentView, result: Mapping[str, Any]) -> int:
     return int(result.get("deleted") is True)
 
 
-def _revert_extra(result: Mapping[str, Any]) -> dict[str, Any]:
-    return {}
-
-
 EXTRACT_REVERT: Final[RevertProfile] = RevertProfile(
     op_name=_revert_op_name,
     args=_revert_args,
     notes=_revert_notes,
     count=_revert_count,
-    extra=_revert_extra,
 )
 
 

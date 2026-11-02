@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from flame_mcp import selectors
-from flame_mcp.ops._common import build_source, offset_param, raise_on_error_src
+from flame_mcp.ops._common import build_source, limit_param, offset_param, raise_on_error_src
 from flame_mcp.ops._segment_edit import (
     SEGMENT_TARGET_DESCRIPTION,
     edit_source,
@@ -31,7 +31,6 @@ from flame_mcp.segment_remove_run import (
 )
 from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
 
-WRITE_OPS: Final[tuple[str, ...]] = (CREATE_OP, REMOVE_OP, SYNC_OP)
 MAX_REMOVE_TARGETS: Final[int] = 50
 
 _CONNECTIONS_DESCRIPTION = (
@@ -297,12 +296,7 @@ def register(registry: Registry) -> None:
                     description="A 'segment' selector identifying one segment.",
                     required=True,
                 ),
-                OperationParam(
-                    name="limit",
-                    type="number",
-                    description="Max items per call.",
-                    required=False,
-                ),
+                limit_param("Max items per call."),
                 offset_param(),
             ),
             accepts=("segment",),

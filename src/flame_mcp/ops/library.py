@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp.desktop_run import run_library_create
-from flame_mcp.ops._common import build_source, list_result_src, offset_param
+from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.ops.desktop import _create_to_python, _no_undo_steps
 from flame_mcp.registry import Registry
 from flame_mcp.types import Category, OperationParam, OperationSpec
@@ -124,9 +124,7 @@ def register(registry: Registry) -> None:
             ),
             effect="read",
             params=(
-                OperationParam(
-                    name="limit", type="number", description="Max items to return.", required=False
-                ),
+                limit_param(),
                 offset_param(),
             ),
             to_python=_list_to_python,

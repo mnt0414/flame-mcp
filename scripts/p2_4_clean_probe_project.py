@@ -130,6 +130,7 @@ TEST_PREFIXES = (
     "PP5",
     "PP5E",
     "PP6",
+    "PP7",
     "PR12",
     "PR12E",
     "PR5E",

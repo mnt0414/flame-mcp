@@ -12,6 +12,7 @@ from flame_mcp.ops._common import (
     AUTO_RESIZE_NOTE,
     REEL_CLIP_NOTE,
     build_source,
+    limit_param,
     list_result_src,
     offset_param,
 )
@@ -244,12 +245,7 @@ def register(registry: Registry) -> None:
             effect="read",
             params=(
                 target_param,
-                OperationParam(
-                    name="limit",
-                    type="number",
-                    description="Max items (containers walked) per call.",
-                    required=False,
-                ),
+                limit_param("Max items (containers walked) per call."),
                 offset_param(),
             ),
             accepts=("segment",),

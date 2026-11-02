@@ -8,6 +8,7 @@ purged. Run through the real Runtime with a scripted `transport.exec` over the f
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -198,6 +199,21 @@ def test_a_token_of_another_age_cutoff_is_refused(
     env = rig.do(PURGE, {"older_than_days": 0, "dry_run": False, "token": token})
     assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET", env
     assert stash_names(rig) == ["S1", "S2"]
+
+
+def test_the_token_without_groups_is_the_digest_of_the_candidates_alone(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_checkpoint(rig, monkeypatch, S1)
+    old_checkpoint(rig, monkeypatch, S2)
+    result = purge(rig)["result"]
+    assert result["count"] == 2
+    material = [
+        [c["id"], c["stash"]["uid"], c["stash"]["name"], c["exists"], c["nameMatches"]]
+        for c in result["candidates"]
+    ]
+    expected = hashlib.sha256(json.dumps(material).encode("utf-8")).hexdigest()[:32]
+    assert result["token"] == expected
 
 
 def test_the_token_must_be_a_string(rig: Rig) -> None:
@@ -481,7 +497,8 @@ def test_the_op_is_declared_destructive_and_not_undoable() -> None:
     op = registry.get(PURGE)
     assert op is not None and op.effect == "destructive" and op.undo == "unsupported"
     assert op.thread == "server" and {p.name: p.default for p in op.params} == {
-        "older_than_days": 30,
+        "older_than_days": NO_DEFAULT,
+        "groups": NO_DEFAULT,
         "dry_run": True,
         "token": NO_DEFAULT,
     }
@@ -550,3 +567,145 @@ def test_the_index_knows_which_checkpoints_were_purged() -> None:
         ]
     )
     assert sorted(index.purged) == ["c1", "c2"] and index.purged["c1"]["id"] == "p"
+
+
+def group_of(env: dict[str, Any]) -> str:
+    assert env["ok"] is True, env
+    return str(env["journal"]["group"])
+
+
+def checkpoint_of(rig: Rig, group: str) -> str:
+    [found] = [str(c["id"]) for c in checkpoints(rig) if c["group"] == group]
+    return found
+
+
+def three_edits(rig: Rig) -> tuple[str, str, str]:
+    """Three groups, one timeline checkpoint each (recorded just now)."""
+    return (
+        group_of(trim(rig, a_seg(1))),
+        group_of(trim(rig, a_seg(1), edge="tail", offset=-1)),
+        group_of(delete(rig, [S2])),
+    )
+
+
+def test_groups_select_the_recorded_checkpoints_of_those_groups_whatever_their_age(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ga, gb, gc = three_edits(rig)
+    old = old_checkpoint(rig, monkeypatch, S3)
+    stray = plant(rig)
+    spy = DeleteSpy(rig, monkeypatch)
+    before = stash_names(rig)
+    env = purge(rig, groups=[gc, ga])
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["groups"] == [gc, ga] and result["olderThanDays"] is None
+    assert [c["id"] for c in result["candidates"]] == [
+        checkpoint_of(rig, ga),
+        checkpoint_of(rig, gc),
+    ]
+    assert [c["group"] for c in result["candidates"]] == [ga, gc]
+    assert result["count"] == 2 and result["groupsAlreadyPurged"] == []
+    assert spy.names == [] and stash_names(rig) == before and purge_records(rig) == []
+    real = purge(rig, groups=[ga, gc], dry_run=False)
+    assert real["ok"] is True, real
+    assert {p["id"] for p in real["result"]["purged"]} == {
+        checkpoint_of(rig, ga),
+        checkpoint_of(rig, gc),
+    }
+    assert old not in {p["id"] for p in real["result"]["purged"]}
+    assert len(stash_names(rig)) == len(before) - 2
+    assert [u["uid"] for u in result["unknown"]] == [uid(stray)]
+    assert [u["uid"] for u in real["result"]["unknown"]] == [uid(stray)]
+    assert uid(stray) in [uid(e) for e in stash_entries(rig)]
+    assert purge_records(rig)[0]["groups"] == [ga, gc]
+    assert purge(rig, groups=[gb])["result"]["count"] == 1
+
+
+def test_without_groups_the_result_says_so_and_nothing_changes(rig: Rig) -> None:
+    result = purge(rig)["result"]
+    assert result["groups"] is None and result["groupsAlreadyPurged"] == []
+    assert result["olderThanDays"] == 30
+
+
+def test_groups_with_older_than_days_are_refused_and_nothing_is_sent(rig: Rig) -> None:
+    ga, _, _ = three_edits(rig)
+    sent = len(rig.exec.labels())
+    for days in (0, 30, 5):
+        env = rig.do(PURGE, {"groups": [ga], "older_than_days": days})
+        assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+        assert "older_than_days" in env["error"] and "groups" in env["error"]
+    assert len(rig.exec.labels()) == sent and purge_records(rig) == []
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [[], ["g_" + str(i) for i in range(51)], ["g_a", "g_a"], [""], ["g_\u00e9"], ["g_a", 5], "g_a"],
+    ids=["empty", "51", "duplicate", "empty-string", "non-ascii", "non-string", "not-a-list"],
+)
+def test_the_groups_array_is_checked_and_nothing_is_sent(rig: Rig, groups: Any) -> None:
+    sent = len(rig.exec.labels())
+    env = rig.do(PURGE, {"groups": groups})
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    assert len(rig.exec.labels()) == sent
+
+
+def test_fifty_groups_pass_the_array_check_and_every_unknown_one_is_named(rig: Rig) -> None:
+    ga, _, _ = three_edits(rig)
+    real = [ga] + [f"g_none_{i}" for i in range(49)]
+    env = rig.do(PURGE, {"groups": real})
+    assert env["errorCode"] == "INVALID_ARGS" and "g_none_0" in env["error"]
+    assert "g_none_48" in env["error"] and ga not in env["error"]
+
+
+def test_a_group_with_no_timeline_checkpoint_on_record_is_refused_by_id(rig: Rig) -> None:
+    ga, _, _ = three_edits(rig)
+    sent = len(rig.exec.labels())
+    env = rig.do(PURGE, {"groups": [ga, "g_typo", "g_typo2"]})
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    assert "g_typo" in env["error"] and "g_typo2" in env["error"] and ga not in env["error"]
+    assert len(rig.exec.labels()) == sent
+
+
+def test_a_group_that_only_has_a_batch_checkpoint_is_refused_and_the_message_says_why(
+    rig: Rig,
+) -> None:
+    rig.journal.append(
+        {"type": "checkpoint", "id": "c_batch1", "kind": "batch", "group": "g_batch", "ts": OLD}
+    )
+    env = rig.do(PURGE, {"groups": ["g_batch"]})
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    assert "g_batch" in env["error"] and "Batch" in env["error"]
+
+
+def test_a_group_whose_checkpoints_are_all_purged_is_not_refused_and_is_reported(
+    rig: Rig,
+) -> None:
+    ga, gb, _ = three_edits(rig)
+    assert purge(rig, groups=[ga], dry_run=False)["ok"] is True
+    again = purge(rig, groups=[ga])
+    assert again["ok"] is True, again
+    assert again["result"]["candidates"] == [] and again["result"]["count"] == 0
+    assert again["result"]["groupsAlreadyPurged"] == [ga]
+    mixed = purge(rig, groups=[gb, ga])["result"]
+    assert [c["group"] for c in mixed["candidates"]] == [gb]
+    assert mixed["groupsAlreadyPurged"] == [ga]
+    real = purge(rig, groups=[gb, ga], dry_run=False)
+    assert real["ok"] is True and real["result"]["groupsAlreadyPurged"] == [ga]
+
+
+def test_the_token_covers_groups_and_not_their_order(rig: Rig) -> None:
+    ga, gb, gc = three_edits(rig)
+    token = purge(rig, groups=[ga, gb])["result"]["token"]
+    assert purge(rig, groups=[gb, ga])["result"]["token"] == token
+    assert purge(rig, groups=[ga])["result"]["token"] != token
+    before = stash_names(rig)
+    other = rig.do(PURGE, {"groups": [ga], "dry_run": False, "token": token})
+    assert other["ok"] is False and other["errorCode"] == "PRECONDITION_UNMET", other
+    assert "groups" in other["error"]
+    plain = purge(rig, older_than_days=0)["result"]["token"]
+    again = rig.do(PURGE, {"groups": [ga, gb, gc], "dry_run": False, "token": plain})
+    assert again["ok"] is False and again["errorCode"] == "PRECONDITION_UNMET", again
+    assert stash_names(rig) == before and purge_records(rig) == []
+    same = rig.do(PURGE, {"groups": [gb, ga], "dry_run": False, "token": token})
+    assert same["ok"] is True and len(same["result"]["purged"]) == 2

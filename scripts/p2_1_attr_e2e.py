@@ -2,9 +2,11 @@
 """MCP end-to-end check of the generic attribute ops and the selectors.
 
 Checks: The generic attribute ops on reels, clips, segments, Batch groups and nodes (a library and
-its clip are refused), the revert of each write, the refusal of bad values, the `batch`, `node` and
-`action_node` selectors, and the resolution of a Colour Source node (a write that Flame applies in
-full and one it applies only in part, each put back by `journal.revert`).
+its clip are refused), the revert of each write, the write of a clip's current_time from a frame
+and from a timecode (a time outside the clip and start_time are refused), the refusal of bad
+values, the `batch`, `node` and `action_node` selectors, and the resolution of a Colour Source
+node (a write that Flame applies in full and one it applies only in part, each put back by
+`journal.revert`).
 
 Also covers the `batch` / `node` / `action_node` selectors (run with the `.venv` Python;
 `scripts/run_e2e.sh p2_1_attr` starts Flame).
@@ -39,6 +41,11 @@ Stages
         restores it by the post-write name; (b) to a name the CURRENT group B holds ->
         Flame refuses, ok=false, explained, unchanged; (c) to a sibling's name in the same
         group -> refused before any write. Stages e and f do not depend on these)
+      c_clip_time: current_time of the Desktop clip written from a frame (absolute PyTime, the
+        clip's own frame rate) -> get_attributes and an independent transport read agree ->
+        journal.revert -> the start value; the same from a timecode; a frame after the end or
+        before the start of the clip -> INVALID_ARGS, value unchanged; start_time ->
+        INVALID_ARGS, value unchanged
       c_resolution: a Colour Source node of A: resolution 800x1080 at bit_depth 16 -> read
         back (op and transport) -> journal.revert -> the start value; then bit_depth 10 ->
         FLAME_API_ERROR "partial:", transport reads width 800, height 1080, bit_depth 16 ->
@@ -615,6 +622,133 @@ async def stage_c_clip(ctx: Ctx) -> None:
             entry=entry,
             env=probe,
         )
+
+
+def tx_time(ctx: Ctx, wid: str) -> dict[str, Any] | str:
+    """Independent read of a clip's current_time, start_time and duration (frames)."""
+    code = "\n".join(
+        [
+            locate_wiretap(wid),
+            "_ct = _v(obj.current_time)",
+            "_result = {",
+            "    'cur': _ct.frame, 'curTc': str(_ct.timecode),",
+            "    'start': _v(obj.start_time).frame, 'dur': _v(obj.duration).frame,",
+            "    'rate': str(obj.frame_rate),",
+            "}",
+        ]
+    )
+    br = _txv(code, ctx.run_dir, label="read_clip_time")
+    return br.result if br.ok and isinstance(br.result, dict) else f"<transport error {br.error}>"
+
+
+async def stage_c_clip_time(ctx: Ctx) -> None:
+    """current_time of the Desktop clip is written from a frame and from a timecode (absolute
+    PyTime, the clip's own frame rate) and put back by journal.revert; a time outside the clip's
+    range and start_time are refused with the value unchanged."""
+    ids = ctx.ids
+    wid = ids["deskClipWtid"]
+    target = {"kind": "wiretap", "id": wid}
+    start = tx_time(ctx, wid)
+    ok_start = isinstance(start, dict) and start["dur"] >= 2
+    rec(ctx.results, "c_time_start_read", ok_start, start=start)
+    if not isinstance(start, dict) or not ok_start:
+        return
+    last = start["start"] + start["dur"] - 1
+    frame = start["cur"] + 1 if start["cur"] < last else start["cur"] - 1
+
+    written = await do(
+        ctx,
+        "desktop.set_attributes",
+        {"target": target, "values": {"current_time": {"frame": frame}}},
+    )
+    now = tx_time(ctx, wid)
+    got = await do(ctx, "desktop.get_attributes", {"target": target, "keys": ["current_time"]})
+    rec(
+        ctx.results,
+        "c_time_frame_write_reads_back_as_written",
+        written.get("ok") is True
+        and value_of(written, "applied") == ["current_time"]
+        and isinstance(now, dict)
+        and now["cur"] == frame
+        and attr_value(got, "current_time") == {"timecode": now["curTc"], "frame": frame},
+        env=written,
+        transport=now,
+        got=attr_value(got, "current_time"),
+    )
+    back = await do(ctx, "journal.revert", {"group": (written.get("journal") or {}).get("group")})
+    restored = tx_time(ctx, wid)
+    rec(
+        ctx.results,
+        "c_time_frame_write_is_reverted",
+        back.get("ok") is True and isinstance(restored, dict) and restored["cur"] == start["cur"],
+        env=back,
+        transport=restored,
+    )
+
+    timecode = now["curTc"] if isinstance(now, dict) else ""
+    written = await do(
+        ctx,
+        "desktop.set_attributes",
+        {"target": target, "values": {"current_time": {"timecode": timecode}}},
+    )
+    now = tx_time(ctx, wid)
+    rec(
+        ctx.results,
+        "c_time_timecode_write_reads_back_as_written",
+        written.get("ok") is True
+        and isinstance(now, dict)
+        and now["cur"] == frame
+        and now["curTc"] == timecode,
+        env=written,
+        transport=now,
+        timecode=timecode,
+    )
+    back = await do(ctx, "journal.revert", {"group": (written.get("journal") or {}).get("group")})
+    restored = tx_time(ctx, wid)
+    rec(
+        ctx.results,
+        "c_time_timecode_write_is_reverted",
+        back.get("ok") is True and isinstance(restored, dict) and restored["cur"] == start["cur"],
+        env=back,
+        transport=restored,
+    )
+
+    for label, bad in (
+        ("after_the_end", {"frame": last + 1}),
+        ("before_the_start", {"frame": start["start"] - 1}),
+    ):
+        refused = await do(
+            ctx, "desktop.set_attributes", {"target": target, "values": {"current_time": bad}}
+        )
+        now = tx_time(ctx, wid)
+        rec(
+            ctx.results,
+            f"c_time_{label}_is_refused_and_unchanged",
+            refused.get("ok") is False
+            and refused.get("errorCode") == "INVALID_ARGS"
+            and isinstance(now, dict)
+            and now["cur"] == start["cur"],
+            env=refused,
+            transport=now,
+        )
+
+    refused = await do(
+        ctx,
+        "desktop.set_attributes",
+        {"target": target, "values": {"start_time": {"frame": start["start"] + 1}}},
+    )
+    now = tx_time(ctx, wid)
+    rec(
+        ctx.results,
+        "c_time_start_time_is_refused_and_unchanged",
+        refused.get("ok") is False
+        and refused.get("errorCode") == "INVALID_ARGS"
+        and isinstance(now, dict)
+        and now["start"] == start["start"]
+        and now["cur"] == start["cur"],
+        env=refused,
+        transport=now,
+    )
 
 
 def first_media_index(ctx: Ctx, items: list[dict[str, Any]]) -> int | None:
@@ -1495,6 +1629,7 @@ async def async_main(run_dir: Path, results: Results) -> None:
                     ("c_library", stage_c_library),
                     ("c_reel", stage_c_reel),
                     ("c_clip", stage_c_clip),
+                    ("c_clip_time", stage_c_clip_time),
                     ("c_segment", stage_c_segment),
                     ("c_batch", stage_c_batch),
                     ("c_nodes", stage_c_nodes),

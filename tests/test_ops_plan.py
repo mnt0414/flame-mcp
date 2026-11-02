@@ -167,6 +167,22 @@ def test_one_invalid_step_means_nothing_runs(rig: Rig) -> None:
     assert env["result"]["ran"] is False
 
 
+def test_an_unknown_fields_name_in_a_read_step_refuses_the_whole_plan_before_any_write(
+    rig: Rig,
+) -> None:
+    steps = [
+        set_step(COMP, {"pos_x": 5.0}),
+        {"op": "desktop.find", "args": {"name": "x", "fields": ["nmae"]}},
+    ]
+    env = run_plan(rig, steps)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS"
+    assert rig.exec.calls == [] and rig.records() == []
+    assert comp_pos(rig) == 0.0
+    issues = env["result"]["issues"]
+    assert [(i["index"], i["op"]) for i in issues] == [(1, "desktop.find")]
+    assert "nmae" in issues[0]["problems"][0] and env["result"]["ran"] is False
+
+
 def test_a_misspelt_op_gets_a_suggestion(rig: Rig) -> None:
     env = run_plan(rig, [{"op": "node.set_attribute", "args": {}}])
     assert "did you mean 'node.set_attributes'" in env["result"]["issues"][0]["problems"][0]

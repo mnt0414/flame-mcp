@@ -1115,6 +1115,32 @@ def test_a_render_that_raised_after_some_frames_reads_partial_by_the_handle(
     assert entry["current"]["writtenFrames"] == 3
 
 
+def test_a_render_that_wrote_nothing_without_an_error_reads_not_landed_by_the_handle(
+    rig: Rig, tmp_path: Path, bridge: FakeBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_writer(rig, tmp_path, last=8)
+    bg(rig).render_frames_limit = 0
+    group = pending_render(rig, bridge, monkeypatch)["journal"]["group"]
+    entry = check(rig, group)
+    assert entry["verdict"] == "not_landed" and entry["basis"] == "handle"
+    assert entry["renderOutcome"]["errorCode"] == "SILENT_NOOP"
+    assert entry["current"]["writtenFrames"] == 0
+    assert states(rig)[group] == "not_landed" and blocked_groups(rig) == []
+
+
+def test_a_render_that_returned_false_and_wrote_nothing_still_reads_failed_by_the_handle(
+    rig: Rig, tmp_path: Path, bridge: FakeBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_writer(rig, tmp_path, last=8)
+    bg(rig).render_returns = False
+    bg(rig).render_frames_limit = 0
+    group = pending_render(rig, bridge, monkeypatch)["journal"]["group"]
+    entry = check(rig, group)
+    assert entry["verdict"] == "failed" and entry["basis"] == "handle"
+    assert entry["renderOutcome"]["errorCode"] == "FLAME_API_ERROR"
+    assert states(rig)[group] == "failed"
+
+
 def test_a_render_that_returned_short_reads_like_render_batch_does(
     rig: Rig, tmp_path: Path, bridge: FakeBridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:

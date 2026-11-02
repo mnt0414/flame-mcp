@@ -2,8 +2,8 @@
 
 Like `timeline_build_prelude`: real Python source that `execution.build_exec_code` places ahead of
 an op's own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError`,
-`_segment_list` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` / `_td_*` helpers already
-defined.
+`_segment_list`, `_te_fail` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` / `_td_*`
+helpers already defined.
 
 What it encodes (measured on Flame 2025.2.4):
   - nothing moves a track: PySequence, PyVersion, PyTrack and PyAudioTrack expose no move or order
@@ -231,7 +231,7 @@ def _tm_check(seq, version, track, to):
             'track index ' + str(track) + ' out of range (have ' + str(count) + ')',
         )
     if count < 2:
-        return _tb_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'the version has a single track: there is no other place to move it to',
@@ -242,17 +242,17 @@ def _tm_check(seq, version, track, to):
             'to ' + str(to) + ' is out of range (the version has ' + str(count) + ' tracks)',
         )
     if to == track:
-        return _tb_fail(out, 'INVALID_ARGS', 'to is the track itself: it would not move')
+        return _te_fail(out, 'INVALID_ARGS', 'to is the track itself: it would not move')
     src = tracks[track]
     refusal = _tm_refusal(src)
     if refusal is not None:
-        return _tb_fail(out, 'PRECONDITION_UNMET', refusal)
+        return _te_fail(out, 'PRECONDITION_UNMET', refusal)
     refusal = _tm_gap_fx_refusal(seq, version, track)
     if refusal is not None:
-        return _tb_fail(out, 'PRECONDITION_UNMET', refusal)
+        return _te_fail(out, 'PRECONDITION_UNMET', refusal)
     for owner, name in ((src, 'copy_to_media_panel'), (versions[version], 'create_track')):
         if not callable(getattr(owner, name, None)):
-            return _tb_fail(
+            return _te_fail(
                 out,
                 'PRECONDITION_UNMET',
                 'this Flame has no ' + type(owner).__name__ + '.' + name + ': nothing was done',
@@ -502,7 +502,7 @@ def _tm_move(seq, version, track, to, library_name, reel_name):
     if failed:
         what = out['exception'] if out['exception'] is not None else problem
         removed = cleanup['track'] is not None and cleanup['track']['deleted']
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'moving track ' + str(track) + ' to ' + str(to) + ' stopped at ' + out['stage'] + ': '
@@ -514,14 +514,14 @@ def _tm_move(seq, version, track, to, library_name, reel_name):
             + ', journal.revert puts it back)',
         )
     if problems:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'the tracks read back are not the old order with track ' + str(track) + ' moved to '
             + str(to) + ': ' + '; '.join(problems) + ' (journal.revert puts the sequence back)',
         )
     if not out['changed'] and sigs_before != wanted:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             'the move returned and nothing in the sequence changed',

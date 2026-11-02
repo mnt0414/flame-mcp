@@ -84,7 +84,9 @@ REEL_NOTE: Final[str] = (
     "An empty reel has no stashed copy (result.deleted[].stash is null). journal.revert(group) "
     "makes a new empty reel of the same name and type at the END of the same reel group (a new "
     "uid; its old place is not restored, and neither are its colour or other attributes); a "
-    "reel group that already has a reel of that name is a CONFLICT."
+    "reel group that already has a reel of that name is a CONFLICT. A schematic reel of a Batch "
+    "group is made again the same way with PyBatch.create_reel at the end of the group's "
+    "schematic reels."
 )
 DELETE_REVERT_NOTE: Final[str] = (
     "The things were copied back into their old parents from their stashed copies: each has a NEW "
@@ -110,12 +112,6 @@ def is_delete_intent(view: IntentView) -> bool:
         view.desktop_kind == KIND_DESKTOP_REVERT
         and view.intent.get("revertOf") == KIND_DESKTOP_DELETE
     )
-
-
-def _no_refusal(
-    op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any], started: float
-) -> dict[str, Any] | None:
-    return None
 
 
 def _refuse(
@@ -223,6 +219,8 @@ def _stable_args(
             "segmentCount": row.get("segmentCount"),
             "checkpoint": st.get("checkpoint"),
             "stash": st.get("stash"),
+            "batchReel": (row.get("parent") or {}).get("type") == "PyBatch",
+            "batchUid": (row.get("parent") or {}).get("uid"),
         }
         for row, st in zip(rows, stashed, strict=True)
     }
@@ -315,16 +313,17 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
 
 
 def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
-    if pre.get("errorCode") == "INVALID_ARGS":
+    if pre.get("errorCode") == "INVALID_ARGS" and "inside a reel of a Batch group" in str(
+        pre.get("error")
+    ):
         return (
-            "A reel of a Batch group is not deleted from here. Nothing was written and nothing "
-            "journaled."
+            "A clip or a sequence inside a reel of a Batch group is not deleted from here. "
+            "Nothing was written and nothing journaled."
         )
     return None
 
 
 DELETE_PROFILE: Final[WriteProfile] = WriteProfile(
-    refuse=_no_refusal,
     stable_args=_stable_args,
     intent=_intent_record,
     created=created_record,

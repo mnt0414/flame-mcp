@@ -20,9 +20,11 @@ from flame_mcp.desktop_run import (
     PHASE_WRITE,
     run_desktop_write,
 )
+from flame_mcp.list_fields import fields_note, fields_param
 from flame_mcp.ops._attributes import attribute_requires, register_attribute_ops
 from flame_mcp.ops._common import (
     build_source,
+    limit_param,
     list_result_src,
     offset_param,
     raise_on_error_src,
@@ -647,9 +649,6 @@ def register(registry: Registry) -> None:
     registry.register_category(CATEGORY)
     _register_writes(registry)
 
-    limit_param = OperationParam(
-        name="limit", type="number", description="Max items to return.", required=False
-    )
     target_param = OperationParam(
         name="target",
         type="selector",
@@ -676,12 +675,12 @@ def register(registry: Registry) -> None:
                 "`offset` skips items, `types` keeps only the named Flame types "
                 "(`total` counts the items after that filter). A PyClip / PySequence item "
                 "also carries `duration` and `frameRate` and `width`, `height`, `bitDepth` "
-                "(each null when it cannot be read)."
+                "(each null when it cannot be read). " + fields_note()
             ),
             effect="read",
             params=(
                 list_target_param,
-                limit_param,
+                limit_param(),
                 offset_param(),
                 OperationParam(
                     name="types",
@@ -693,6 +692,7 @@ def register(registry: Registry) -> None:
                     required=False,
                     item_type="string",
                 ),
+                fields_param("desktop.list_children"),
             ),
             accepts=(*_TARGET_ACCEPTS, "desktop"),
             to_python=_list_children_to_python,
@@ -716,7 +716,7 @@ def register(registry: Registry) -> None:
             category="desktop",
             description="List the current Media Panel selection.",
             effect="read",
-            params=(limit_param, offset_param()),
+            params=(limit_param(), offset_param()),
             to_python=_selection_to_python,
             requires=("PyMediaPanel.selected_entries",),
         )

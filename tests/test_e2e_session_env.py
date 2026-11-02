@@ -26,6 +26,7 @@ journal_e2e = importlib.import_module("p2_2a_journal_e2e")
 mcp_e2e = importlib.import_module("p1_mcp_e2e")
 
 ENABLE_EVAL = "FLAME_MCP_ENABLE_EVAL"
+RESPONSE = "FLAME_MCP_RESPONSE"
 
 
 class FakeSession:
@@ -160,3 +161,21 @@ def test_mcp_server_can_be_started_without_the_eval_switch(
     run_mcp_session(tmp_path, eval_enabled=False)
 
     assert ENABLE_EVAL not in seen[0]
+
+
+@pytest.mark.parametrize("parent_value", [None, "compact", "full"])
+def test_both_e2e_clients_start_their_servers_with_full_responses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parent_value: str | None
+) -> None:
+    if parent_value is None:
+        monkeypatch.delenv(RESPONSE, raising=False)
+    else:
+        monkeypatch.setenv(RESPONSE, parent_value)
+    journal_seen = capture_env(journal_e2e, monkeypatch)
+    mcp_seen = capture_env(mcp_e2e, monkeypatch)
+
+    run_journal_session(tmp_path)
+    run_mcp_session(tmp_path)
+
+    assert journal_seen[0][RESPONSE] == "full"
+    assert mcp_seen[0][RESPONSE] == "full"

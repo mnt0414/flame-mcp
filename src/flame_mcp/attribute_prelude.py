@@ -23,6 +23,14 @@ What it encodes (measured on Flame 2025.2.4):
     ends in `partial:` (FLAME_API_ERROR), one that changed nothing in `silent_noop:`. The keys
     whose value changed are returned as `changedKeys` (applied or not): that is what a revert
     puts back.
+  - a PyTime attribute is written for `current_time` only, from {frame} and/or {timecode} (and
+    an optional fps that must be the object's own frame_rate). The PyTime is built in the
+    absolute form `flame.PyTime(frame, frame_rate)` / `flame.PyTime(timecode, frame_rate)`
+    (the relative `PyTime(int)` is never used), and the frame must lie inside
+    `start_time.frame` .. `start_time.frame + duration.frame - 1`: Flame moves a frame outside
+    that range to the nearest end without an error (58 -> 47, -1 -> 0 on a 48-frame clip), so
+    the check runs before the write. Other PyTime attributes (start_time ...) are refused:
+    start_time drags current_time along when raised and not when lowered.
   - compare-and-swap: when the server passes `expected` (the values it read a
     moment ago), every key's current value must still equal it, checked after the
     preflight and before the first write; one mismatch means nothing is written and
@@ -132,6 +140,8 @@ def _resolution_gaps(got, want):
 def _attr_equal(a, b):
     if _is_resolution(a) and _is_resolution(b):
         return len(_resolution_gaps(a, b)) == 0
+    if type(a).__name__ == 'PyTime' and type(b).__name__ == 'PyTime':
+        return _v(a.frame) == _v(b.frame)
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if _is_num(a) and _is_num(b):
@@ -230,6 +240,79 @@ def _resolution_want(current, want):
     return None, built
 
 
+_TIME_KEYS = ('frame', 'timecode', 'fps')
+_TIME_SHAPE = (
+    "an object {'frame': int} and/or {'timecode': str}, with an optional 'fps' that must be "
+    "the object's own frame rate"
+)
+
+
+def _is_int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _time_problem(want):
+    if not isinstance(want, dict):
+        return 'expected ' + _TIME_SHAPE + ', got ' + repr(want)
+    for k in want:
+        if k not in _TIME_KEYS:
+            return 'unknown key ' + repr(k) + ' (keys: ' + ', '.join(_TIME_KEYS) + ')'
+    if 'frame' not in want and 'timecode' not in want:
+        return 'expected ' + _TIME_SHAPE + ', got ' + repr(want)
+    if 'frame' in want and not _is_int(want['frame']):
+        return 'frame must be an integer, got ' + repr(want['frame'])
+    if 'timecode' in want and not isinstance(want['timecode'], str):
+        return 'timecode must be a string, got ' + repr(want['timecode'])
+    if 'fps' in want and not isinstance(want['fps'], str):
+        return 'fps must be a string, got ' + repr(want['fps'])
+    return None
+
+
+def _time_want(obj, key, want):
+    if key != 'current_time':
+        reason = (
+            'rejected: only current_time can be written among the PyTime attributes ('
+            + key + ' is not)'
+        )
+        if key == 'start_time':
+            reason += '; start_time moves current_time along when raised and not when lowered'
+        return reason, None
+    problem = _time_problem(want)
+    if problem is not None:
+        return 'rejected: ' + problem, None
+    rate = _try(lambda: str(_v(obj.frame_rate)))
+    first = _try(lambda: _v(_v(obj.start_time).frame))
+    length = _try(lambda: _v(_v(obj.duration).frame))
+    if not isinstance(rate, str) or not _is_int(first) or not _is_int(length):
+        return 'rejected: the frame rate, start_time or duration of the object cannot be read', None
+    if 'fps' in want and want['fps'] != rate:
+        return (
+            'rejected: fps ' + repr(want['fps']) + ' is not the frame rate of the object ('
+            + repr(rate) + '); the time would mean something else'
+        ), None
+    try:
+        if 'frame' in want:
+            built = flame.PyTime(want['frame'], rate)
+        else:
+            built = flame.PyTime(want['timecode'], rate)
+        frame = _v(built.frame)
+        timecode = _v(built.timecode)
+    except BaseException as exc:
+        return 'rejected: Flame refused to build the time: ' + str(exc), None
+    if 'frame' in want and 'timecode' in want and timecode != want['timecode']:
+        return (
+            'rejected: frame ' + repr(want['frame']) + ' is timecode ' + repr(timecode)
+            + ', not ' + repr(want['timecode'])
+        ), None
+    if frame < first or frame > first + length - 1:
+        return (
+            'rejected: frame ' + repr(frame) + ' is outside the range of the object ('
+            + repr(first) + ' to ' + repr(first + length - 1)
+            + ')'
+        ), None
+    return None, built
+
+
 def _attr_preflight(obj, names, key, want):
     if key not in names:
         shown = ', '.join(names[:40]) + (' ...' if len(names) > 40 else '')
@@ -242,7 +325,8 @@ def _attr_preflight(obj, names, key, want):
     if type(attr).__name__ != 'PyAttribute':
         return 'rejected: not a PyAttribute (' + type(attr).__name__ + ')', None, None
     if type(current).__name__ == 'PyTime':
-        return 'rejected: PyTime attributes are not supported yet', None, current
+        reason, built = _time_want(obj, key, want)
+        return reason, built, current
     if _is_resolution(current):
         reason, built = _resolution_want(current, want)
         return reason, built, current

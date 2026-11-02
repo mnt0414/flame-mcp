@@ -44,6 +44,7 @@ from flame_mcp.journal import (
 )
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime, ServerContext
@@ -57,7 +58,6 @@ ACTIONS: Final[dict[str, str]] = {CREATE_OP: "create", REMOVE_OP: "remove", SYNC
 REMOVE_KIND: Final[str] = "segment_connection_remove"
 """`kind` of the intent a step of any connection write makes. The intent's `action` says which
 write it was, and `check_remove_intent` decides by it. `journal.check` dispatches on this kind."""
-CONNECTION_KIND: Final[str] = REMOVE_KIND
 
 PHASE_ARG: Final[str] = "_phase"
 PHASE_CHECK: Final[str] = "check"
@@ -68,10 +68,6 @@ send them, `validate_op_args` rejects an unknown key)."""
 _NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
 
 _ROW_DROP: Final[tuple[str, ...]] = ("notices", "warnings", "error", "errorCode")
-
-
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
 
 
 def _item(index: int, env: dict[str, Any], *, unknown: bool) -> dict[str, Any]:
@@ -217,7 +213,7 @@ def _refused_without_address(op: RegisteredOperation, started: float, what: str)
         ),
         error_code="PRECONDITION_UNMET",
         op=op,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint=None,
     )
 
@@ -234,7 +230,7 @@ def _run_single(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         check = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_CHECK}, run_dir=rt.run_dir)
@@ -255,7 +251,7 @@ def _run_single(
                 error=failure["error"],
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=failure["hint"],
             )
         env = execution.run_op(op, {**op_args, "target": stable}, run_dir=rt.run_dir)
@@ -288,7 +284,7 @@ def run_connection_write(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         check = execution.run_op(
@@ -373,7 +369,7 @@ def run_connection_write(
                 affected=removed,
                 journal=ref,
                 execution=meta,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
             ),
             degraded,
         )
@@ -402,7 +398,7 @@ def run_connection_write(
             partial=partial,
             journal=ref,
             execution=meta,
-            duration_ms=_elapsed_ms(started),
+            duration_ms=elapsed_ms(started),
             hint_override=hint,
         ),
         degraded,

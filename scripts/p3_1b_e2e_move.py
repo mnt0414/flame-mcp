@@ -291,19 +291,15 @@ async def stage_c_refusals(session: Any, ctx: Ctx) -> None:
         )
     else:
         observe(ctx, "c9_the_clip_in_the_batch_reel_has_no_wiretap_id")
-    same = await run_call(session, ctx, "c10_move_into_its_own_reel")
     selection = await run_call(session, ctx, "c11_move_to_a_selection")
     reel = await run_call(session, ctx, "c12_move_a_reel")
     rec(
         ctx,
-        "c10_same_reel_selection_destination_and_a_reel_source_are_refused_before_a_write",
-        expect_error(same, "PRECONDITION_UNMET")
-        and "already in" in err_text(same)
-        and expect_error(selection, "INVALID_ARGS")
+        "c10_selection_destination_and_a_reel_source_are_refused_before_a_write",
+        expect_error(selection, "INVALID_ARGS")
         and expect_error(reel, "SELECTOR_TYPE")
         and groups_now(ctx) == before
         and await tx_find_uid(ctx, x["uid"]) == "PyClip",
-        sameError=same.get("error"),
         selectionError=selection.get("error"),
         reelError=reel.get("error"),
     )

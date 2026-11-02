@@ -2,8 +2,9 @@
 """MCP end-to-end verification client (run with the `.venv` Python).
 
 Checks: Eight basic operations (reads of the project, libraries, desktop, timeline and segments, and
-`desktop.rename`) through the MCP server: the catalog, the answers, a rename and its revert, the
-refusal of a rename inside a library, and the error cases.
+`desktop.rename`) and `project.save` through the MCP server: the catalog, the answers, a rename and
+its revert, the refusal of a rename inside a library, the error cases, and the save (ok, and its
+`readBackDecisive` is false).
 
 Drives the real MCP surface (`python -m flame_mcp` over stdio, via the
 `mcp` package's own stdio client -- `mcp.client.stdio.stdio_client` +
@@ -50,9 +51,12 @@ Steps:
      via a wiretap selector (the Desktop reel)
   e. abnormal paths: unknown wiretap/path -> SELECTOR_EMPTY, selection of 0
      -> SELECTOR_EMPTY, wrong shape / unaccepted kind -> INVALID_ARGS
+  i. project.save (run after e, before f and the cleanup, so the saved point still holds the
+     test library and reel): flame_do returns ok, result.readBackDecisive is False and
+     result.projectName is the test project's name
   f. a second server subprocess with FLAME_MCP_READONLY=1: tools/list's
-     flame_do op enum and flame_catalog both omit every op READONLY hides (the registry's
-     non-read ops: desktop.rename + the *.set_attributes, plus eval.run);
+     flame_do op enum and flame_catalog both omit every op READONLY hides (computed from
+     the registry: every non-read op, plus eval.run);
      flame_do(desktop.rename) -> POLICY_DENIED; a read op still works
   g. cleanup via transport (delete the created library + desktop reel),
      then flame.exit() (no response is expected -- the connection just
@@ -100,6 +104,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client  # noqa: E402
 
 from flame_mcp import envelope as envelope_mod  # noqa: E402
 from flame_mcp import transport  # noqa: E402
+from flame_mcp.compact import RESPONSE_ENV  # noqa: E402
 from flame_mcp.ops import register_all  # noqa: E402
 from flame_mcp.registry import Registry  # noqa: E402
 
@@ -496,6 +501,7 @@ async def mcp_session(
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT / "src")
     env["FLAME_MCP_RUN_DIR"] = str(run_dir)
+    env[RESPONSE_ENV] = "full"  # the checks read the full envelope, whatever the default is
     if readonly:
         env["FLAME_MCP_READONLY"] = "1"
     else:
@@ -1243,6 +1249,20 @@ async def step_e_abnormal(session: ClientSession, results: dict[str, Any]) -> No
     )
 
 
+async def step_i_project_save(session: ClientSession, results: dict[str, Any]) -> None:
+    save_result = await session.call_tool("flame_do", {"op": "project.save"})
+    save_env = _structured(save_result, tool="flame_do", results=results)
+    save_value = _result_of(save_env)
+    record(
+        results,
+        "i_project_save_ok_and_read_back_not_decisive",
+        save_env.get("ok") is True
+        and save_value.get("readBackDecisive") is False
+        and save_value.get("projectName") == PROBE_PROJECT_NAME,
+        env=save_env,
+    )
+
+
 async def step_f_readonly(run_dir: Path, results: dict[str, Any]) -> None:
     async with mcp_session(run_dir, readonly=True) as session:
         listed = await session.list_tools()
@@ -1301,6 +1321,7 @@ async def async_main(run_dir: Path, results: dict[str, Any]) -> None:
         await step_c_flame_context(session, lib, results)
         await step_d_rename_and_revert(session, run_dir, lib, desk, results)
         await step_e_abnormal(session, results)
+        await step_i_project_save(session, results)
 
         results["_lib"] = lib
         results["_desk"] = desk

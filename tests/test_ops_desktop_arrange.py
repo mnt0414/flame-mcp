@@ -53,8 +53,16 @@ def item(action: str, source: dict[str, Any]) -> dict[str, Any]:
     return {"action": action, "source": source}
 
 
-def arrange(rig: Rig, items: list[dict[str, Any]], destination: dict[str, Any]) -> dict[str, Any]:
-    return rig.do(ARRANGE, {"destination": destination, "items": items})
+def arrange(
+    rig: Rig,
+    items: list[dict[str, Any]],
+    destination: dict[str, Any],
+    position: Any = None,
+) -> dict[str, Any]:
+    args: dict[str, Any] = {"destination": destination, "items": items}
+    if position is not None:
+        args["position"] = position
+    return rig.do(ARRANGE, args)
 
 
 def reel1(rig: Rig) -> Any:
@@ -209,13 +217,15 @@ def test_a_timeout_stops_the_run_without_a_retry_and_shuts_the_write_door(rig: R
     assert after["ok"] is True, after
 
 
-def test_a_move_inside_the_destination_reel_is_refused_and_nothing_is_written(rig: Rig) -> None:
-    c1, c2, c3 = three_clips(rig)
+def test_a_move_inside_the_destination_reel_puts_the_clip_at_the_end(rig: Rig) -> None:
+    c1, _c2, c3 = three_clips(rig)
     env = arrange(rig, [item("copy", c3), item("move", c1)], REEL1)
-    assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET", env
-    assert "items[1]" in env["error"] and "already in the destination" in env["error"]
-    assert rig.records() == [] and rig.flame.media_panel.move_calls == []
-    assert rig.flame.media_panel.copy_calls == [] and c2 is not None
+    assert env["ok"] is True, env
+    assert names(reel1(rig)) == ["c2", "c3", "c3", "c1"]
+    assert env["result"]["orderMatches"] is True
+    assert order(env) == ["c2", "c3", "c3", "c1"]
+    group = env["journal"]["group"]
+    assert {r["group"] for r in rig.records() if r.get("type") == "intent"} == {group}
 
 
 def test_a_copy_inside_the_destination_reel_is_allowed(rig: Rig) -> None:
@@ -586,3 +596,395 @@ def test_the_notes_of_the_steps_are_kept_when_the_order_does_not_match(rig: Rig)
     env = arrange(rig, [item("move", c2), item("copy", c1)], reel2_selector(rig))
     assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
     assert any(note.startswith("items[0]: ") for note in env["degraded"]), env["degraded"]
+
+
+def reel2_with(rig: Rig, *clip_names: str) -> list[dict[str, Any]]:
+    """Reel 2 holds the clips; their selectors."""
+    return [wt(add_clip(rig.handles["reel2"], n)) for n in clip_names]
+
+
+def reel2_uids(rig: Rig) -> dict[str, str]:
+    return {str(c.name.get_value()): str(c.uid.get_value()) for c in rig.handles["reel2"].children}
+
+
+def intents(rig: Rig) -> list[dict[str, Any]]:
+    return [r for r in rig.records() if r.get("type") == "intent"]
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        (0, ["c1", "c2", "k1", "k2", "k3", "k4"]),
+        (1, ["k1", "c1", "c2", "k2", "k3", "k4"]),
+        (2, ["k1", "k2", "c1", "c2", "k3", "k4"]),
+        (3, ["k1", "k2", "k3", "c1", "c2", "k4"]),
+        (4, ["k1", "k2", "k3", "k4", "c1", "c2"]),
+        (None, ["k1", "k2", "k3", "k4", "c1", "c2"]),
+    ],
+)
+def test_position_puts_the_items_before_that_entry_of_the_reel(
+    rig: Rig, position: int | None, expected: list[str]
+) -> None:
+    c1, c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3", "k4")
+    env = arrange(rig, [item("copy", c1), item("move", c2)], reel2_selector(rig), position)
+    assert env["ok"] is True, env
+    assert names(rig.handles["reel2"]) == expected
+    assert order(env) == expected and env["result"]["orderMatches"] is True
+    assert env["result"]["existing"] == 4
+
+
+def test_position_sends_what_was_behind_the_insertion_point_in_one_move_in_the_group(
+    rig: Rig,
+) -> None:
+    c1, c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3", "k4")
+    before = reel2_uids(rig)
+    env = arrange(rig, [item("copy", c1), item("move", c2)], reel2_selector(rig), 2)
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert [a["index"] for a in result["applied"]] == [0, 1, 2]
+    shift = result["applied"][2]
+    assert shift["action"] == "move" and shift["shift"] is True
+    assert [row["source"]["name"] for row in shift["shifted"]] == ["k3", "k4"]
+    assert [row["source"]["uid"] for row in shift["shifted"]] == [before["k3"], before["k4"]]
+    assert all(row["made"]["uid"] != row["source"]["uid"] for row in shift["shifted"])
+    assert result["position"] == 2 and result["shiftedBehind"] == 2
+    assert env["affected"] == 3
+    last = rig.flame.media_panel.move_calls[-1]
+    assert [str(o.name.get_value()) for o in last[0]] == ["k3", "k4"] and last[1] is not None
+    assert len(rig.flame.media_panel.move_calls) == 2  # item 1, then the one move of the two
+    assert [i["kind"] for i in intents(rig)] == ["desktop_copy", "desktop_move", "desktop_move"]
+    group = env["journal"]["group"]
+    assert {i["group"] for i in intents(rig)} == {group} and len(env["journal"]["ids"]) == 3
+    first = rig.records()[0]
+    assert first["type"] == "group" and first["steps"] == ["copy", "move", "move"]
+    after = reel2_uids(rig)
+    assert after["k1"] == before["k1"] and after["k2"] == before["k2"]
+    assert after["k3"] != before["k3"] and after["k4"] != before["k4"]
+
+
+def test_position_at_the_end_or_none_makes_no_extra_step(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2")
+    for position in (2, None):
+        env = arrange(rig, [item("copy", c1)], reel2_selector(rig), position)
+        assert env["ok"] is True, env
+        assert len(env["result"]["applied"]) == 1 and "shiftedBehind" not in env["result"]
+    assert rig.flame.media_panel.move_calls == []
+
+
+def test_a_position_out_of_range_is_refused_before_anything_is_written(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2")
+    for position in (3, 99, -1, 1.5, "1", True):
+        env = arrange(rig, [item("copy", c1)], reel2_selector(rig), position)
+        assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", (position, env)
+        assert "position" in env["error"], env["error"]
+    assert rig.records() == [] and rig.flame.media_panel.copy_calls == []
+    assert rig.flame.media_panel.move_calls == []
+    assert names(rig.handles["reel2"]) == ["k1", "k2"]
+
+
+def test_a_move_whose_source_is_in_the_destination_is_refused_when_position_is_given(
+    rig: Rig,
+) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    k1, _k2 = reel2_with(rig, "k1", "k2")
+    for position in (0, 1):
+        env = arrange(rig, [item("copy", c1), item("move", k1)], reel2_selector(rig), position)
+        assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", (position, env)
+        assert "items[1]" in env["error"] and "position" in env["error"]
+    assert rig.records() == [] and rig.flame.media_panel.move_calls == []
+    assert rig.flame.media_panel.copy_calls == []
+
+
+def test_position_at_the_end_is_the_same_as_no_position_for_a_move_out_of_the_destination(
+    rig: Rig,
+) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    k1, _k2 = reel2_with(rig, "k1", "k2")
+    env = arrange(rig, [item("copy", c1), item("move", k1)], reel2_selector(rig), 2)
+    assert env["ok"] is True, env
+    assert names(rig.handles["reel2"]) == ["k2", "c1", "k1"]
+    assert env["result"]["orderMatches"] is True and "shiftedBehind" not in env["result"]
+
+
+def test_a_copy_whose_source_is_in_the_destination_may_use_position(rig: Rig) -> None:
+    _c1, _c2, _c3 = three_clips(rig)
+    _k1, _k2, k3 = reel2_with(rig, "k1", "k2", "k3")
+    env = arrange(rig, [item("copy", k3)], reel2_selector(rig), 1)
+    assert env["ok"] is True, env
+    assert names(rig.handles["reel2"]) == ["k1", "k3", "k2", "k3"]
+    assert env["result"]["orderMatches"] is True
+
+
+def test_a_move_inside_the_destination_without_position_leaves_the_reel_as_expected(
+    rig: Rig,
+) -> None:
+    _c1, c2, _c3 = three_clips(rig)
+    _k1, k2, _k3 = reel2_with(rig, "k1", "k2", "k3")
+    env = arrange(rig, [item("copy", c2), item("move", k2)], reel2_selector(rig))
+    assert env["ok"] is True, env
+    assert names(rig.handles["reel2"]) == ["k1", "k3", "c2", "k2"]
+    assert env["result"]["orderMatches"] is True
+
+
+def test_the_entries_sent_behind_are_limited_to_what_one_move_takes(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, *[f"k{n:02d}" for n in range(51)])
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 0)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    assert "50" in env["error"] and "position" in env["error"]
+    assert rig.records() == [] and rig.flame.media_panel.copy_calls == []
+    edge = arrange(rig, [item("copy", c1)], reel2_selector(rig), 1)
+    assert edge["ok"] is True, edge
+    assert len(rig.flame.media_panel.move_calls[-1][0]) == 50
+    assert names(rig.handles["reel2"])[:3] == ["k00", "c1", "k01"]
+
+
+def test_position_read_and_code_have_no_loop(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2")
+    arrange(rig, [item("copy", c1)], reel2_selector(rig), 1)
+    loops = (ast.For, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    for call in rig.exec.calls:
+        if call.label == ARRANGE:
+            assert not any(isinstance(n, loops) for n in ast.walk(ast.parse(own_source(call.code))))
+        assert call.code.isascii()
+
+
+def test_a_reel_in_another_order_than_the_position_gives_is_a_flame_api_error(rig: Rig) -> None:
+    c1, c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3")
+    reads = {"arrange": 0}
+
+    def flame_reorders(label: str | None) -> None:
+        if label == ARRANGE:
+            reads["arrange"] += 1
+            if reads["arrange"] == 2:
+                rig.handles["reel2"]._children.reverse()
+
+    rig.exec.before_run = flame_reorders
+    env = arrange(rig, [item("copy", c1), item("copy", c2)], reel2_selector(rig), 1)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    result = env["result"]
+    assert result["orderMatches"] is False
+    assert [row["name"] for row in result["expected"]] == ["k1", "c1", "c2", "k2", "k3"]
+    assert order(env) == ["k3", "k2", "c2", "c1", "k1"]
+    assert len(result["applied"]) == 3
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+
+
+def test_an_item_that_fails_leaves_the_shift_not_run_and_the_items_applied(rig: Rig) -> None:
+    c1, c2, c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2")
+    c2_object = rig.flame.find_by_wiretap_node_id(c2["id"])
+
+    gone = {"done": False}
+
+    def user_deletes_c2(label: str | None) -> None:
+        if label == COPY and len(rig.flame.media_panel.copy_calls) == 1 and not gone["done"]:
+            gone["done"] = True
+            reel1(rig)._children.remove(c2_object)
+            rig.flame.forget_wiretap(c2_object)
+
+    rig.exec.before_run = user_deletes_c2
+    env = arrange(
+        rig, [item("copy", c1), item("copy", c2), item("copy", c3)], reel2_selector(rig), 1
+    )
+    assert env["ok"] is False and env["errorCode"] == "SELECTOR_EMPTY", env
+    result = env["result"]
+    assert result["stoppedAt"] == 1 and result["notRun"] == [2, 3]
+    assert env["partial"] == {"done": 1, "failed": 1, "notRun": 2}
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "c1"]
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert names(rig.handles["reel2"]) == ["k1", "k2"]
+
+
+def test_a_shift_that_fails_is_the_last_step_of_the_partial(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    _k1, _k2, k3 = reel2_with(rig, "k1", "k2", "k3")
+    k3_object = rig.flame.find_by_wiretap_node_id(k3["id"])
+    seen = {"moves": 0}
+
+    def user_deletes_k3(label: str | None) -> None:
+        if label == MOVE:
+            seen["moves"] += 1
+            if seen["moves"] == 3:  # pre-pass, the check before the shift, the shift's own read
+                rig.handles["reel2"]._children.remove(k3_object)
+                rig.flame.forget_wiretap(k3_object)
+
+    rig.exec.before_run = user_deletes_k3
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 2)
+    assert env["ok"] is False and env["errorCode"] == "SELECTOR_EMPTY", env
+    result = env["result"]
+    assert result["stoppedAt"] == 1 and result["failed"]["index"] == 1
+    assert result["failed"]["action"] == "move" and result["notRun"] == []
+    assert env["partial"] == {"done": 1, "failed": 1, "notRun": 0}
+    assert [a["index"] for a in result["applied"]] == [0]
+    assert group_hint(env)
+
+
+def group_hint(env: dict[str, Any]) -> bool:
+    return "journal.revert" in env["hint"] and env["journal"]["group"] in env["hint"]
+
+
+def test_a_timeout_of_the_shift_is_not_retried_and_shuts_the_write_door(rig: Rig) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2")
+    # moves: the pre-pass read (#0), the check before the shift (#1), the shift's read (#2) and
+    # write (#3)
+    rig.exec.fault(MOVE, "TIMEOUT", when="after", skip=3)
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 1)
+    assert env["ok"] is False and env["errorCode"] == "TIMEOUT", env
+    assert env["result"]["stoppedAt"] == 1 and len(rig.flame.media_panel.move_calls) == 1
+    assert "journal.check" in env["hint"]
+    again = arrange(rig, [item("copy", c1)], reel2_selector(rig))
+    assert again["errorCode"] == "POLICY_DENIED"
+
+
+def test_revert_puts_the_reel_back_in_its_old_order_with_new_uids_for_what_was_behind(
+    rig: Rig,
+) -> None:
+    c1, c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3", "k4")
+    before = reel2_uids(rig)
+    env = arrange(rig, [item("copy", c1), item("move", c2)], reel2_selector(rig), 2)
+    assert env["ok"] is True, env
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "c1", "c2", "k3", "k4"]
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "k3", "k4"]
+    assert names(reel1(rig)) == ["c1", "c3", "c2"]
+    assert [s["index"] for s in out["result"]["steps"]] == [2, 1, 0]
+    assert [s["action"] for s in out["result"]["steps"]] == ["move", "move", "copy"]
+    after = reel2_uids(rig)
+    assert after["k1"] == before["k1"] and after["k2"] == before["k2"]
+    assert after["k3"] != before["k3"] and after["k4"] != before["k4"]
+    assert out["affected"] == 3
+    again = revert(rig, env)
+    assert again["ok"] is False and again["errorCode"] == "PRECONDITION_UNMET"
+
+
+def test_revert_after_the_shift_keeps_the_order_even_when_the_items_are_all_copies(
+    rig: Rig,
+) -> None:
+    c1, c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3")
+    env = arrange(rig, [item("copy", c1), item("copy", c2)], reel2_selector(rig), 0)
+    assert names(rig.handles["reel2"]) == ["c1", "c2", "k1", "k2", "k3"]
+    assert revert(rig, env)["ok"] is True
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "k3"]
+
+
+def test_the_description_names_position_and_what_the_revert_changes() -> None:
+    registry = Registry()
+    register_all(registry)
+    op = registry.get(ARRANGE)
+    assert op is not None
+    assert any(p.name == "position" and not p.required for p in op.params)
+    for word in ("position", "uid", "journal.revert"):
+        assert word in op.description, word
+
+
+def take_out_of_reel2(rig: Rig, entry: dict[str, Any]) -> None:
+    """The user puts a clip of reel 2 into reel 1 behind the server's back."""
+    clip = rig.flame.find_by_wiretap_node_id(entry["id"])
+    rig.handles["reel2"]._children.remove(clip)
+    reel1(rig)._children.append(clip)
+    adopt(reel1(rig), [clip])
+
+
+def test_a_clip_behind_position_that_left_the_destination_before_the_call_writes_nothing(
+    rig: Rig,
+) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    _k1, _k2, k3 = reel2_with(rig, "k1", "k2", "k3")
+    seen = {"moves": 0}
+
+    def user_moves_k3(label: str | None) -> None:
+        if label == MOVE:
+            seen["moves"] += 1
+            if seen["moves"] == 1:  # the read of the entries behind position
+                take_out_of_reel2(rig, k3)
+
+    rig.exec.before_run = user_moves_k3
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 2)
+    assert env["ok"] is False and env["errorCode"] == "CONFLICT", env
+    assert "position" in env["error"] and "nothing was written" in env["error"]
+    assert rig.records() == [] and rig.flame.media_panel.copy_calls == []
+    assert rig.flame.media_panel.move_calls == []
+
+
+def test_a_clip_behind_position_that_left_the_destination_during_the_items_is_not_moved(
+    rig: Rig,
+) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    _k1, _k2, k3 = reel2_with(rig, "k1", "k2", "k3")
+    seen = {"moves": 0}
+
+    def user_moves_k3(label: str | None) -> None:
+        if label == MOVE:
+            seen["moves"] += 1
+            if seen["moves"] == 2:  # the pre-pass of the shift is the first, the check the second
+                take_out_of_reel2(rig, k3)
+
+    rig.exec.before_run = user_moves_k3
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 2)
+    assert env["ok"] is False and env["errorCode"] == "CONFLICT", env
+    result = env["result"]
+    assert result["stoppedAt"] == 1 and result["failed"]["shift"] is True
+    assert result["notRun"] == [] and [a["index"] for a in result["applied"]] == [0]
+    assert env["partial"] == {"done": 1, "failed": 1, "notRun": 0}
+    assert rig.flame.media_panel.move_calls == []  # the shift was not started
+    assert "journal.revert" in env["hint"] and env["journal"]["group"] in env["hint"]
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "c1"]
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert names(rig.handles["reel2"]) == ["k1", "k2"]
+
+
+def only_the_first_of_a_list(rig: Rig) -> None:
+    """A move of several clips into the reel they are in moves only the first one."""
+    real = rig.flame.media_panel.move
+
+    def partial_move(source: Any, destination: Any) -> list[Any]:
+        if isinstance(source, list) and len(source) > 1 and source[0].parent is destination:
+            return list(real(source[:1], destination))
+        return list(real(source, destination))
+
+    rig.flame.media_panel.move = partial_move
+
+
+def test_a_shift_that_moves_only_some_names_the_ones_left_and_says_the_order_is_not_restored(
+    rig: Rig,
+) -> None:
+    c1, _c2, _c3 = three_clips(rig)
+    reel2_with(rig, "k1", "k2", "k3", "k4")
+    before = reel2_uids(rig)
+    only_the_first_of_a_list(rig)
+    env = arrange(rig, [item("copy", c1)], reel2_selector(rig), 2)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert "partial:" in env["error"]
+    result = env["result"]
+    assert result["stoppedAt"] == 1 and result["notRun"] == []
+    failed = result["failed"]
+    assert failed["shift"] is True
+    assert failed["notMoved"] == [{"name": "k4", "uid": before["k4"], "uidGone": False}]
+    assert [m["name"] for m in failed["moved"]] == ["k3"]
+    assert "k4" in env["hint"] and before["k4"] in env["hint"]
+    assert "not" in env["hint"] and "order" in env["hint"] and "journal.revert" in env["hint"]
+    assert any("order" in note for note in result["notes"])
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "k4", "c1", "k3"]
+    assert [a["index"] for a in result["applied"]] == [0]
+    assert len(env["journal"]["ids"]) == 2
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    # what moved is put back and the copy is deleted; k4 never moved, so it stays in front
+    assert names(rig.handles["reel2"]) == ["k1", "k2", "k4", "k3"]
+    after = reel2_uids(rig)
+    assert after["k1"] == before["k1"] and after["k2"] == before["k2"]
+    assert after["k4"] == before["k4"] and after["k3"] != before["k3"]

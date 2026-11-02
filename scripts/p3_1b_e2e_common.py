@@ -188,11 +188,6 @@ def _c9b(ids: dict[str, Any]) -> dict[str, Any]:
     return {"sources": [wt(ids["batchClipWt"])], "destination": wt(ids["mvDestWt"])}
 
 
-@call_for("c10_move_into_its_own_reel", "desktop.move")
-def _c10(ids: dict[str, Any]) -> dict[str, Any]:
-    return {"sources": [wt(ids["mvSrcWt"])], "destination": wt(ids["mvSrcReelWt"])}
-
-
 @call_for("c11_move_to_a_selection", "desktop.move")
 def _c11(ids: dict[str, Any]) -> dict[str, Any]:
     return {"sources": [wt(ids["mvSrcWt"])], "destination": {"kind": "selection"}}

@@ -21,6 +21,7 @@ import pytest
 
 from fake_media_tree import (
     CLIP_NODE_SETUP_SUFFIXES,
+    RENDER_NODE_SETUP_SUFFIXES,
     FakeAttr,
     PyBatch,
     PyClipNode,
@@ -703,6 +704,21 @@ def test_save_setup_of_a_node_that_writes_several_files_lists_them_all_and_names
     assert result["files"] == [f"{target}{suffix}" for suffix in sorted(CLIP_SUFFIXES)]
     assert result["written"] == result["files"] and result["overwritten"] == []
     assert all(os.path.isfile(f) for f in result["files"])
+    assert result["size"] == os.path.getsize(result["path"])
+
+
+def test_save_setup_of_a_render_node_names_the_output_node_file_as_the_main_one(
+    rig: Rig, tmp_path: Path
+) -> None:
+    bg(rig).create_node("Render")
+    render = {"kind": "node", "batch": BG1, "name": "render1"}
+    target = tmp_path / "rnd"
+    env = rig.do("node.save_setup", {"target": render, "path": str(target)})
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["path"] == f"{target}.output_node" and result["extension"] == ".output_node"
+    assert result["files"] == [f"{target}{s}" for s in sorted(RENDER_NODE_SETUP_SUFFIXES)]
+    assert len(result["files"]) == 4
     assert result["size"] == os.path.getsize(result["path"])
 
 

@@ -57,6 +57,7 @@ from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.opschema import ArgIssue, find_non_ascii
 from flame_mcp.policy import deny_operation
 from flame_mcp.registry import RegisteredOperation
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import CheckpointSpec, ErrorCode, ServerOpError
 
 if TYPE_CHECKING:
@@ -89,10 +90,6 @@ RESTORE_SIDE_EFFECTS = (
 """The side effects of every restore, worded once for the descriptions of everything that
 restores a checkpoint (journal.revert, journal.restore_checkpoint, batch.load_setup, a
 destructive eval.run, and each op that declares a `CheckpointSpec`)."""
-
-NEEDED_OPS: tuple[str, ...] = BATCH_KIND.needed_ops
-"""The ops the engine itself calls for a Batch group (through `ctx.do`, so under the same policy);
-`CheckpointKind.needed_ops` for the other kind."""
 
 Stage = Literal["checkpoint", "uid", "intent", "ascii"]
 
@@ -378,10 +375,6 @@ class Words:
     refuses: str = "a checkpointed write"
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
 def _code_of(env: Mapping[str, Any]) -> ErrorCode:
     return as_error_code(str(env.get("errorCode")))
 
@@ -435,7 +428,7 @@ def refusal_envelope(
         error=message,
         error_code=code,
         execution=meta,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=elapsed_ms(started),
         hint_override=hint,
     )
 
@@ -529,7 +522,7 @@ def run_declared(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         target_kind = kind_named(spec.target_kind)
@@ -541,7 +534,7 @@ def run_declared(
                 error=exc.message,
                 error_code=exc.code,
                 execution=meta,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint_override=exc.hint,
             )
         if spec.check is not None:
@@ -553,7 +546,7 @@ def run_declared(
                     error=refusal.message,
                     error_code=refusal.code,
                     execution=meta,
-                    duration_ms=_elapsed_ms(started),
+                    duration_ms=elapsed_ms(started),
                     hint_override=refusal.hint,
                 )
 

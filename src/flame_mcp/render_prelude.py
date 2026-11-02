@@ -33,8 +33,6 @@ What it encodes (measured on Flame 2025.2.4):
 
 from __future__ import annotations
 
-RENDER_NODE_PY_TYPES: tuple[str, ...] = ("PyWriteFileNode", "PyRenderNode")
-
 DESKTOP_RENDER_REEL = "Batch Renders"
 
 RENDER_HELPER = (

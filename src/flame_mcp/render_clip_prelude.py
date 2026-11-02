@@ -2,7 +2,8 @@
 
 Like `render_prelude`: real Python source that `execution.build_exec_code` places ahead of an op's
 own code, so the op's `to_python` output is a few loop-free lines. It runs inside Flame (3.11) with
-`flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError` and `_tl_location` already defined.
+`flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError`, `_tl_location` and `_ex_identity` (from
+`export_prelude`) already defined.
 
 What it encodes:
   - `PyClip.render(render_mode='All', render_option='Foreground', render_quality='Full Resolution',
@@ -29,17 +30,6 @@ RENDER_CLIP_HELPER = """
 _RC_MEDIA_TYPES = ('PyClip', 'PySequence')
 
 
-def _rc_identity(clip):
-    wiretap = _try(lambda: clip.get_wiretap_node_id())
-    return {
-        'type': type(clip).__name__,
-        'name': _try(lambda: _v(clip.name)),
-        'uid': _try(lambda: _v(clip.uid)),
-        'wiretapId': wiretap,
-        'selector': {'kind': 'wiretap', 'id': wiretap} if wiretap else None,
-    }
-
-
 def _rc_effect_types(clip):
     found = []
     count = 0
@@ -64,7 +54,7 @@ def _rc_failure(out, text, exc):
 
 
 def _rc_inspect(clip, render_mode, render_quality):
-    out = _rc_identity(clip)
+    out = _ex_identity(clip)
     out.update(
         location=None, effects=[], effectCount=0, isRendered=None, error=None, errorCode=None
     )
@@ -82,7 +72,7 @@ def _rc_inspect(clip, render_mode, render_quality):
 
 def _rc_render(clip, expected_uid, render_mode, render_quality, include_handles):
     import time
-    out = _rc_identity(clip)
+    out = _ex_identity(clip)
     out.update(
         returned=None,
         elapsedS=None,

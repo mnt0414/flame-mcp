@@ -45,8 +45,6 @@ Source = Literal["op", "category", "global"]
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 
-GLOBAL_DEFAULT_THREAD: Thread = "main"
-GLOBAL_DEFAULT_PACING: Pacing = "none"
 GLOBAL_DEFAULT_ON_ERROR: OnError = "abort"
 
 _REPRESENTATIVE_VALUES: dict[ParamType, Any] = {

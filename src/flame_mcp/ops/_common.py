@@ -51,6 +51,10 @@ def list_result_src(items_var: str, total_var: str, offset_var: str) -> str:
     )
 
 
+def limit_param(description: str = "Max items to return.") -> OperationParam:
+    return OperationParam(name="limit", type="number", description=description, required=False)
+
+
 def offset_param() -> OperationParam:
     return OperationParam(
         name="offset",

@@ -659,7 +659,8 @@ def check_timeline_intent(ctx: ServerContext, view: IntentView) -> dict[str, Any
         verdict, finding = STATE_NOT_LANDED, "before"
         entry["detail"] = (
             "the segments and effects are as before the run; effects the fingerprint does not "
-            "see cannot be ruled out"
+            "see cannot be ruled out (a segment.replace that changed only the segment's name or "
+            "source size, or swapped a same-name same-size clip, looks like this too)"
         )
     else:
         verdict, finding = STATE_DIVERGED, "other"

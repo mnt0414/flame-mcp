@@ -88,17 +88,27 @@ _REPLACE_DESCRIPTION = (
     "timecode, compare result.after.sourceIn (timecode and frame) with the one you want and pass "
     "the difference to segment.slip (slip(n) takes source_in down by n). It reaches only as "
     "far as the handle goes. "
-    "A clip too short for the range the segment uses changes nothing in Flame and raises "
-    "nothing: that is reported as SILENT_NOOP (source_name, the source range, head and tail are "
-    "all the same as before -- the same happens when the clip is the one the segment already "
-    "has). Refused up front (PRECONDITION_UNMET, before anything is copied or journaled): a Gap, "
+    "Whether it took effect is judged from what a read can see: sourceName, the source range, "
+    "head and tail, and the segment's name and source size (sourceWidth / sourceHeight). One of "
+    "them moving gives result.verified true and is listed in result.changed; an attribute that "
+    "cannot be read is null and left out of the comparison. Nothing moved and the new clip's "
+    "name, width or height differs from the segment's: SILENT_NOOP (a clip too short for the "
+    "range the segment uses changes nothing in Flame and raises nothing). Nothing moved and the "
+    "new clip has the segment's name and size (the clip the segment already has, or a comp of "
+    "the same name and size): ok with result.verified false and a notice -- a read cannot tell "
+    "whether it was swapped, so export the segment and compare the pixels. The sequence's "
+    "fingerprint sees neither the name nor the size, so journal.changed reads false for a "
+    "replace that moved only those; journal.revert still restores the segment. Refused up "
+    "front (PRECONDITION_UNMET, before anything is copied or journaled): a Gap, "
     "a source that is not a PyClip (a sequence, a reel ...), a sequence inside a library or a "
     "Batch group; INVALID_ARGS: a mode that is neither of the two, a source that is a segment "
     "selector. "
     "result: mode, source {type, name, uid, wiretapId, selector}, before / after (type, "
     "sourceName, recordIn / recordOut / sourceIn / sourceOut -- frame AND timecode; recordOut / "
     "sourceOut are the last frame (inclusive) -- head, tail, "
-    "recordDuration), changed (which of sourceName / sourceIn / sourceOut / head / tail "
+    "recordDuration; also name, sourceWidth, sourceHeight, filePath, sourceUid, null when "
+    "unreadable -- the last two are shown, not judged), verified, changed (which of "
+    "sourceName / sourceIn / sourceOut / head / tail / name / sourceWidth / sourceHeight "
     "changed), effects {before, after} (types), position {version, track, index, recordIn, "
     "selector (by record_in, with expect_source_name = the new source name), selectorByIndex}, "
     "warnings, returned, connected {count, error} (the number of OTHER segments "
@@ -246,6 +256,14 @@ def register(registry: Registry) -> None:
                 "PySegment.smart_replace",
                 "PySegment.effects",
                 "PySegment.connected_segments",
+                "PySegment.name",
+                "PySegment.source_width",
+                "PySegment.source_height",
+                "PySegment.file_path",
+                "PySegment.source_uid",
+                "PyClip.name",
+                "PyClip.width",
+                "PyClip.height",
                 "PyTimelineFX.type",
                 *SEGMENT_REQUIRES,
             ),

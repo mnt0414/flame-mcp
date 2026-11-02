@@ -1,11 +1,13 @@
 """Text functions for the ops that replace one value of a setup file (`segment.edit_effect_setup`,
-`node.edit_setup`).
+`node.edit_setup`) and the ops that only read one (`segment.read_effect_setup`,
+`node.read_setup`).
 
 A setup file is text made of tags. The one thing these ops may do to it is replace the value of a
 tag that occurs exactly once, written `<TAG>value</TAG>`: a tag with child elements, with
 attributes, written self-closing or occurring more than once is refused, and so is a name or a
-value that could change the structure of the file. Nothing here uses a regular expression's
-replacement string, so a value such as `\\1` goes in as it is.
+value that could change the structure of the file. A read (`read_tags`) takes a value by the same
+rule: a tag that occurs exactly once, as `<TAG>value</TAG>`. Nothing here uses a regular
+expression's replacement string, so a value such as `\\1` goes in as it is.
 
 The source of this module is also sent to Flame (`setup_edit_prelude`): the edit runs inside
 Flame, between the save and the load of the setup. It is ASCII, needs nothing but `re` and
@@ -148,6 +150,57 @@ def tag_problems(text: str, tags: list[str]) -> dict[str, str]:
                 "or is written self-closing"
             )
     return problems
+
+
+def check_tags(tags: object) -> list[str]:
+    """Every reason `tags` (a list of tag names to read) may not be used, as one line each; []
+    when fine."""
+    if not isinstance(tags, list) or not 1 <= len(tags) <= SETUP_MAX_VALUES:
+        return ["tags must be a list of 1 to " + str(SETUP_MAX_VALUES) + " tag names"]
+    problems = []
+    listed_twice = []
+    for position, tag in enumerate(tags):
+        problem = tag_name_problem(tag)
+        if problem is not None:
+            problems.append("tag " + ascii(tag) + ": " + problem)
+        elif tag in tags[:position] and tag not in listed_twice:
+            listed_twice.append(tag)
+            problems.append("tag " + ascii(tag) + " is listed twice")
+    return problems
+
+
+def read_tags(texts: dict[str, str], tags: list[str]) -> dict[str, dict[str, str | int | None]]:
+    """The value of each tag in `tags` across all the files of one setup (`texts` is
+    {file name: text}). A tag is read only when it occurs exactly once in all the files together,
+    as `<TAG>value</TAG>`: its value is the text of the file, not converted. Any other tag has
+    the value None and a reason in `problems`. `tagCounts` is each tag's count over all the
+    files and `fileOf` the name of the file where a tag occurs exactly once (None otherwise)."""
+    values: dict[str, str | int | None] = {}
+    problems: dict[str, str | int | None] = {}
+    counts: dict[str, str | int | None] = {}
+    file_of: dict[str, str | int | None] = {}
+    per_file = {name: count_tags(text, tags) for name, text in texts.items()}
+    for tag in tags:
+        total = sum(found[tag] for found in per_file.values())
+        counts[tag] = total
+        file_of[tag] = None
+        values[tag] = None
+        if total == 0:
+            problems[tag] = "the tag is not in the setup"
+        elif total > 1:
+            problems[tag] = (
+                "the tag occurs " + str(total) + " times (only a tag that occurs once can be read)"
+            )
+        else:
+            where = next(name for name, found in per_file.items() if found[tag] == 1)
+            file_of[tag] = where
+            values[tag] = scalar_value(texts[where], tag)
+            if values[tag] is None:
+                problems[tag] = (
+                    "the tag is not a plain <TAG>value</TAG>: it has attributes, child "
+                    "elements or is written self-closing"
+                )
+    return {"values": values, "problems": problems, "tagCounts": counts, "fileOf": file_of}
 
 
 def replace_tags(text: str, values: dict[str, object]) -> str:

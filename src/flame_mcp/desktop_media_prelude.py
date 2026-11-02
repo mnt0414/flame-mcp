@@ -45,6 +45,12 @@ def _dm_media_children(container):
     return [c for c in list(container.children) if type(c).__name__ in _DC_ENTRY_TYPES]
 
 
+def _dm_pins(container):
+    # the entries of a reel in the order Flame lists them, each with the selector that finds it
+    # again (the shifted entries of desktop.arrange are named by these)
+    return [_dc_with_selector(o) for o in _dm_media_children(container)]
+
+
 def _dm_pool(container):
     pool = []
     for attr in ('children', 'reels', 'batch_groups'):
@@ -507,11 +513,6 @@ def _dm_move_snapshot(dest, sources):
             )
         if row['uid'] in seen:
             raise _OpError('INVALID_ARGS', label + ' is listed twice')
-        if parent_row['uid'] == dest_row['uid'] or parent_row['selector'] == dest_row['selector']:
-            raise _OpError(
-                'PRECONDITION_UNMET',
-                label + ' is already in the destination: such a move is refused',
-            )
         seen.append(row['uid'])
         row['parent'] = parent_row
         rows.append(row)

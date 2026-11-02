@@ -31,11 +31,16 @@ from flame_mcp.checkpoints import (
 )
 from flame_mcp.clip_order import CLIP_ORDER_NOTE
 from flame_mcp.journal import Index
-from flame_mcp.ops._common import build_source, offset_param
+from flame_mcp.ops._common import build_source, limit_param, offset_param
 from flame_mcp.registry import Registry
 from flame_mcp.restore import restore_checkpoint, run_load_setup
 from flame_mcp.runtime import ServerContext
-from flame_mcp.timeline_purge import DEFAULT_OLDER_THAN_DAYS, purge_checkpoints
+from flame_mcp.timeline_purge import (
+    DEFAULT_OLDER_THAN_DAYS,
+    MAX_GROUPS,
+    groups_precheck,
+    purge_checkpoints,
+)
 from flame_mcp.timeline_restore import RESTORE_NOTE
 from flame_mcp.types import OperationParam, OperationSpec, Refusal, ServerResult
 
@@ -372,9 +377,7 @@ def register(registry: Registry) -> None:
             ),
             effect="read",
             params=(
-                OperationParam(
-                    name="limit", type="number", description="Max items to return.", required=False
-                ),
+                limit_param(),
                 offset_param(),
             ),
             server_handler=_list_checkpoints,
@@ -390,8 +393,15 @@ def register(registry: Registry) -> None:
                 "behind them, of a restore's pre-restore copy, of desktop.delete and of an "
                 "in-place desktop.reformat. Only what the journal records is deleted, and only a "
                 "checkpoint recorded MORE than "
-                "`older_than_days` days ago (0 = every one) whose copy is still in the library "
-                "(`dry_run`, the default, deletes nothing and reads Flame only). Flame checks "
+                "`older_than_days` days ago (0 = every one), or -- with `groups` -- one that "
+                "belongs to one of those journal groups, whatever its age, whose copy is still in "
+                "the library (`dry_run`, the default, deletes nothing and reads Flame only). "
+                "`groups` and `older_than_days` cannot be given together (INVALID_ARGS). A group "
+                "id in `groups` that the journal holds no Timeline checkpoint for (a typo, or a "
+                "group that only has a Batch checkpoint: Batch setup files are not touched) is "
+                "INVALID_ARGS, named in the message; a group whose Timeline checkpoints are all "
+                "purged already is not refused: it adds no candidate and is listed in "
+                "result.groupsAlreadyPurged. Flame checks "
                 "again, copy by copy, that it is inside the checkpoint library with the uid AND "
                 "the name the journal recorded; one that is not is skipped. A copy whose "
                 "flame.delete was called and that is still there is not a skip: it is listed in "
@@ -400,7 +410,8 @@ def register(registry: Registry) -> None:
                 "deleted; the deleted ones are recorded as purged and a purge again retries "
                 "the rest). Then the date reels "
                 "('timeline_<YYMMDD>', directly in the library) that this left empty are "
-                "deleted. dry_run result: candidates [{id, ts, label, group, sourceName, stash "
+                "deleted. dry_run result: groups (as given, or null), groupsAlreadyPurged, "
+                "candidates [{id, ts, label, group, sourceName, stash "
                 "{uid, name, library, reel}, exists, nameMatches}], count (what a real run would "
                 "delete), missing (ids whose copy is not in the library any more) and unknown "
                 "[{type, name, uid, wiretapId, reel}]: what the library holds that no recorded "
@@ -417,7 +428,8 @@ def register(registry: Registry) -> None:
                 "that holds a checkpoint not purged yet. Batch setup files (on disk) are not "
                 "touched. A real run (dry_run=false) needs `token`: the value the dry run just "
                 "returned (result.token, a digest of the candidate list). Without it, or when "
-                "the candidates changed since (or older_than_days differs), nothing is deleted "
+                "the candidates changed since (or older_than_days or groups differ; the order of "
+                "groups does not matter), nothing is deleted "
                 "(PRECONDITION_UNMET). Look at the candidates of the dry run first, and ask the "
                 "user before a real run. Denied by a read-only server like every destructive "
                 "op, dry_run included."
@@ -430,12 +442,24 @@ def register(registry: Registry) -> None:
                     type="number",
                     description=(
                         "Only checkpoints recorded more than this many days ago (integer >= 0; "
-                        f"default {DEFAULT_OLDER_THAN_DAYS})."
+                        f"default {DEFAULT_OLDER_THAN_DAYS} when `groups` is not given). Not "
+                        "allowed together with `groups`."
                     ),
                     required=False,
-                    default=DEFAULT_OLDER_THAN_DAYS,
                     integer=True,
                     minimum=0,
+                ),
+                OperationParam(
+                    name="groups",
+                    type="array",
+                    item_type="string",
+                    description=(
+                        f"Journal group ids (1 to {MAX_GROUPS}, none twice, each a non-empty ASCII "
+                        "string; journal.list or journal.list_checkpoints show them): delete the "
+                        "Timeline checkpoints of these groups instead of choosing by date. Not "
+                        "allowed together with `older_than_days`."
+                    ),
+                    required=False,
                 ),
                 OperationParam(
                     name="dry_run",
@@ -451,14 +475,15 @@ def register(registry: Registry) -> None:
                     name="token",
                     type="string",
                     description=(
-                        "result.token of a dry run with the same older_than_days; required "
-                        "when dry_run is false."
+                        "result.token of a dry run with the same older_than_days / groups; "
+                        "required when dry_run is false."
                     ),
                     required=False,
                     non_empty=True,
                 ),
             ),
             server_handler=purge_checkpoints,
+            precheck=groups_precheck,
             undo_steps=lambda args, affected: 0,
         )
     )

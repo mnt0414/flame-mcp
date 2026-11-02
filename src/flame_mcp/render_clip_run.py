@@ -50,13 +50,13 @@ from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_run import (
     HANDLE_SOURCE_CLIENT,
     RenderJudgement,
-    _elapsed_ms,
     _fail_env,
     _new_client_handle,
     _refusal,
     _remove_result_file,
     _unknown_end,
 )
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
@@ -269,7 +269,7 @@ def run_render_clip(
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
         pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
@@ -413,7 +413,7 @@ def _finish(
     env["partial"] = None
     env["degraded"] = [*env.get("degraded", []), *judged.degraded]
     env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    env["durationMs"] = _elapsed_ms(started)
+    env["durationMs"] = elapsed_ms(started)
     try:
         rt.journal.append(_outcome_record(intent_id, group_id, judged, flame))
     except OSError as exc:

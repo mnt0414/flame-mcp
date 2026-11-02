@@ -2,8 +2,8 @@
 
 Like `timeline_delete_prelude`: real Python source that `execution.build_exec_code` places ahead of
 an op's own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError`,
-`_segment_list` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` / `_td_*` / `_tm_*` helpers
-already defined.
+`_segment_list`, `_te_fail` and the `_tl_*` / `_tb_*` / `_dm_*` / `_dc_*` / `_ex_*` / `_td_*` /
+`_tm_*` helpers already defined.
 
 What it encodes (measured on Flame 2025.2.4, a sequence of 720 frames shortened to 360
 with two audio channels, an audio track whose length decided the length of the sequence, and video
@@ -177,46 +177,46 @@ def _ts_inspect(seq, duration):
     if _tb_start(out, seq, 'shorten needs a sequence')['error'] is not None:
         return out, None, None
     if not callable(getattr(seq, 'extract_selection_to_media_panel', None)):
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'this Flame has no PySequence.extract_selection_to_media_panel: nothing was done')
         return out, None, None
     try:
         length = _v(seq.duration).frame
         base = _v(seq.start_time).frame
     except BaseException as exc:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the duration or the start_time of the sequence cannot be read ('
                  + type(exc).__name__ + ': ' + str(exc) + '): nothing was done')
         return out, None, None
     out['before'] = {'duration': length, 'startFrame': base}
     out['startFrame'] = base
     if duration >= length:
-        _tb_fail(out, 'INVALID_ARGS',
+        _te_fail(out, 'INVALID_ARGS',
                  'duration ' + str(duration) + ' does not lengthen the sequence (it is '
                  + str(length) + ' frames long): this op only shortens, nothing was done')
         return out, None, None
     versions = list(seq.versions)
     if len(versions) != 1:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the sequence has ' + str(len(versions)) + ' versions and exactly one is '
                  'needed: nothing was done')
         return out, None, None
     audio = _tb_audio_read(seq)
     if audio['errors']:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the audio cannot be read completely (' + '; '.join(audio['errors'][:_TS_ROWS])
                  + '), so the result could not be judged: nothing was done')
         return out, None, None
     try:
         places = _ts_places(seq)
     except BaseException as exc:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the tracks cannot be read (' + type(exc).__name__ + ': ' + str(exc)
                  + '): nothing was done')
         return out, None, None
     firsts = [p['segs'][0].record_in.frame for p in places if p['media'] == 'video' and p['segs']]
     if firsts and min(firsts) != base:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the start of the sequence (start_time frame ' + str(base) + ') is not the first '
                  'record_in of its video tracks (' + str(min(firsts)) + '), so the end frame '
                  'cannot be told: nothing was done')
@@ -227,7 +227,7 @@ def _ts_inspect(seq, duration):
         and p['segs'][0].record_in.frame != base
     ]
     if late:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the audio does not start at the start_time frame ' + str(base) + ' ('
                  + '; '.join(late[:_TS_ROWS]) + '), so the end frame cannot be told for it: '
                  'nothing was done')
@@ -240,19 +240,19 @@ def _ts_inspect(seq, duration):
         try:
             linked = _v(place['obj'].stereo_linked)
         except BaseException as exc:
-            _tb_fail(out, 'PRECONDITION_UNMET',
+            _te_fail(out, 'PRECONDITION_UNMET',
                      'PyTrack.stereo_linked of ' + _ts_where(place) + ' cannot be read ('
                      + type(exc).__name__ + ': ' + str(exc) + '), and a stereo_linked track is '
                      'refused: nothing was done')
             return out, None, None
         if linked:
-            _tb_fail(out, 'PRECONDITION_UNMET',
+            _te_fail(out, 'PRECONDITION_UNMET',
                      _ts_where(place) + ' is stereo_linked, which is refused: nothing was done')
             return out, None, None
     for place in places:
         problem = _ts_boundary_refusal(place, end)
         if problem is not None:
-            _tb_fail(out, 'PRECONDITION_UNMET', problem)
+            _te_fail(out, 'PRECONDITION_UNMET', problem)
             return out, None, None
     out['tracks'], media = _ts_plan(places, end)
     out['removedMediaCount'] = len(media)
@@ -261,18 +261,18 @@ def _ts_inspect(seq, duration):
     for place in places:
         if place['media'] == 'audio' and place['cut'] and not callable(
                 getattr(place['obj'], 'cut', None)):
-            _tb_fail(out, 'PRECONDITION_UNMET',
+            _te_fail(out, 'PRECONDITION_UNMET',
                      'this Flame has no PyAudioChannel.cut for ' + _ts_where(place)
                      + ': nothing was done')
             return out, None, None
     if not [t for t in out['tracks'] if t['removed'] > 0]:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'no track has a segment at or after the end frame ' + str(end)
                  + ': there is nothing to remove, nothing was done')
         return out, None, None
     unselectable = _td_unselectable(seq)
     if unselectable:
-        _tb_fail(out, 'PRECONDITION_UNMET',
+        _te_fail(out, 'PRECONDITION_UNMET',
                  'the sequence has a selection that selecting segments cannot clear: '
                  + '; '.join(unselectable) + ' (the extract acts on everything that is selected; '
                  'only selected segments are deselected here). Clear it in the Timeline first: '
@@ -283,7 +283,7 @@ def _ts_inspect(seq, duration):
             try:
                 _td_selected(place['segs'][0])
             except BaseException as exc:
-                _tb_fail(out, 'PRECONDITION_UNMET',
+                _te_fail(out, 'PRECONDITION_UNMET',
                          'PySegment.selected cannot be read (' + type(exc).__name__ + ': '
                          + str(exc) + '): the segments cannot be selected, nothing was done')
                 return out, None, None
@@ -436,7 +436,7 @@ def _ts_fail_after_cuts(out, seq, fp_before, audio_before, code, message):
     changed = video_changed or audio_changed
     out['changed'] = changed
     out['after'] = _ts_state(seq)
-    return _tb_fail(
+    return _te_fail(
         out,
         code,
         message + ' (the sequence ' + ('CHANGED: read result.after and result.audio'
@@ -578,14 +578,14 @@ def _ts_shorten(seq, duration, library_name, reel_name):
         out['warnings'].append('by-product of the call: ' + out['cleanup']['error'])
     if problem is not None:
         out['ran'] = False
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             problem + ': nothing was removed (the cuts at ' + str(end) + ' were made: the sequence '
             + ('CHANGED' if out['changed'] else 'is unchanged') + ')',
         )
     if out['exception'] is not None:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             what + ' raised ' + out['exception'] + ' (the sequence '
@@ -593,7 +593,7 @@ def _ts_shorten(seq, duration, library_name, reel_name):
                else 'is unchanged') + ')',
         )
     if not out['changed']:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             'extract_selection_to_media_panel() returned ' + repr(out['returned']['shape'])
@@ -602,7 +602,7 @@ def _ts_shorten(seq, duration, library_name, reel_name):
     _tb_audio_only(out, video_changed, audio_changed)
     problems = _ts_judge(seq, places, rows_before, audio_before, end, duration)
     if problems:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'the sequence changed, but not the way the shortening is measured to change it: '

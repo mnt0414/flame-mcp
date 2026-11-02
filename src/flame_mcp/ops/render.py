@@ -27,9 +27,11 @@ from flame_mcp.types import Category, OperationParam, OperationSpec, Refusal
 CATEGORY = Category(
     name="render",
     description=(
-        "Rendering. Use render.plan to see what a Batch render would write, render.batch to "
-        "render a Batch group (it need not be current), and render.clip to render the "
-        "Timeline FX of a clip or sequence."
+        "Rendering a Batch group, and writing a clip or sequence to files. Use render.plan to "
+        "see what a Batch render would write, render.batch to render a Batch group (it need "
+        "not be current), render.clip to render the Timeline FX of a clip or sequence, and "
+        "render.export to write a clip or sequence to files with an export preset, and "
+        "render.still to get one frame of a clip as a small PNG."
     ),
     default_thread="main",
     default_pacing="none",

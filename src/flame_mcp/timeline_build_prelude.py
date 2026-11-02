@@ -4,7 +4,7 @@
 
 Like `timeline_edit_prelude`: real Python source that `execution.build_exec_code` places ahead of an
 op's own code. It runs inside Flame (3.11) with `flame`, `_v`, `_j`, `_ja`, `_try`, `_OpError`,
-`_segment_list`, `_wiretap_selector` and the `_tl_*` helpers of `timeline_prelude` /
+`_segment_list`, `_wiretap_selector`, `_te_fail` and the `_tl_*` helpers of `timeline_prelude` /
 `timeline_trim_prelude` already defined.
 
 What it encodes (measured on Flame 2025.2.4):
@@ -41,12 +41,6 @@ _TB_ROWS_MANY = 10
 _TB_LEAD = 3
 _TB_LISTED = 20
 _TB_AUDIO_ROWS = 24
-
-
-def _tb_fail(out, code, message):
-    out['error'] = message
-    out['errorCode'] = code
-    return out
 
 
 def _tb_new(extra):
@@ -167,7 +161,7 @@ def _tb_sequence(parent, what):
 def _tb_start(out, parent, what):
     code, message = _tb_sequence(parent, what)
     if code is not None:
-        return _tb_fail(out, code, message)
+        return _te_fail(out, code, message)
     return out
 
 
@@ -353,7 +347,7 @@ def _tb_put(parent, version, track, clip, at, mode):
     video_changed = fp_after != fp_before
     out['changed'] = video_changed or audio_changed
     if not out['changed'] and start_before == start_after:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             mode + '(' + repr(out['source']['name']) + ', at ' + str(at) + ') returned '
@@ -366,7 +360,7 @@ def _tb_put(parent, version, track, clip, at, mode):
         parent, version, track, at, out['source']['name'], length
     )
     if problem is not None:
-        return _tb_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'partial: ' + mode + ' changed the sequence but the clip is not in track ' + str(track)
@@ -431,7 +425,7 @@ def _tb_cut_check(parent, version, track, at, scope):
                 '<= record_out of a segment that has media; a cut of the whole sequence inside '
                 'a Gap only is not done: use scope track)'
             )
-        return _tb_fail(out, 'PRECONDITION_UNMET', 'at ' + str(at) + ' ' + what)
+        return _te_fail(out, 'PRECONDITION_UNMET', 'at ' + str(at) + ' ' + what)
     return out
 
 
@@ -489,7 +483,7 @@ def _tb_cut(parent, version, track, at, scope):
     video_changed = fp_after != fp_before
     out['changed'] = video_changed or audio_changed
     if not out['changed']:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             'cut at ' + str(at) + ' (' + scope + ') returned ' + type(returned).__name__
@@ -519,7 +513,7 @@ def _tb_cut(parent, version, track, at, scope):
             for hit in out['willCut'] if (hit['version'], hit['track']) not in done
         ]
         if video_changed and out['notSplit']:
-            return _tb_fail(
+            return _te_fail(
                 out,
                 'FLAME_API_ERROR',
                 'partial: cut at ' + str(at) + ' (all) split ' + str(len(cut)) + ' of '
@@ -557,7 +551,7 @@ def _tb_create_version(parent):
     fp_after = _tl_fingerprint(parent)['fingerprint']
     out['changed'] = fp_after != fp_before
     if not out['changed'] or len(out['versionsAfter']) == len(out['versionsBefore']):
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             'create_version() returned ' + type(returned).__name__ + ' and the sequence has '
@@ -606,7 +600,7 @@ def _tb_create_track(parent, version):
     fp_after = _tl_fingerprint(parent)['fingerprint']
     out['changed'] = fp_after != fp_before
     if not out['changed'] or out['tracksAfter'] == out['tracksBefore']:
-        return _tb_fail(
+        return _te_fail(
             out,
             'SILENT_NOOP',
             'create_track() returned ' + type(returned).__name__ + ' and version '

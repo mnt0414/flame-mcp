@@ -26,13 +26,16 @@ from typing import Any
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import transport
 from flame_mcp.attribute_prelude import ATTRIBUTE_HELPER
+from flame_mcp.batch_delete_prelude import BATCH_DELETE_HELPER
 from flame_mcp.batch_prelude import BATCH_HELPER
 from flame_mcp.checkpoint_prelude import CHECKPOINT_HELPER
+from flame_mcp.colourspace_prelude import COLOUR_HELPER
 from flame_mcp.desktop_batch_prelude import BATCH_COPY_HELPER
 from flame_mcp.desktop_delete_prelude import DELETE_HELPER, PURGE_HELPER
 from flame_mcp.desktop_media_prelude import MEDIA_HELPER
 from flame_mcp.desktop_prelude import DESKTOP_HELPER
 from flame_mcp.desktop_reformat_prelude import REFORMAT_HELPER
+from flame_mcp.export_prelude import EXPORT_HELPER
 from flame_mcp.inspect_prelude import INSPECT_HELPER
 from flame_mcp.library_open import has_refs, library_refs
 from flame_mcp.library_open_prelude import LIBRARY_OPEN_HELPER
@@ -44,6 +47,8 @@ from flame_mcp.render_prelude import RENDER_HELPER
 from flame_mcp.segment_connection_prelude import CONNECTION_HELPER
 from flame_mcp.segment_extract_prelude import EXTRACT_HELPER
 from flame_mcp.setup_edit_prelude import SETUP_EDIT_HELPER
+from flame_mcp.still_prelude import STILL_HELPER
+from flame_mcp.tc_prelude import TC_HELPER
 from flame_mcp.timeline_build_prelude import BUILD_HELPER
 from flame_mcp.timeline_compare_prelude import COMPARE_HELPER
 from flame_mcp.timeline_create_prelude import CREATE_HELPER
@@ -53,6 +58,7 @@ from flame_mcp.timeline_move_prelude import MOVE_TRACK_HELPER
 from flame_mcp.timeline_prelude import TIMELINE_HELPER
 from flame_mcp.timeline_shorten_prelude import SHORTEN_HELPER
 from flame_mcp.timeline_trim_prelude import TRIM_HELPER
+from flame_mcp.usage_prelude import USAGE_HELPER
 
 V_HELPER = "def _v(x):\n    return x.get_value() if type(x).__name__ == 'PyAttribute' else x"
 """The `_v` prelude.
@@ -500,6 +506,8 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         "",
         INSPECT_HELPER.strip("\n"),
         "",
+        USAGE_HELPER.strip("\n"),
+        "",
         TIMELINE_HELPER.strip("\n"),
         "",
         TRIM_HELPER.strip("\n"),
@@ -529,6 +537,16 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         REFORMAT_HELPER.strip("\n"),
         "",
         RENDER_CLIP_HELPER.strip("\n"),
+        "",
+        COLOUR_HELPER.strip("\n"),
+        "",
+        TC_HELPER.strip("\n"),
+        "",
+        BATCH_DELETE_HELPER.strip("\n"),
+        "",
+        EXPORT_HELPER.strip("\n"),
+        "",
+        STILL_HELPER.strip("\n"),
         "",
         SETUP_EDIT_HELPER.strip("\n"),
         "",

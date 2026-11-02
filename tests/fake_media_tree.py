@@ -343,7 +343,9 @@ class PyTime:
                 f"Frame rate should be one of the following: {', '.join(FRAME_RATES)}."
             )
         if isinstance(frame, str):
-            hours, minutes, seconds, frames = (int(part) for part in frame.split(":"))
+            hours, minutes, seconds, frames = (
+                int(part) for part in frame.replace("+", ":").split(":")
+            )
             frame = ((hours * 60 + minutes) * 60 + seconds) * nominal + frames
         self.frame = frame
         self.frame_rate = rate
@@ -427,6 +429,9 @@ class PySegment:
     `shared_source_segments()` answers whatever `share_sources` put in `_shared` (the real one
     walks the project; the fake is told)."""
 
+    file_path: Any
+    """Declared only: absent unless a test sets it (a segment of a Gap has no file_path)."""
+
     def __init__(
         self,
         name: str = "seg",
@@ -476,6 +481,9 @@ class PySegment:
         self._link_group: list[PySegment] | None = None
         for fx in fx_list:
             fx.parent = self
+
+    def get_colour_space(self, time: Any = None) -> str:
+        return "ACEScg"
 
     def shared_source_segments(self) -> list[PySegment]:
         return list(self._shared)
@@ -1088,6 +1096,8 @@ class PyClip(PySequence):
     "noop" or "raise"."""
 
     open = None  # type: ignore[assignment]  # PyClip has no open() (PyClip.open_as_sequence does)
+    current_time: Any
+    """Declared only: absent unless a test sets it."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1282,6 +1292,10 @@ class PyWorkspace:
         self._desktop = desktop if desktop is not None else PyDesktop()
         adopt(self, self._libraries)
         self._desktop.parent = self
+        self.commit_count = 0
+
+    def commit(self) -> None:
+        self.commit_count += 1
 
     @property
     def desktop(self) -> PyDesktop:
@@ -1534,6 +1548,14 @@ CLIP_NODE_SETUP_SUFFIXES: tuple[str, ...] = (
 )
 """The six files one `save_node_setup` of a Clip node writes on Flame 2025.2.4."""
 
+RENDER_NODE_SETUP_SUFFIXES: tuple[str, ...] = (
+    ".output_node",
+    ".lut_node",
+    ".resize",
+    ".resize_node",
+)
+"""The four files one `save_node_setup` of a Render node writes on Flame 2025.2.4."""
+
 
 class PyClipNode(PyNode):
     """The node Flame makes when a clip is copied into a SCHEMATIC reel."""
@@ -1638,6 +1660,7 @@ class PyRenderNode(PyNode):
                 "tape_name": FakeAttr("Batch"),
             },
         )
+        self.save_node_setup_suffixes = RENDER_NODE_SETUP_SUFFIXES
 
     def __setattr__(self, name: str, value: Any) -> None:
         """An assignment to `destination` goes through `set_value`, like the real attribute."""
@@ -2409,6 +2432,90 @@ def clone_entry(entry: Any, parent: Any) -> Any:
     )
 
 
+class FakeExport:
+    """How the fake `flame.PyExporter` behaves (set on `FakeFlame.export`), and what it was asked.
+
+    `export(clip, preset, directory)` writes one `<clip name>.<frame:08d>.tif` per frame of the
+    clip (one fewer with `export_between_marks`, as the out mark is not included) into `subdir` of
+    the directory when set. `raises` makes it raise instead; `writes` False makes it write
+    nothing and return; `limit` writes only the first N files; `hidden` names hidden files it
+    writes as well; `extra` names visible files it writes in addition; `on_export(clip)` runs
+    first; `locked_dirs` names folders it leaves with mode 000 (a folder the server cannot read);
+    `returns` is its return value."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.raises: str | None = None
+        self.writes = True
+        self.limit: int | None = None
+        self.subdir: str | None = None
+        self.hidden: list[str] = []
+        self.extra: list[str] = []
+        self.locked_dirs: list[str] = []
+        self.on_export: Any = None
+        self.returns: Any = None
+        self.file_size = 5
+
+    def names(self, clip: Any, between_marks: bool) -> list[str]:
+        """With `between_marks` and both marks set (ints or PyTime, 1-based, the out mark not
+        included: P6-a), one file per frame from the in mark up to the out mark; otherwise one per
+        frame, one fewer between marks."""
+        name = str(clip.name.get_value())
+        first, last = (
+            mark_frame(getattr(clip, "in_mark", None)),
+            mark_frame(getattr(clip, "out_mark", None)),
+        )
+        if between_marks and first is not None and last is not None:
+            return [f"{name}.{n:08d}.tif" for n in range(first, last)]
+        frames = clip.duration.frame - (1 if between_marks else 0)
+        return [f"{name}.{n:08d}.tif" for n in range(max(frames, 0))]
+
+
+def mark_frame(mark: Any) -> int | None:
+    """A mark as a frame number: None, an int, a PyTime or a PyAttribute holding one."""
+    value = mark.get_value() if type(mark).__name__ == "PyAttribute" else mark
+    if value is None:
+        return None
+    return int(value.frame) if hasattr(value, "frame") else int(value)
+
+
+def make_exporter_class(state: FakeExport) -> type:
+    class PyExporter:
+        def __init__(self) -> None:
+            self.foreground = False
+            self.export_between_marks = False
+
+        def export(self, sources: Any, preset_path: str, output_directory: str) -> Any:
+            state.calls.append(
+                {
+                    "sources": sources,
+                    "preset": preset_path,
+                    "output_dir": output_directory,
+                    "foreground": self.foreground,
+                    "between_marks": self.export_between_marks,
+                }
+            )
+            if state.on_export is not None:
+                state.on_export(sources)
+            if state.raises is not None:
+                raise RuntimeError(state.raises)
+            if state.writes:
+                target = output_directory
+                if state.subdir is not None:
+                    target = os.path.join(output_directory, state.subdir)
+                    os.makedirs(target, exist_ok=True)
+                names = state.names(sources, self.export_between_marks)
+                for name in [*names[: state.limit], *state.extra, *state.hidden]:
+                    with open(os.path.join(target, name), "wb") as handle:
+                        handle.write(b"x" * state.file_size)
+                for folder in state.locked_dirs:
+                    os.makedirs(os.path.join(target, folder), exist_ok=True)
+                    os.chmod(os.path.join(target, folder), 0)
+            return state.returns
+
+    return PyExporter
+
+
 class FakeFlame:
     def __init__(
         self,
@@ -2424,12 +2531,18 @@ class FakeFlame:
         self.timeline = PyTimeline()
         self.PyTime = PyTime
         self.PyResolution = PyResolution
+        self.version = "2025.2.4"
+        self.export = FakeExport()
+        self.PyExporter = make_exporter_class(self.export)
         ACTIVE_TIMELINE[:] = [self.timeline]
         ACTIVE_FLAME[:] = [self]
         self._wiretap_index = dict(wiretap_index) if wiretap_index else {}
         self.import_calls: list[list[str]] = []
         self.duplicate_calls: list[Any] = []
         self.exited = False
+
+    def get_version(self) -> str:
+        return self.version
 
     def forget_wiretap(self, obj: Any) -> None:
         """The wiretap id an object had before a move finds nothing any more."""

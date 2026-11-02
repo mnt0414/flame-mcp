@@ -46,6 +46,8 @@ _ACTION_LINK_TYPES = ('default', 'look at', 'gmask', 'gmask exclusive', 'light',
 # node types for which Flame 2025.2.4 makes a second node of the listed types along with the one
 # asked for (measured: creating each of the 97 types of a Batch group one by one)
 _NODE_COMPANIONS = {'Colour Blend': ('Group Input',), 'Matte Blend': ('Group Input',)}
+# node types whose own setup file does not end in "<type>_node" (measured on Flame 2025.2.4)
+_NODE_SETUP_EXTENSION = {'render': 'output_node'}
 
 
 def _node_names(batch):
@@ -699,10 +701,10 @@ def _node_save_setup(batch, node, path, overwrite):
         if p not in files:
             not_made_private[p] = 'not named after the file asked for'
     node_type = _try(lambda: str(_v(node.type)).lower().replace(' ', '_'))
+    own_ext = _NODE_SETUP_EXTENSION.get(node_type, node_type + '_node') if node_type else None
     own = [
         p for p in files
-        if node_type and os.path.basename(p) in (name + '.' + node_type + '_node',
-                                                  stem + '.' + node_type + '_node')
+        if own_ext and os.path.basename(p) in (name + '.' + own_ext, stem + '.' + own_ext)
     ]
     real = own[0] if len(own) == 1 else (files[0] if len(files) == 1 else None)
     error = None

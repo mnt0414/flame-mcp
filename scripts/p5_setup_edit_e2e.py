@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real-Flame end-to-end: `segment.edit_effect_setup` and `node.edit_setup` replace one value of a
-Timewarp's setup file (run with the `.venv` Python; `scripts/run_e2e.sh p5_setup_edit` starts Flame;
+Timewarp's setup file, and `segment.read_effect_setup` and `node.read_setup` read tags without
+writing (run with the `.venv` Python; `scripts/run_e2e.sh p5_setup_edit` starts Flame;
 `--dry-run` connects to nothing, lists the calls, compiles the code and checks the tag reader on
 made-up text).
 
@@ -10,6 +11,8 @@ is `PRECONDITION_UNMET`, and a value with `<` is `INVALID_ARGS`; neither leaves 
 journal. `journal.revert` puts the clip back to 2. A `plan.run` of three edits on the three
 segments of one sequence is one checkpoint, and one revert puts all three back. `node.edit_setup`
 does the same on a Timewarp node of a Batch group, and its revert puts the node back.
+`segment.read_effect_setup` and `node.read_setup` read tags without writing, and leave no work
+folder and no journal record.
 
 A real MCP stdio client drives `python -m flame_mcp` against a live Flame + dev bridge;
 `flame_mcp.transport` is scaffolding only -- it builds the material and READS EVERY STATE BACK
@@ -26,7 +29,7 @@ No test hook is set for any server. The first step refuses to run anywhere but i
 Material (transport): a Desktop reel group `PP5E_<ts>_RG` with clip1 and p2_len48 imported; a
 Timewarp (Flame's default) made on the segment of p2_len48; a sequence of three p2_len48 segments
 on track 0 with a Timewarp on each; the Batch group `PP5E_<ts>_B` (made last, so the current one)
-with a Timewarp node.
+with a Timewarp node and a Render node.
 
 Stage c (the clip)
   1. The transport reads the clip's setup. JUDGED: one file, and `TW_FrameMode` occurs once with
@@ -42,6 +45,11 @@ Stage c (the clip)
   6. The call with `keep_files`. JUDGED: ok; the kept original / edited / read-back files are
      mode 0600 in a 0700 directory under the journal directory, the original holds 2, the edited
      and read-back hold 0; then it is reverted. OBSERVED: how often `Value` occurs in the file.
+  1a. (after 1) `segment.read_effect_setup` with tags TW_FrameMode and PP5E_NoSuchTag. JUDGED: ok;
+     values.TW_FrameMode is "2"; the unknown tag is null and is in result.problems; no new s_
+     folder is left under the journal directory's setups/; no new intent in the journal.
+  2a. (after 2) The same read. JUDGED: ok; values.TW_FrameMode is "0".
+  4a. The read with the tag name `a<b`. JUDGED: INVALID_ARGS; no new intent.
 Stage p (a plan)
   1. `plan.run` of three edits (TW_FrameMode 0) on the three segments. JUDGED: ok; one more
      checkpoint record; the transport reads 0 on all three.
@@ -51,6 +59,12 @@ Stage n (the node)
   2. `node.edit_setup` TW_FrameMode 0. JUDGED: ok; result.tags before 2, requested 0, after 0; the
      transport's own save of the node's setup reads 0; the node keeps its name.
   3. `journal.revert`. JUDGED: ok; the transport reads 2.
+  1a. (after 1, before the edit) `node.read_setup` of the Timewarp node with tag TW_FrameMode.
+     JUDGED: ok; the value is "2"; no s_ folder is left.
+  1b. `node.read_setup` of the Render node with tags LogLinTargetPixelFormat and UseLuts. JUDGED:
+     ok; the value of LogLinTargetPixelFormat is not null and result.fileOf names `.lut_node` for
+     it. OBSERVED: the value of UseLuts and whether it is null, result.fileOf, result.tagCounts,
+     the files the save wrote, every problem, and whether a work folder or an intent was left.
   z  cross-cutting checks; everything this run made is deleted; flame.exit().
 """
 
@@ -144,6 +158,12 @@ START_VALUE: Final[str] = "2"
 NEW_VALUE: Final[int] = 0
 UNKNOWN_TAG: Final[str] = "TW_NoSuchTag"
 BAD_VALUE: Final[str] = "0<1"
+UNKNOWN_READ_TAG: Final[str] = "PP5E_NoSuchTag"
+BAD_TAG_NAME: Final[str] = "a<b"
+RENDER_TYPE: Final[str] = "Render"
+RENDER_TAGS: Final[tuple[str, str]] = ("LogLinTargetPixelFormat", "UseLuts")
+RENDER_JUDGED_TAG: Final[str] = "LogLinTargetPixelFormat"
+RENDER_JUDGED_FILE: Final[str] = ".lut_node"
 GOOD_STATES: Final[frozenset[str]] = frozenset(
     {"landed", "reverted", "conflict", "failed", "not_landed"}
 )
@@ -189,6 +209,12 @@ declare(
     },
 )
 declare("n_edit", "node.edit_setup", {"target": _NODE, "values": _VALUES})
+declare(
+    "c_read",
+    "segment.read_effect_setup",
+    {"target": _SEG, "type": FX_TYPE, "tags": [TAG, UNKNOWN_READ_TAG]},
+)
+declare("n_read", "node.read_setup", {"target": _NODE, "tags": [TAG]})
 declare("r_revert", "journal.revert", {"group": "g_dry"})
 
 # -- transport scaffolding (never through the ops under test) -----------------------------------
@@ -233,8 +259,9 @@ BATCH_CODE: Final[str] = "\n".join(
         "_d = flame.projects.current_project.current_workspace.desktop",
         "_bg = _d.create_batch_group(@NAME@)",
         "_n = _bg.create_node(@TYPE@)",
+        "_r = _bg.create_node(@RENDER@)",
         "_cur = _v(_d.current_batch_group)",
-        "_result = {'uid': _v(_bg.uid), 'node': _v(_n.name),",
+        "_result = {'uid': _v(_bg.uid), 'node': _v(_n.name), 'render': _v(_r.name),",
         "           'isCurrent': _cur is not None and _v(_cur.uid) == _v(_bg.uid)}",
     ]
 )
@@ -328,6 +355,10 @@ async def read_node(ctx: Ctx, tag: str) -> dict[str, Any] | None:
 async def run_call(session: Any, ctx: Ctx, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
     op, _build = CALLS[call_id]
     return await do(session, ctx, op, args)
+
+
+def read_args(seg: dict[str, Any], tags: list[str]) -> dict[str, Any]:
+    return {"target": seg, "type": FX_TYPE, "tags": tags}
 
 
 def edit_args(seg: dict[str, Any], values: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -431,18 +462,18 @@ async def prepare(ctx: Ctx) -> None:
             ids["seqRins"] = [row["rin"] for row in created]
     batch = await tx_val(
         ctx,
-        fill(BATCH_CODE, NAME=name_of(ctx, "B"), TYPE=FX_TYPE),
+        fill(BATCH_CODE, NAME=name_of(ctx, "B"), TYPE=FX_TYPE, RENDER=RENDER_TYPE),
         "pp5e_batch",
         MAKE_TIMEOUT_S,
     )
     rec(
         ctx,
-        "prepare_the_batch_group_with_a_timewarp_node_is_made_and_is_current",
+        "prepare_the_batch_group_with_a_timewarp_node_and_a_render_node_is_made_and_is_current",
         isinstance(batch, dict) and batch.get("isCurrent") is True,
         batch=batch,
     )
     if isinstance(batch, dict):
-        ids.update(batchUid=batch["uid"], nodeName=batch["node"])
+        ids.update(batchUid=batch["uid"], nodeName=batch["node"], renderName=batch.get("render"))
 
 
 # -- stage c: a clip on the Desktop -------------------------------------------------------------
@@ -463,6 +494,9 @@ async def stage_c(ctx: Ctx) -> None:
     if frame_mode(first) != START_VALUE:
         return
     async with server_session(ctx, "pp5e-c") as session:
+        await judge_segment_read(
+            session, ctx, seg, "c1a_the_read_gives_2_and_null_with_a_reason_and_leaves_nothing", "2"
+        )
         before = await fingerprint(session, ctx, wiretap)
         env = await run_call(session, ctx, "c_edit", edit_args(seg, {TAG: NEW_VALUE}))
         result = _result_of(env)
@@ -479,6 +513,9 @@ async def stage_c(ctx: Ctx) -> None:
             tags=result.get("tags"),
             degraded=env.get("degraded"),
             transport=mode,
+        )
+        await judge_segment_read(
+            session, ctx, seg, "c2a_the_read_after_the_edit_gives_0_and_leaves_nothing", "0"
         )
         group = (env.get("journal") or {}).get("group")
         counts = (len(checkpoint_records(ctx)), intents(ctx), len(journal_states(ctx)))
@@ -505,6 +542,15 @@ async def stage_c(ctx: Ctx) -> None:
             bad=bad.get("error"),
             unknown=unknown.get("error"),
             tagCounts=_result_of(unknown).get("tagCounts"),
+        )
+        bad_name = await run_call(session, ctx, "c_read", read_args(seg, [BAD_TAG_NAME]))
+        rec(
+            ctx,
+            "c4a_a_tag_name_with_a_bracket_is_invalid_args_and_journals_nothing",
+            bad_name.get("errorCode") == "INVALID_ARGS"
+            and (len(checkpoint_records(ctx)), intents(ctx), len(journal_states(ctx))) == counts,
+            errorCode=bad_name.get("errorCode"),
+            error=bad_name.get("error"),
         )
         out = await revert(session, ctx, {"journal": {"group": group}})
         new_wt = restored_wt(out)
@@ -537,6 +583,32 @@ async def stage_c(ctx: Ctx) -> None:
             "c6_how_often_the_value_tag_occurs_in_the_file",
             count=len(tag_values((first or {}).get("texts", [""])[0], "Value")),
         )
+
+
+async def judge_segment_read(
+    session: Any, ctx: Ctx, seg: dict[str, Any], name: str, expected: str
+) -> None:
+    dirs, written = work_dirs(ctx), intents(ctx)
+    env = await run_call(session, ctx, "c_read", read_args(seg, [TAG, UNKNOWN_READ_TAG]))
+    result = _result_of(env)
+    values, problems = result.get("values") or {}, result.get("problems") or {}
+    rec(
+        ctx,
+        name,
+        env.get("ok") is True
+        and values.get(TAG) == expected
+        and values.get(UNKNOWN_READ_TAG, "missing") is None
+        and UNKNOWN_READ_TAG in problems
+        and TAG not in problems
+        and work_dirs(ctx) == dirs
+        and intents(ctx) == written,
+        error=env.get("error"),
+        errorCode=env.get("errorCode"),
+        values=values,
+        problems=problems,
+        workDirsBefore=dirs,
+        workDirsAfter=work_dirs(ctx),
+    )
 
 
 async def judge_kept_files(ctx: Ctx, env: dict[str, Any]) -> None:
@@ -644,6 +716,7 @@ async def stage_n(ctx: Ctx) -> None:
     if frame_mode(first) != START_VALUE:
         return
     async with server_session(ctx, "pp5e-n") as session:
+        await judge_node_reads(session, ctx, node)
         env = await run_call(session, ctx, "n_edit", {"target": node, "values": {TAG: NEW_VALUE}})
         result = _result_of(env)
         after = await read_node(ctx, "n2")
@@ -674,6 +747,57 @@ async def stage_n(ctx: Ctx) -> None:
             errorCode=out.get("errorCode"),
             transport=frame_mode(back),
         )
+
+
+async def judge_node_reads(session: Any, ctx: Ctx, node: dict[str, Any]) -> None:
+    dirs, written = work_dirs(ctx), intents(ctx)
+    env = await run_call(session, ctx, "n_read", {"target": node, "tags": [TAG]})
+    result = _result_of(env)
+    rec(
+        ctx,
+        "n1a_node_read_setup_of_the_timewarp_node_gives_2_and_leaves_nothing",
+        env.get("ok") is True
+        and (result.get("values") or {}).get(TAG) == START_VALUE
+        and work_dirs(ctx) == dirs
+        and intents(ctx) == written,
+        error=env.get("error"),
+        errorCode=env.get("errorCode"),
+        values=result.get("values"),
+        problems=result.get("problems"),
+        savedFiles=result.get("savedFiles"),
+    )
+    render_name = ctx.ids.get("renderName")
+    if not render_name:
+        rec(ctx, "n1b_the_render_node_is_ready", False, ids=sorted(ctx.ids))
+        return
+    render = {**node, "name": render_name}
+    env = await run_call(session, ctx, "n_read", {"target": render, "tags": list(RENDER_TAGS)})
+    result = _result_of(env)
+    values, file_of = result.get("values") or {}, result.get("fileOf") or {}
+    rec(
+        ctx,
+        "n1b_node_read_setup_of_the_render_node_gives_the_pixel_format_from_the_lut_file",
+        env.get("ok") is True
+        and values.get(RENDER_JUDGED_TAG) is not None
+        and file_of.get(RENDER_JUDGED_TAG) == RENDER_JUDGED_FILE,
+        error=env.get("error"),
+        errorCode=env.get("errorCode"),
+        values=values,
+        fileOf=file_of,
+    )
+    observe(
+        ctx,
+        "n1b_the_render_node_use_luts_and_the_files_its_save_wrote",
+        values=values,
+        useLutsIsNull=values.get("UseLuts") is None,
+        fileOf=file_of,
+        tagCounts=result.get("tagCounts"),
+        savedFiles=result.get("savedFiles"),
+        notText=result.get("notText"),
+        problems=result.get("problems"),
+        workDirsLeft=work_dirs(ctx) != dirs,
+        intentsAdded=intents(ctx) - written,
+    )
 
 
 # -- z / driver ---------------------------------------------------------------------------------

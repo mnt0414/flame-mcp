@@ -1,5 +1,6 @@
 """Prelude source for `segment.edit_effect_setup` and `node.edit_setup` (`ops/segment_effects.py`,
-`ops/node_edit_setup.py`).
+`ops/node_edit_setup.py`) and for `segment.read_effect_setup` and `node.read_setup`
+(`ops/setup_read.py`).
 
 Real Python source that `execution.build_exec_code` places ahead of an op's own code, so each op's
 `to_python` output is a few loop-free lines. It runs inside Flame (3.11) after
@@ -22,6 +23,10 @@ What it encodes:
     the result can say where they are. Making a new one removes the old ones (`_se_sweep`).
   - everything after the edited file is written is inside one `try`: an exception there ends in
     FLAME_API_ERROR with the files and `ran` kept in the result.
+  - the two read ops (`_te_read_setup`, `_se_node_read`) save the setup into a new work directory,
+    read every file of it as text (a file that is not UTF-8 is named in `notText`) and take each
+    tag's value over all the files; the directory is removed whatever happened (`finally`), and
+    a directory that could not be removed is named in `cleanupError`. They keep no files.
   - the read-back is judged tag by tag; a difference in another tag is reported in
     `otherDifferences` and in `degradedNotes` (which the envelope turns into `degraded`), and does
     not fail the call.
@@ -40,6 +45,8 @@ _se_check_values = _se_lib['check_values']
 _se_count_tags = _se_lib['count_tags']
 _se_tag_problems = _se_lib['tag_problems']
 _se_scalar_value = _se_lib['scalar_value']
+_se_check_tags = _se_lib['check_tags']
+_se_read_tags = _se_lib['read_tags']
 _se_format_value = _se_lib['format_value']
 _se_replace_tags = _se_lib['replace_tags']
 _se_values_match = _se_lib['values_match']
@@ -48,12 +55,6 @@ _se_max_age_days = _se_lib['WORKDIR_MAX_AGE_DAYS']
 """
 
 _FLAME_SIDE = """
-def _se_fail(out, code, message):
-    out['error'] = message
-    out['errorCode'] = code
-    return out
-
-
 def _se_private_dirs(path):
     import os
     missing = []
@@ -162,9 +163,9 @@ def _se_one_file(out, paths, what):
         return True
     names = repr([p.rsplit('/', 1)[-1] for p in paths])
     if len(paths) == 0:
-        _se_fail(out, 'FLAME_API_ERROR', what + ' wrote no file')
+        _te_fail(out, 'FLAME_API_ERROR', what + ' wrote no file')
     else:
-        _se_fail(
+        _te_fail(
             out,
             'PRECONDITION_UNMET',
             what + ' wrote ' + str(len(paths)) + ' files ' + names + ': only a setup of exactly '
@@ -180,7 +181,7 @@ def _se_inspect(out, text, values):
     bad = _se_tag_problems(text, tags)
     if len(bad) > 0:
         out['tagProblems'] = bad
-        return _se_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'only a tag that occurs exactly once as <TAG>value</TAG> can be replaced: '
@@ -196,7 +197,7 @@ def _se_inspect(out, text, values):
     out['tags'] = rows
     out['unchanged'] = unchanged
     if len(unchanged) == len(tags):
-        return _se_fail(
+        return _te_fail(
             out,
             'PRECONDITION_UNMET',
             'nothing to change: ' + ', '.join(tags) + ' already hold the value asked for; '
@@ -225,7 +226,7 @@ def _se_judge(out, values, edited_text, readback_text):
             mismatched.append(tag)
     out['mismatched'] = mismatched
     if len(mismatched) > 0:
-        return _se_fail(
+        return _te_fail(
             out,
             'FLAME_API_ERROR',
             'the setup was loaded, but the values read back differ from the ones asked for: '
@@ -263,7 +264,7 @@ def _se_finish(out, workdir, keep_files):
 
 def _se_stopped(out, exc):
     # an exception after the edited file was written: the load may have taken effect
-    return _se_fail(
+    return _te_fail(
         out,
         'FLAME_API_ERROR',
         'the edit stopped after the edited setup file was written (the load may have taken '
@@ -285,7 +286,7 @@ def _te_edit_look(seg, parent, fx_type, values, base):
     out['type'] = _j(fx.type)
     problems = _se_check_values(values)
     if len(problems) > 0:
-        return _se_fail(out, 'INVALID_ARGS', '; '.join(problems)), None
+        return _te_fail(out, 'INVALID_ARGS', '; '.join(problems)), None
     workdir = _se_new_workdir(base)
     out['workDir'] = workdir
     out['files'] = {'original': None, 'edited': None, 'readback': None}
@@ -293,7 +294,7 @@ def _te_edit_look(seg, parent, fx_type, values, base):
         saved = _te_save_setup(seg, parent, fx_type, os.path.join(workdir, 'original'), False)
         if saved['error'] is not None:
             code = saved['errorCode']
-            return _se_fail(
+            return _te_fail(
                 out, 'FLAME_API_ERROR' if code == 'SILENT_NOOP' else code, saved['error']
             ), None
         paths = [f['path'] for f in saved['files']]
@@ -303,7 +304,7 @@ def _te_edit_look(seg, parent, fx_type, values, base):
         out['files']['original'] = paths[0]
         text = _se_read_text(paths[0])
         if text is None:
-            return _se_fail(
+            return _te_fail(
                 out, 'PRECONDITION_UNMET', 'the setup file is not UTF-8 text: it cannot be edited'
             ), None
         return _se_inspect(out, text, values), (text, paths[0])
@@ -325,12 +326,12 @@ def _te_edit_after_write(seg, parent, version, track, fx_type, values, out, edit
                 'trackChanged', 'position', 'effects'):
         out[key] = loaded.get(key)
     if loaded['error'] is not None:
-        return _se_fail(out, loaded['errorCode'], loaded['error'])
+        return _te_fail(out, loaded['errorCode'], loaded['error'])
     again = _te_save_setup(
         seg, parent, fx_type, os.path.join(os.path.dirname(edited), 'readback'), False
     )
     if again['error'] is not None:
-        return _se_fail(
+        return _te_fail(
             out, 'FLAME_API_ERROR',
             'the setup was loaded, but it could not be saved again to read it back: '
             + again['error'],
@@ -342,7 +343,7 @@ def _te_edit_after_write(seg, parent, version, track, fx_type, values, out, edit
     out['files']['readback'] = paths[0]
     back = _se_read_text(paths[0])
     if back is None:
-        return _se_fail(
+        return _te_fail(
             out, 'FLAME_API_ERROR', 'the setup saved for the read-back is not UTF-8 text'
         )
     return _se_judge(out, values, edited_text, back)
@@ -393,7 +394,7 @@ def _se_node_look(batch, node, values, base):
     }
     problems = _se_check_values(values)
     if len(problems) > 0:
-        return _se_fail(out, 'INVALID_ARGS', '; '.join(problems)), None
+        return _te_fail(out, 'INVALID_ARGS', '; '.join(problems)), None
     workdir = _se_new_workdir(base)
     out['workDir'] = workdir
     out['files'] = {'original': None, 'edited': None, 'readback': None}
@@ -411,12 +412,12 @@ def _se_node_look(batch, node, values, base):
             return out, None
         if saved['error'] is not None:
             out['savedFiles'] = paths
-            return _se_fail(out, 'FLAME_API_ERROR', saved['error']), None
+            return _te_fail(out, 'FLAME_API_ERROR', saved['error']), None
         out['savedFiles'] = paths
         out['files']['original'] = paths[0]
         text = _se_read_text(paths[0])
         if text is None:
-            return _se_fail(
+            return _te_fail(
                 out, 'PRECONDITION_UNMET', 'the setup file is not UTF-8 text: it cannot be edited'
             ), None
         return _se_inspect(out, text, values), (text, paths[0])
@@ -440,10 +441,10 @@ def _se_node_after_write(batch, node, values, out, edited, edited_text):
     out['changedKeys'] = loaded['changedKeys']
     out['noChange'] = loaded['noChange']
     if loaded['error'] is not None:
-        return _se_fail(out, loaded['errorCode'] or 'FLAME_API_ERROR', loaded['error'])
+        return _te_fail(out, loaded['errorCode'] or 'FLAME_API_ERROR', loaded['error'])
     fresh = _se_node_again(batch, node, index, len(nodes_before))
     if fresh is None:
-        return _se_fail(
+        return _te_fail(
             out, 'FLAME_API_ERROR',
             'the setup was loaded, but the node cannot be found again to read it back',
         )
@@ -452,7 +453,7 @@ def _se_node_after_write(batch, node, values, out, edited, edited_text):
     _se_tighten(paths)
     if again['error'] is not None or len(paths) != 1:
         out['savedFiles'] = paths
-        return _se_fail(
+        return _te_fail(
             out, 'FLAME_API_ERROR',
             'the setup was loaded, but it could not be saved again to read it back: '
             + str(again['error'] or (str(len(paths)) + ' files')),
@@ -460,7 +461,7 @@ def _se_node_after_write(batch, node, values, out, edited, edited_text):
     out['files']['readback'] = paths[0]
     back = _se_read_text(paths[0])
     if back is None:
-        return _se_fail(
+        return _te_fail(
             out, 'FLAME_API_ERROR', 'the setup saved for the read-back is not UTF-8 text'
         )
     _se_judge(out, values, edited_text, back)
@@ -486,6 +487,101 @@ def _se_node_edit(batch, node, values, keep_files, base):
     except BaseException as exc:
         _se_stopped(out, exc)
     return _se_finish(out, workdir, keep_files)
+
+
+def _se_file_ident(path):
+    # the part of a saved file's name after 'setup': '.timewarp_node', '.lut_node'
+    name = path.rsplit('/', 1)[-1]
+    return name[len('setup'):] if name.startswith('setup') else name
+
+
+def _se_read_files(out, paths, tags):
+    # read the files a save wrote into the work directory and take the value of each tag over all
+    # of them; a file that is not UTF-8 is named in notText and not read
+    _se_tighten(paths)
+    texts = {}
+    not_text = []
+    for path in paths:
+        ident = _se_file_ident(path)
+        text = _se_read_text(path)
+        if text is None:
+            not_text.append(ident)
+        else:
+            texts[ident] = text
+    out['savedFiles'] = [_se_file_ident(p) for p in paths]
+    out['notText'] = not_text
+    if len(texts) == 0:
+        return _te_fail(
+            out,
+            'PRECONDITION_UNMET',
+            'none of the setup files is UTF-8 text (' + ', '.join(not_text) + '): they cannot be '
+            'read',
+        )
+    got = _se_read_tags(texts, tags)
+    for tag in tags:
+        if got['tagCounts'][tag] == 0 and len(not_text) > 0:
+            got['problems'][tag] += ' (files not read as text: ' + ', '.join(not_text) + ')'
+    out.update(
+        values=got['values'],
+        problems=got['problems'],
+        tagCounts=got['tagCounts'],
+        fileOf=got['fileOf'],
+    )
+    return out
+
+
+def _te_read_setup(seg, parent, fx_type, tags, base):
+    # save the effect's setup into a new work directory, read the tags, remove the directory
+    import os
+    out = _te_start(seg, parent, 'read the setup of', False)
+    out.pop('before', None)
+    out.pop('ran', None)
+    if out['error'] is not None:
+        return out
+    out['requestedType'] = fx_type
+    fx = _te_fx_find(seg, fx_type)
+    if fx is None:
+        return _te_fx_missing(out, seg, fx_type, '')
+    out['type'] = _j(fx.type)
+    problems = _se_check_tags(tags)
+    if len(problems) > 0:
+        return _te_fail(out, 'INVALID_ARGS', '; '.join(problems))
+    workdir = _se_new_workdir(base)
+    try:
+        saved = _te_save_setup(seg, parent, fx_type, os.path.join(workdir, 'setup'), False)
+        if saved['error'] is not None:
+            code = saved['errorCode']
+            _te_fail(out, 'FLAME_API_ERROR' if code == 'SILENT_NOOP' else code, saved['error'])
+        else:
+            _se_read_files(out, [f['path'] for f in saved['files']], tags)
+    finally:
+        _se_remove_workdir(out, workdir)
+    return out
+
+
+def _se_node_read(batch, node, tags, base):
+    # save the node's setup into a new work directory, read the tags, remove the directory
+    import os
+    out = {
+        'error': None,
+        'errorCode': None,
+        'node': _node_row(node, _name_counts(_node_names(batch))),
+    }
+    problems = _se_check_tags(tags)
+    if len(problems) > 0:
+        return _te_fail(out, 'INVALID_ARGS', '; '.join(problems))
+    workdir = _se_new_workdir(base)
+    try:
+        saved = _node_save_setup(batch, node, os.path.join(workdir, 'setup'), False)
+        # an error that only says no file is the one named after the node type is not one here:
+        # every file is read
+        if len(saved['files']) == 0 or saved['saveSetupReturned'] is not True:
+            _te_fail(out, 'FLAME_API_ERROR', saved['error'])
+        else:
+            _se_read_files(out, list(saved['files']), tags)
+    finally:
+        _se_remove_workdir(out, workdir)
+    return out
 """
 
 SETUP_EDIT_HELPER = (

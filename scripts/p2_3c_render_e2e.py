@@ -7,7 +7,8 @@ the rendered files on disk, the journal record, the refusals made before anythin
 (default output path, too many frames), the clip a Render node aimed at a Desktop reel group
 puts into that group's reel (`Batch Renders` when the destination reads back as 2 elements,
 the reel its 3rd element names when it reads back as 3), and the `outputs` that `batch.list`
-lists for the Write File and Render nodes of these groups.
+lists for the Write File and Render nodes of these groups, and the file `node.save_setup` of a
+Render node reports as its own.
 
 Same shape and helpers as scripts/p2_3b_node_action_e2e.py (imported from p2_2a / p1): a real MCP
 stdio client drives `python -m flame_mcp` against a live Flame + dev bridge; `flame_mcp.transport`
@@ -72,8 +73,11 @@ Stages
      count) before the render; render.batch is ok and result.newClips holds the one clip, named
      after the Render node, in `<group>/<reel>`; the Desktop reel
      (transport) gained exactly that clip; reelsBefore / reelsAfter carry the Desktop row; the
-     plan after the render says the reel exists with one more clip. Observed: elapsed time, what
-     `returned` was, the reels of the group before and after.
+     plan after the render says the reel exists with one more clip. node.save_setup of the Render
+     node (into `render_g_setup/` of the files directory): JUDGED, ok, result.path ends in
+     `.output_node` and the extensions of result.files are exactly `.lut_node`, `.output_node`,
+     `.resize` and `.resize_node`. Observed: elapsed time, what `returned` was, the
+     reels of the group before and after.
   h  batch.list(outputs=true), paged with limit / offset (after a `stoppedEarly` the next page
      starts at offset + stoppedEarly.read) until the groups of this run are all found. JUDGED:
      group A lists exactly its Write File `write_a` (kind write_file, bypass false, mediaPath
@@ -86,7 +90,8 @@ Stages
   z  cross-cutting checks over every envelope; nothing left undecided
 
 Cleanup: this run's own Desktop reel group (`P23C_RG_<ts>`) is deleted and checked gone; no Batch
-group is deleted (flame.delete on a PyBatch is not used); rendered files and the library are kept;
+group is deleted (flame.delete on a PyBatch is not used); rendered files, the setup files of
+stage g and the library are kept;
 then flame.exit().
 """
 
@@ -140,6 +145,7 @@ WRITERS: Final[dict[str, str]] = {
 DEFAULT_DIR: Final[str] = "/var/tmp"
 RENDER_GROUP: Final[str] = "G"
 RENDER_NODE: Final[str] = "render_g"
+RENDER_SETUP_SUFFIXES: Final[list[str]] = [".lut_node", ".output_node", ".resize", ".resize_node"]
 RENDER_RANGE: Final[tuple[int, int]] = (1, 8)
 DESKTOP_REEL: Final[str] = "Batch Renders"
 LIST_PAGE: Final[int] = 20
@@ -1188,6 +1194,27 @@ async def stage_g(ctx: Ctx) -> None:
             dest_after.get("exists") is True
             and dest_after.get("clipCount") == len(after.get("clips") or []),
             destinationReel=dest_after,
+        )
+        setup_dir = Path(str(ctx.ids["filesDir"])) / "render_g_setup"
+        setup_dir.mkdir(parents=True, exist_ok=True)
+        saved = await do(
+            session,
+            ctx,
+            "node.save_setup",
+            {"target": node_sel(ctx, group, RENDER_NODE), "path": str(setup_dir / "rnd")},
+        )
+        saved_result = _result_of(saved)
+        rec(
+            ctx,
+            "g_node_save_setup_of_the_render_node_is_ok_and_its_path_ends_in_output_node",
+            saved.get("ok") is True
+            and str(saved_result.get("path")).endswith(".output_node")
+            and sorted(Path(str(f)).suffix for f in saved_result.get("files") or [])
+            == RENDER_SETUP_SUFFIXES,
+            error=saved.get("error"),
+            errorCode=saved.get("errorCode"),
+            path=saved_result.get("path"),
+            files=saved_result.get("files"),
         )
         observe(
             ctx,

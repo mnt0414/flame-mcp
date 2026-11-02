@@ -9,8 +9,8 @@ default 1-100, whatever the group's duration is). From those this module derives
 names a render is to write (`OutputSpec`), checks the directory, and compares the directory
 before and after a run.
 
-Everything that looks at the filesystem lives here so `render.plan`, `render.batch` and
-`journal.check` share one reading of it.
+Everything that looks at the filesystem lives here so `render.plan`, `render.batch`,
+`render.export` and `journal.check` share one reading of it.
 """
 
 from __future__ import annotations
@@ -31,6 +31,18 @@ NAME_LIST_CAP: Final[int] = 200
 """Directory entries the journal's intent lists by name (the count is always exact)."""
 OTHER_FILES_CAP: Final[int] = 50
 MISSING_CAP: Final[int] = 20
+EXPORT_SCAN_DEPTH: Final[int] = 3
+"""How many directory levels below the output directory `render.export` lists before the export,
+to show what keeps it from being empty (the entries directly inside it are level 1). Whether it is
+empty never depends on this: anything visible deeper has a visible folder at level 1."""
+EXPORT_COUNT_DEPTH: Final[int] = 16
+"""How many levels `render.export` and `journal.check` look into to count what an export wrote: a
+preset may nest its files deep (a publish preset writes `<name>/<tape>/<size>/...`)."""
+EXPORT_COUNT_LIMIT: Final[int] = 200_000
+"""Most entries counted after an export; beyond it the count is a lower bound, not an answer."""
+EXPORT_SCAN_LIMIT: Final[int] = 20_000
+"""Most entries (files and directories) `render.export` reads from the output directory before
+it refuses (`scan_tree(limit=...)`): a listing cut short could not tell what an export wrote."""
 
 _SEQUENCE_RE: Final = re.compile(
     r"^(?P<dir>.*)/(?P<head>[^/]*)\[(?P<first>\d+)-(?P<last>\d+)\](?P<tail>[^/]*)$"
@@ -162,6 +174,102 @@ def list_directory(directory: str) -> dict[str, Stat]:
     except OSError:
         return {}
     return found
+
+
+@dataclass(frozen=True)
+class Tree:
+    """What `scan_tree` found, paths relative to the scanned directory, with `/`: `files` the
+    regular files {path: (size, mtime_ns)}, `dirs` the directories, `others` what is neither (a
+    symbolic link, also a dangling one, a pipe, a socket, a device: seen, never entered),
+    `unreadable` the directories that could not be listed (`""` is the scanned directory itself),
+    `truncated` True when the scan stopped at its limit. A hidden directory (a name starting with
+    `.`) is listed as an entry but never entered, so what is inside one is not in the lists. The
+    lists are incomplete (`incomplete`) when the scan was cut short or a directory that is not
+    hidden could not be read."""
+
+    files: dict[str, Stat]
+    dirs: tuple[str, ...]
+    others: tuple[str, ...]
+    unreadable: tuple[str, ...]
+    truncated: bool
+
+    @property
+    def incomplete(self) -> bool:
+        return self.truncated or any(not is_hidden(path) for path in self.unreadable)
+
+
+def scan_tree(directory: str, depth: int = EXPORT_SCAN_DEPTH, limit: int | None = None) -> Tree:
+    """The entries inside `directory`, `depth` levels down (the entries directly inside it are
+    level 1, so a file is listed when it lies in at most `depth - 1` nested folders), stopping
+    at `limit` entries that are not hidden when given. A directory that cannot be listed is named
+    in `unreadable`, not taken for an empty one."""
+    files: dict[str, Stat] = {}
+    dirs: list[str] = []
+    others: list[str] = []
+    unreadable: list[str] = []
+    pending: list[tuple[str, str, int]] = [(directory, "", 1)]
+    counted = 0
+    while pending:
+        path, prefix, level = pending.pop()
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    hidden = entry.name.startswith(".")
+                    if limit is not None and counted >= limit and not hidden:
+                        return _tree(files, dirs, others, unreadable, True)
+                    counted += 0 if hidden else 1
+                    relative = f"{prefix}{entry.name}"
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            dirs.append(relative)
+                            if level < depth and not hidden:
+                                pending.append((entry.path, f"{relative}/", level + 1))
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            files[relative] = (st.st_size, st.st_mtime_ns)
+                        else:
+                            others.append(relative)
+                    except OSError:
+                        others.append(relative)
+        except OSError:
+            unreadable.append(prefix.rstrip("/"))
+    return _tree(files, dirs, others, unreadable, False)
+
+
+def _tree(
+    files: dict[str, Stat],
+    dirs: list[str],
+    others: list[str],
+    unreadable: list[str],
+    truncated: bool,
+) -> Tree:
+    return Tree(
+        files, tuple(sorted(dirs)), tuple(sorted(others)), tuple(sorted(unreadable)), truncated
+    )
+
+
+def is_hidden(path: str) -> bool:
+    """A relative path with a name starting with `.` (`.DS_Store`) anywhere in it: a hidden
+    entry, or something inside a hidden folder."""
+    return any(part.startswith(".") for part in path.split("/"))
+
+
+def visible_entries(tree: Tree) -> list[str]:
+    """Sorted relative paths of everything in `tree` that is not hidden: files, directories
+    (with a trailing `/`) and the other kinds of entry."""
+    found = [path for path in (*tree.files, *tree.others) if not is_hidden(path)]
+    found.extend(f"{path}/" for path in tree.dirs if not is_hidden(path))
+    return sorted(found)
+
+
+def written_files(before: Mapping[str, Stat], tree: Tree) -> list[str]:
+    """The files of `tree` that are new or changed since `before` and not hidden."""
+    return [name for name in written_since(before, tree.files) if not is_hidden(name)]
+
+
+def visible_folders(tree: Tree) -> list[str]:
+    """Sorted directories of `tree` that are not hidden (a trailing `/`)."""
+    return sorted(f"{path}/" for path in tree.dirs if not is_hidden(path))
 
 
 def written_since(before: Mapping[str, Stat], after: Mapping[str, Stat]) -> list[str]:

@@ -106,7 +106,7 @@ def run_script(
     monkeypatch.setattr(module, "pixel_hash_dir", file_md5_listing)
     monkeypatch.setenv(common.CKPT_ENV, "")
     flame = FakeFlame()
-    flame.PyExporter = FakeExporter  # type: ignore[attr-defined]
+    flame.PyExporter = FakeExporter
     original_import = FakeFlame.import_clips
 
     def import_with_a_segment(self: FakeFlame, path: Any, destination: Any) -> list[Any]:

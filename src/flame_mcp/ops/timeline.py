@@ -7,7 +7,14 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from flame_mcp import selectors
-from flame_mcp.ops._common import AUTO_RESIZE_NOTE, build_source, list_result_src, offset_param
+from flame_mcp.list_fields import fields_note, fields_param
+from flame_mcp.ops._common import (
+    AUTO_RESIZE_NOTE,
+    build_source,
+    limit_param,
+    list_result_src,
+    offset_param,
+)
 from flame_mcp.registry import Registry
 from flame_mcp.types import Category, OperationParam, OperationSpec, Refusal, SelectorKind
 
@@ -245,9 +252,6 @@ def register(registry: Registry) -> None:
         ),
         required=True,
     )
-    limit_param = OperationParam(
-        name="limit", type="number", description="Max segments to return.", required=False
-    )
 
     registry.register(
         OperationSpec(
@@ -319,7 +323,7 @@ def register(registry: Registry) -> None:
                 "The result's uid / wiretapId are those of the sequence that was read; to read "
                 "or edit that same sequence again, point at it with "
                 "{kind: 'wiretap', id: <wiretapId>}, because a timeline selector reads what the "
-                "Timeline shows at each call."
+                "Timeline shows at each call. " + fields_note()
             ),
             effect="read",
             params=(
@@ -378,8 +382,9 @@ def register(registry: Registry) -> None:
                     required=False,
                     default=False,
                 ),
-                limit_param,
+                limit_param("Max segments to return."),
                 offset_param(),
+                fields_param("timeline.list_segments"),
             ),
             accepts=_SEQUENCE_TARGET_ACCEPTS,
             to_python=_list_segments_to_python,

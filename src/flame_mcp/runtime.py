@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import execution, opschema
+from flame_mcp import execution, list_fields, opschema
 from flame_mcp.callargs import apply_limit_default, apply_param_defaults
 from flame_mcp.checkpointed import run_declared
 from flame_mcp.journal import Index, Journal, new_id
@@ -50,6 +50,7 @@ from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import Denial, Policy, deny_operation
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.setup_work import set_journal_directory
+from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ServerOpError
 
 TEST_PAUSE_ENV: Final[str] = "FLAME_MCP_TEST_PAUSE_AFTER_PREREAD"
@@ -229,10 +230,6 @@ class ServerContext(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
 @dataclass
 class Runtime:
     registry: Registry
@@ -269,7 +266,7 @@ class Runtime:
                 error=denial.message,
                 error_code="POLICY_DENIED",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint=denial.hint,
             )
 
@@ -280,10 +277,18 @@ class Runtime:
                 error=f"invalid arguments: {issues}",
                 error_code="INVALID_ARGS",
                 op=op,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
             )
 
         op_args: dict[str, Any] = dict(validation.value or {})
+        unknown_fields = list_fields.unknown_fields_message(op.name, op_args)
+        if unknown_fields is not None:
+            return envelope_mod.from_pre_bridge_error(
+                error=unknown_fields,
+                error_code="INVALID_ARGS",
+                op=op,
+                duration_ms=elapsed_ms(started),
+            )
         apply_param_defaults(op, op_args)
         limit_notes = apply_limit_default(op, op_args)
 
@@ -296,7 +301,7 @@ class Runtime:
                     error=refusal.message,
                     error_code=refusal.code,
                     execution=envelope_mod.execution_meta(op),
-                    duration_ms=_elapsed_ms(started),
+                    duration_ms=elapsed_ms(started),
                     hint_override=refusal.hint,
                 )
 
@@ -308,6 +313,7 @@ class Runtime:
             reverts_intent=reverts_intent,
             precondition=precondition,
         )
+        list_fields.select_fields(op.name, op_args, env)
         if limit_notes:
             env["degraded"] = [*env.get("degraded", []), *limit_notes]
         return env
@@ -339,7 +345,7 @@ class Runtime:
                     error=denial.message,
                     error_code="POLICY_DENIED",
                     op=op,
-                    duration_ms=_elapsed_ms(started),
+                    duration_ms=elapsed_ms(started),
                     hint=denial.hint,
                 )
             return self._dispatch(
@@ -394,7 +400,7 @@ class Runtime:
                 partial=exc.partial,
                 journal=exc.journal,
                 execution=meta,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
                 hint_override=exc.hint,
             )
         except Exception as exc:  # a bug in the handler: report it, do not take the tool down
@@ -405,7 +411,7 @@ class Runtime:
                 error_code="FLAME_API_ERROR",
                 traceback=traceback.format_exc(),
                 execution=meta,
-                duration_ms=_elapsed_ms(started),
+                duration_ms=elapsed_ms(started),
             )
         return envelope_mod.build_envelope(
             ok=True,
@@ -419,7 +425,7 @@ class Runtime:
             partial=outcome.partial,
             journal=outcome.journal,
             execution=meta,
-            duration_ms=_elapsed_ms(started),
+            duration_ms=elapsed_ms(started),
         )
 
     def journal_summary(self) -> dict[str, Any]:
@@ -458,7 +464,7 @@ def _unknown_operation(registry: Registry, op_name: str, started: float) -> dict
     env = envelope_mod.from_pre_bridge_error(
         error=message, error_code="UNKNOWN_OPERATION", op=None, duration_ms=0
     )
-    env["durationMs"] = _elapsed_ms(started)
+    env["durationMs"] = elapsed_ms(started)
     return env
 
 

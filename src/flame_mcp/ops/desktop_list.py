@@ -7,7 +7,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp.inspect_prelude import INSPECT_BUDGET_S
-from flame_mcp.ops._common import build_source, list_result_src, offset_param
+from flame_mcp.list_fields import fields_note, fields_param
+from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.registry import Registry
 from flame_mcp.types import OperationParam, OperationSpec
 
@@ -44,7 +45,8 @@ _DESCRIPTION = (
     "past `total` and the walk stopped early, the walk of this call stopped before `offset` "
     "(earlier than the walk of the call that gave it): `offsetBeyondReached` is true and "
     "`hint` says to narrow the walk. A page larger than the response size limit "
-    "comes back with `items` collapsed to {count, omitted}: keep `limit` at 100 or less."
+    "comes back with `items` collapsed to {count, omitted}: keep `limit` at 100 or less. "
+    + fields_note()
 )
 
 
@@ -108,10 +110,9 @@ def register(registry: Registry) -> None:
                     default="all",
                     enum=SCOPES,
                 ),
-                OperationParam(
-                    name="limit", type="number", description="Max items to return.", required=False
-                ),
+                limit_param(),
                 offset_param(),
+                fields_param("desktop.list_all"),
             ),
             to_python=_to_python,
             requires=(

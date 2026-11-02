@@ -194,8 +194,6 @@ def test_move_refuses_a_batch_group_reel_as_destination_or_as_source(rig: Rig) -
 
 
 def test_move_refuses_the_cases_that_were_not_measured_or_make_no_sense(rig: Rig) -> None:
-    same_reel = mv(rig, [C1], REEL1)
-    assert same_reel["errorCode"] == "PRECONDITION_UNMET" and "already in" in same_reel["error"]
     twice = mv(rig, [C1, C1], reel2_selector(rig))
     assert twice["errorCode"] == "INVALID_ARGS" and "twice" in twice["error"]
     reel_source = mv(rig, [REEL1], reel2_selector(rig))
@@ -206,6 +204,93 @@ def test_move_refuses_the_cases_that_were_not_measured_or_make_no_sense(rig: Rig
         and "destination is a PyClip" in (clip_dest["error"])
     )
     assert rig.records() == [] and rig.flame.media_panel.move_calls == []
+
+
+def same_reel_clips(rig: Rig) -> tuple[Any, list[dict[str, Any]]]:
+    """Reel 1 holds c1, c2, c3 (c1 from the rig); the reel and the selectors of the three."""
+    reel = rig.handles["reel_group"].reels[0]
+    c2 = add_clip(reel, "c2")
+    c3 = add_clip(reel, "c3")
+    return reel, [C1, wt(c2), wt(c3)]
+
+
+def test_move_into_the_reel_the_source_is_in_goes_to_the_end_with_a_new_uid(rig: Rig) -> None:
+    reel, [c1, _c2, _c3] = same_reel_clips(rig)
+    old_uid = reel.children[0].uid.get_value()
+    env = mv(rig, [c1], REEL1)
+    assert env["ok"] is True, env
+    assert names(reel) == ["c2", "c3", "c1"]
+    [moved] = env["result"]["moved"]
+    assert moved["from"]["uid"] == old_uid and moved["to"]["uid"] != old_uid
+    assert moved["to"]["name"] == "c1" and "pairedBy" not in moved
+    assert env["result"]["notMoved"] == [] and env["result"]["partial"] is False
+    assert env.get("degraded") in (None, [])
+    assert env["affected"] == 1 and env["journal"]["revert"] is not None
+
+
+def test_move_into_its_own_reel_puts_the_sources_at_the_end_in_the_order_given(rig: Rig) -> None:
+    reel, [c1, c2, c3] = same_reel_clips(rig)
+    env = mv(rig, [c3, c1], REEL1)
+    assert env["ok"] is True, env
+    assert names(reel) == ["c2", "c3", "c1"]
+    assert [m["from"]["name"] for m in env["result"]["moved"]] == ["c3", "c1"]
+    again = mv(rig, [c2], REEL1)
+    assert again["ok"] is True and names(reel) == ["c3", "c1", "c2"]
+
+
+def test_move_into_its_own_reel_pairs_same_named_clips_by_what_flame_answered(rig: Rig) -> None:
+    reel, [c1, _c2, _c3] = same_reel_clips(rig)
+    twin = add_clip(reel, "c1")
+    env = mv(rig, [wt(twin), c1], REEL1)
+    assert env["ok"] is True, env
+    assert names(reel) == ["c2", "c3", "c1", "c1"]
+    assert len({m["to"]["uid"] for m in env["result"]["moved"]}) == 2
+    assert env["result"]["moved"][0]["from"]["uid"] != env["result"]["moved"][1]["from"]["uid"]
+
+
+def test_revert_of_a_move_inside_one_reel_moves_it_to_the_end_again(rig: Rig) -> None:
+    reel, [c1, _c2, _c3] = same_reel_clips(rig)
+    env = mv(rig, [c1], REEL1)
+    moved_uid = env["result"]["moved"][0]["to"]["uid"]
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert names(reel) == ["c2", "c3", "c1"]
+    [back] = out["result"]["reverted"]
+    assert back["from"]["uid"] == moved_uid and back["to"]["uid"] != moved_uid
+
+
+def test_revert_of_a_move_inside_one_reel_conflicts_when_the_thing_left_the_reel(
+    rig: Rig,
+) -> None:
+    reel, [c1, _c2, _c3] = same_reel_clips(rig)
+    env = mv(rig, [c1], REEL1)
+    moved = env["result"]["moved"][0]["to"]
+    assert mv(rig, [moved["selector"]], reel2_selector(rig))["ok"] is True
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "CONFLICT", out
+    assert names(reel) == ["c2", "c3"] and names(rig.handles["reel2"]) == ["c1"]
+
+
+def test_a_lost_answer_of_a_move_inside_one_reel_is_landed_by_check(rig: Rig) -> None:
+    reel, [c1, c2, _c3] = same_reel_clips(rig)
+    rig.exec.fault(MOVE, "TIMEOUT", when="after", skip=1)
+    env = mv(rig, [c1, c2], REEL1)
+    assert env["errorCode"] == "TIMEOUT"
+    group = env["journal"]["group"]
+    [row] = rig.do("journal.check", {"group": group})["result"]["checked"]
+    assert row["verdict"] == "landed", row
+    assert [m["to"]["name"] for m in row["created"]["moves"]] == ["c1", "c2"]
+    assert names(reel) == ["c3", "c1", "c2"]
+
+
+def test_check_of_a_move_inside_one_reel_that_never_ran_is_not_landed(rig: Rig) -> None:
+    reel, [c1, _c2, _c3] = same_reel_clips(rig)
+    rig.exec.fault(MOVE, "TIMEOUT", when="before", skip=1)
+    env = mv(rig, [c1], REEL1)
+    assert env["errorCode"] == "TIMEOUT", env
+    [row] = rig.do("journal.check", {"group": env["journal"]["group"]})["result"]["checked"]
+    assert row["verdict"] == "not_landed", row
+    assert names(reel) == ["c1", "c2", "c3"]
 
 
 def test_move_argument_checks(rig: Rig) -> None:

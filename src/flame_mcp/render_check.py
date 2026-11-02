@@ -136,9 +136,12 @@ def _reels_grew(before: Any, now: Any) -> bool:
     )
 
 
-def _unknown_entry(entry: dict[str, Any], detail: str, code: str | None = None) -> dict[str, Any]:
+def _unknown_entry(
+    entry: dict[str, Any], detail: str, code: str | None = None, noun: str = "render"
+) -> dict[str, Any]:
+    """`noun` is what the notes call the thing that was running (`render`, `export`)."""
     if code in BRIDGE_BUSY_CODES:
-        detail = f"{detail}. {BRIDGE_BUSY_NOTE}"
+        detail = f"{detail}. {BRIDGE_BUSY_NOTE.replace('render', noun)}"
     entry.update(verdict=VERDICT_UNKNOWN, detail=detail)
     return entry
 
@@ -173,7 +176,8 @@ def _check_with_result(
     """The bridge has handed over the run's answer (`polled` record): the render has ended. The
     files are counted as the check of what it wrote, and the verdict follows `judge_render`:
     landed (all is well), partial (some frames of a render that reported a problem or came out
-    short), failed (the render reported a failure and wrote none / all of it)."""
+    short), not_landed (it ended without an error and wrote nothing: SILENT_NOOP), failed (the
+    render reported a failure and wrote none / all of it)."""
     flame_raw = polled.get("flame")
     flame: dict[str, Any] = flame_raw if isinstance(flame_raw, dict) else {}
     rows, written, expected = _disk_rows(view.intent)
@@ -190,6 +194,8 @@ def _check_with_result(
         verdict = STATE_LANDED
     elif 0 < written < expected:
         verdict = STATE_PARTIAL
+    elif judged.code == "SILENT_NOOP":
+        verdict = STATE_NOT_LANDED
     else:
         verdict = STATE_FAILED
     per_key = {
@@ -309,13 +315,17 @@ class Answer:
 
 
 def fetch_answer(
-    ctx: ServerContext, view: IntentView, entry: dict[str, Any], op_name: str
+    ctx: ServerContext,
+    view: IntentView,
+    entry: dict[str, Any],
+    op_name: str,
+    noun: str = "render",
 ) -> Answer:
     """The bridge's answer for the run of `view`, from a journaled `polled` record, else from the
     handle to ask with -- the `pending` record's (the bridge's own), else the intent's client
     handle (chosen by this server: it is there even when the run ended in BRIDGE_LOST or a bare
     TIMEOUT and no pending handle ever came). An answer is journaled at once: the bridge hands a
-    result over once."""
+    result over once. `noun` is what the messages call the run (`render`, `export`)."""
     polled = view.polled
     handle = view.pending_handle
     from_intent = handle is None and view.client_handle is not None
@@ -328,17 +338,19 @@ def fetch_answer(
         return Answer(
             stop=_unknown_entry(
                 entry,
-                "the render is still running (the bridge says the handle is still pending): "
+                f"the {noun} is still running (the bridge says the handle is still pending): "
                 "run journal.check again later",
+                noun=noun,
             )
         )
     if result.kind == "unreachable":
         return Answer(
             stop=_unknown_entry(
                 entry,
-                f"the bridge could not be asked for the render's result ({result.code}: "
+                f"the bridge could not be asked for the {noun}'s result ({result.code}: "
                 f"{result.message})",
                 result.code,
+                noun,
             )
         )
     if result.kind == "unknown_handle":
@@ -347,7 +359,7 @@ def fetch_answer(
             "result was already handed over)"
             if not from_intent
             else f"the bridge does not know handle {handle}, which this server gave the "
-            "render: Flame was restarted before the render finished, or the result file "
+            f"{noun}: Flame was restarted before the {noun} finished, or the result file "
             "was removed"
         )
         return Answer(reason=reason)

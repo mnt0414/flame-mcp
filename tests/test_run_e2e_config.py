@@ -212,7 +212,31 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages a-f, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages a-g, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p94_arrange_insert",
+        "scripts/p94_arrange_insert_e2e.py",
+        "p2",
+        "p94_arrange_insert_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages a-e, g, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p95_prep_ops",
+        "scripts/p95_prep_ops_e2e.py",
+        "p2",
+        "p95_prep_ops_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        "600",
+        "(setup, stages c, t, b, r, u, s, o, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p2_3r_reel_fidelity",
@@ -535,12 +559,12 @@ def test_only_the_two_p2_4_e2es_take_extra_args_and_crash_check() -> None:
     assert names == {c.name for c in OLD_CONFIGS if c.crash_check == "yes"}
 
 
-def test_list_names_the_27_folded_e2es_and_the_3_dedicated_ones(tmp_path: Path) -> None:
+def test_list_names_the_configured_e2es_and_the_dedicated_ones(tmp_path: Path) -> None:
     proc = bash([str(RUN_E2E), "--list"], base_env(tmp_path))
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.split()
     assert sorted(names) == sorted(ALL_NAMES)
-    assert len(names) == 34
+    assert len(names) == 36
 
 
 @pytest.mark.parametrize("name", DEDICATED)

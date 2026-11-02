@@ -231,6 +231,103 @@ def test_scalar_differences_is_cut_at_a_limit() -> None:
     assert len(se.scalar_differences(a, b, [])) == se.MAX_DIFFERENCES
 
 
+def test_check_tags_accepts_one_to_twenty_distinct_names() -> None:
+    assert se.check_tags(["TW_FrameMode"]) == []
+    assert se.check_tags([f"T{i}" for i in range(se.SETUP_MAX_VALUES)]) == []
+
+
+@pytest.mark.parametrize("tags", [[], None, "TW_FrameMode", {"TW_FrameMode": 1}, 5])
+def test_check_tags_refuses_what_is_not_a_list_of_one_to_twenty(tags: Any) -> None:
+    problems = se.check_tags(tags)
+    assert len(problems) == 1 and "1 to 20" in problems[0]
+
+
+def test_check_tags_refuses_twenty_one() -> None:
+    problems = se.check_tags([f"T{i}" for i in range(se.SETUP_MAX_VALUES + 1)])
+    assert len(problems) == 1 and "1 to 20" in problems[0]
+
+
+@pytest.mark.parametrize("name", ["a b", "a<b", "1A", "", "a-b", "\u00e9"])
+def test_check_tags_refuses_a_name_of_another_shape(name: str) -> None:
+    problems = se.check_tags(["Good", name])
+    assert len(problems) == 1 and ascii(name) in problems[0]
+
+
+def test_check_tags_refuses_a_name_that_is_not_a_string() -> None:
+    problems = se.check_tags([1, ["x"]])
+    assert len(problems) == 2 and all("must be a string" in p for p in problems)
+
+
+def test_check_tags_refuses_a_name_listed_twice_once_per_name() -> None:
+    assert se.check_tags(["A", "B", "A"]) == ["tag 'A' is listed twice"]
+    assert se.check_tags(["A", "A", "A"]) == ["tag 'A' is listed twice"]
+
+
+def test_read_tags_returns_the_text_of_a_tag_that_occurs_once() -> None:
+    got = se.read_tags({".timewarp_node": TIMEWARP}, ["TW_FrameMode", "TW_Bypass"])
+    assert got == {
+        "values": {"TW_FrameMode": "2", "TW_Bypass": "False"},
+        "problems": {},
+        "tagCounts": {"TW_FrameMode": 1, "TW_Bypass": 1},
+        "fileOf": {"TW_FrameMode": ".timewarp_node", "TW_Bypass": ".timewarp_node"},
+    }
+
+
+def test_read_tags_gives_none_and_a_reason_for_a_tag_that_is_not_there() -> None:
+    got = se.read_tags({".a": TIMEWARP}, ["TW_Nope"])
+    assert got["values"] == {"TW_Nope": None}
+    assert got["problems"] == {"TW_Nope": "the tag is not in the setup"}
+    assert got["tagCounts"] == {"TW_Nope": 0} and got["fileOf"] == {"TW_Nope": None}
+
+
+def test_read_tags_gives_none_and_the_count_for_a_tag_that_occurs_twice() -> None:
+    got = se.read_tags({".a": TIMEWARP}, ["Frame"])
+    assert got["values"] == {"Frame": None}
+    assert got["problems"] == {
+        "Frame": "the tag occurs 2 times (only a tag that occurs once can be read)"
+    }
+    assert got["tagCounts"] == {"Frame": 2} and got["fileOf"] == {"Frame": None}
+
+
+def test_read_tags_counts_across_all_the_files() -> None:
+    files = {".a_node": "<A><Mode>1</Mode></A>", ".b_node": "<B><Mode>2</Mode><Own>7</Own></B>"}
+    got = se.read_tags(files, ["Mode", "Own"])
+    assert got["values"] == {"Mode": None, "Own": "7"}
+    assert got["tagCounts"] == {"Mode": 2, "Own": 1}
+    assert "2 times" in str(got["problems"]["Mode"]) and list(got["problems"]) == ["Mode"]
+    assert got["fileOf"] == {"Mode": None, "Own": ".b_node"}
+
+
+def test_read_tags_finds_the_one_file_that_holds_the_tag() -> None:
+    files = {".output_node": "<O><UseLuts>True</UseLuts></O>", ".lut_node": "<L><P>137</P></L>"}
+    got = se.read_tags(files, ["P", "UseLuts"])
+    assert got["values"] == {"P": "137", "UseLuts": "True"}
+    assert got["fileOf"] == {"P": ".lut_node", "UseLuts": ".output_node"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['<A><Mode Kind="x">1</Mode></A>', "<A><Mode/></A>", "<A><Mode><X>1</X></Mode></A>"],
+)
+def test_read_tags_refuses_a_tag_that_is_not_plain(text: str) -> None:
+    got = se.read_tags({".a": text}, ["Mode"])
+    assert got["values"] == {"Mode": None} and got["tagCounts"] == {"Mode": 1}
+    reason = str(got["problems"]["Mode"])
+    assert "not a plain <TAG>value</TAG>" in reason
+    assert "attributes, child elements or is written self-closing" in reason
+
+
+def test_read_tags_does_not_convert_the_value() -> None:
+    text = "<A><N>0.500000</N><B>True</B><E></E><S>  a b </S></A>"
+    got = se.read_tags({".a": text}, ["N", "B", "E", "S"])
+    assert got["values"] == {"N": "0.500000", "B": "True", "E": "", "S": "  a b "}
+
+
+def test_read_tags_of_no_file_finds_nothing() -> None:
+    got = se.read_tags({}, ["A"])
+    assert got["values"] == {"A": None} and got["tagCounts"] == {"A": 0}
+
+
 def test_the_module_is_ascii_and_needs_nothing_but_re() -> None:
     import inspect
 
@@ -253,6 +350,10 @@ def test_the_copy_that_runs_inside_flame_behaves_the_same() -> None:
     )
     assert namespace["_se_check_values"]({"a b": 1}) == se.check_values({"a b": 1})
     assert namespace["_se_values_match"](0.5, "0.500000") is True
+    assert namespace["_se_check_tags"](["A", "A"]) == se.check_tags(["A", "A"])
+    assert namespace["_se_read_tags"]({".x": TIMEWARP}, ["TW_FrameMode"]) == se.read_tags(
+        {".x": TIMEWARP}, ["TW_FrameMode"]
+    )
 
 
 def test_the_copy_leaves_no_public_name_in_the_namespace_every_op_shares() -> None:
