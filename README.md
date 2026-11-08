@@ -25,7 +25,7 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 | Batch | Create, connect, and set up nodes. Save and load setups. Render. |
 | Multi-step plans | Run several operations as one procedure (`plan.run`). |
 
-There are 110 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
+There are 111 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
 
 ## Before you start
 
@@ -352,7 +352,7 @@ Report security vulnerabilities as described in [SECURITY.md](.github/SECURITY.m
 - `render.export` writes only into an empty directory and never overwrites. Use a new directory for each export.
 - `render.export` and `render.still` can't be undone. The files that they write stay on disk. The PNG of `render.still` is a small image for checking, not a deliverable.
 - You can't delete anything in a library, or move anything out of a library. This keeps past work stored in libraries from being changed by mistake. To take something out of a library, use `desktop.copy` (the original stays).
-- A sequence or clip that's restored by an undo goes to the end of its reel. Flame's API has no way to set the order of items in a reel. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
+- A sequence or clip that's restored by an undo goes to the end of its reel. To change the order of a Desktop reel, use `desktop.reorder`. The entries that it moves get new uids. To undo a change to a sequence, flame-mcp replaces the sequence with the copy that it saved before the change. The changed sequence isn't deleted. It moves to the library for undo copies (`flame_mcp_checkpoints`).
 - The `flame_context` tool lists known pitfalls in its `pitfalls` field.
 
 ## How it works

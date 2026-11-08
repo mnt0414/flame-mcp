@@ -7,7 +7,8 @@ new intents (run with the `.venv` Python; `scripts/run_e2e.sh p3_2b_plan_delete`
 
 Checks: `plan.run` with Timeline writes (one checkpoint, one revert), `desktop.delete` and its
 revert, how `desktop.move` handles a Timeline, `journal.purge_checkpoints`, and `journal.check` of
-the new intents.
+the new intents. `desktop.delete` with `without_backup` deletes a clip with no stashed copy next to
+a stashed sequence, and its revert puts back only the sequence.
 
 The test sequences are made with the bit depth of the media, read from the clip: Flame puts a
 Resize on each segment of a sequence of another bit depth, and a new sequence otherwise gets the
@@ -38,6 +39,9 @@ Stages
      Batch reel clip / stash entry / the same thing twice / a plan are refused; an empty reel is
      deleted without a stash and the revert makes a new empty reel of the same name (where it
      lands in the group is OBSERVED); a gone parent is a CONFLICT.
+  w  desktop.delete with without_backup: one probe clip is deleted with no copy next to a stashed
+     sequence; the clip has no stash and no checkpoint; the revert puts the sequence back and
+     reports the clip as PRECONDITION_UNMET.
   m  desktop.move: the sequence in front of the shown one is moved, the Timeline stays on it.
   g  journal.purge_checkpoints: dry run by default, the unknown copy is reported and kept, a real
      run (given the dry run's token) deletes the recorded copies, a purged checkpoint cannot be
@@ -105,7 +109,7 @@ from p3_2b_e2e_common import (  # noqa: E402
     state_snapshot,
     synthetic_open_intent,
 )
-from p3_2b_e2e_delete import stage_d, stage_g, stage_m  # noqa: E402
+from p3_2b_e2e_delete import stage_d, stage_g, stage_m, stage_w  # noqa: E402
 from p3_2b_e2e_plan import stage_p  # noqa: E402
 
 from flame_mcp import execution  # noqa: E402
@@ -275,6 +279,7 @@ async def async_main(ctx: Ctx) -> None:
             for name, stage in (
                 ("p", stage_p),
                 ("d", stage_d),
+                ("w", stage_w),
                 ("m", stage_m),
                 ("k", stage_k),
                 ("r", stage_r),
@@ -340,7 +345,7 @@ def dry_run() -> int:
         except SyntaxError as exc:
             print(f"NG  {name}: {exc}")
             failures += 1
-    print(f"===== calls: {len(CALLS)}; stages: p d m k r g, prepare and z =====")
+    print(f"===== calls: {len(CALLS)}; stages: p d w m k r g, prepare and z =====")
     print(f"=== dry run: {'FAILED' if failures else 'OK'} ({failures} problem(s)) ===")
     return 1 if failures else 0
 

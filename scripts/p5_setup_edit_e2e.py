@@ -10,7 +10,8 @@ to 0, and an independent read of the setup (by transport) says 0. A second call 
 is `PRECONDITION_UNMET`, and a value with `<` is `INVALID_ARGS`; neither leaves an intent in the
 journal. `journal.revert` puts the clip back to 2. A `plan.run` of three edits on the three
 segments of one sequence is one checkpoint, and one revert puts all three back. `node.edit_setup`
-does the same on a Timewarp node of a Batch group, and its revert puts the node back.
+does the same on a Timewarp node of a Batch group, and its revert puts the node back. Given the
+`file` argument, it edits the own file of a node that saves more than one file.
 `segment.read_effect_setup` and `node.read_setup` read tags without writing, and leave no work
 folder and no journal record.
 
@@ -44,7 +45,8 @@ Stage c (the clip)
      had before.
   6. The call with `keep_files`. JUDGED: ok; the kept original / edited / read-back files are
      mode 0600 in a 0700 directory under the journal directory, the original holds 2, the edited
-     and read-back hold 0; then it is reverted. OBSERVED: how often `Value` occurs in the file.
+     and read-back hold 0; then it is reverted. JUDGED: the revert is ok and the restored clip has
+     a wiretap id, which the later steps use. OBSERVED: how often `Value` occurs in the file.
   1a. (after 1) `segment.read_effect_setup` with tags TW_FrameMode and PP5E_NoSuchTag. JUDGED: ok;
      values.TW_FrameMode is "2"; the unknown tag is null and is in result.problems; no new s_
      folder is left under the journal directory's setups/; no new intent in the journal.
@@ -65,6 +67,22 @@ Stage n (the node)
      ok; the value of LogLinTargetPixelFormat is not null and result.fileOf names `.lut_node` for
      it. OBSERVED: the value of UseLuts and whether it is null, result.fileOf, result.tagCounts,
      the files the save wrote, every problem, and whether a work folder or an intent was left.
+  4. The transport saves the Render node's setup (before). `node.edit_setup` on the Render node
+     with file `output_node`, values {SourceTime: 100} (101 when it already reads 100). JUDGED: ok;
+     result.file is `output_node`; the transport's own save of the Render node reads the new
+     `<SourceTime>` in the `.output_node` file; result.otherFilesChanged is a list. OBSERVED: the
+     files the save wrote, result.otherFilesChanged, result.otherDifferences, `degraded`.
+  5. `journal.revert` of step 4. JUDGED: ok; the transport reads the value of before.
+  6. The transport adds a Clip node to the Batch group when it has none: it first copies
+     p2_len48 (which carries a Timewarp) into the batch reel `sch` with `flame.media_panel.copy`
+     (OBSERVED: what it returned or raised, and the Clip nodes after it), and when that made no
+     Clip node it copies clip1 (no Timeline FX). `node.edit_setup` on the first Clip node with
+     file `clip_node`, values {HeadMode: 1} (2
+     when it already reads 1). JUDGED: ok; the transport's own save reads the new `<HeadMode>` in
+     the `.clip_node` file; result.otherFilesChanged is a list. OBSERVED: the value before (2 was
+     measured in a fresh Clip node of p2_len48), the files the save wrote,
+     result.otherFilesChanged.
+  7. `journal.revert` of step 6. JUDGED: ok; the transport reads the value of before.
   z  cross-cutting checks; everything this run made is deleted; flame.exit().
 """
 
@@ -147,6 +165,7 @@ CLIP_FILES: Final[tuple[tuple[str, Path], ...]] = (
 )
 """clip1 is only there for the frame rate and size the sequence is made with."""
 SOURCE_CLIP: Final[str] = "p2_len48"
+PLAIN_CLIP: Final[str] = "clip1"
 SEQUENCE_PUTS: Final[tuple[tuple[int, str, int], ...]] = (
     (0, SOURCE_CLIP, 1),
     (0, SOURCE_CLIP, 49),
@@ -164,6 +183,14 @@ RENDER_TYPE: Final[str] = "Render"
 RENDER_TAGS: Final[tuple[str, str]] = ("LogLinTargetPixelFormat", "UseLuts")
 RENDER_JUDGED_TAG: Final[str] = "LogLinTargetPixelFormat"
 RENDER_JUDGED_FILE: Final[str] = ".lut_node"
+RENDER_FILE: Final[str] = "output_node"
+RENDER_EDIT_TAG: Final[str] = "SourceTime"
+RENDER_EDIT_VALUE: Final[int] = 100
+RENDER_EDIT_OTHER: Final[int] = 101
+CLIP_FILE: Final[str] = "clip_node"
+CLIP_EDIT_TAG: Final[str] = "HeadMode"
+CLIP_EDIT_VALUE: Final[int] = 1
+CLIP_EDIT_OTHER: Final[int] = 2
 GOOD_STATES: Final[frozenset[str]] = frozenset(
     {"landed", "reverted", "conflict", "failed", "not_landed"}
 )
@@ -209,6 +236,16 @@ declare(
     },
 )
 declare("n_edit", "node.edit_setup", {"target": _NODE, "values": _VALUES})
+declare(
+    "n_edit_render",
+    "node.edit_setup",
+    {"target": _NODE, "values": {RENDER_EDIT_TAG: RENDER_EDIT_VALUE}, "file": RENDER_FILE},
+)
+declare(
+    "n_edit_clip",
+    "node.edit_setup",
+    {"target": _NODE, "values": {CLIP_EDIT_TAG: CLIP_EDIT_VALUE}, "file": CLIP_FILE},
+)
 declare(
     "c_read",
     "segment.read_effect_setup",
@@ -257,7 +294,7 @@ READ_FX_CODE: Final[str] = "\n".join(
 BATCH_CODE: Final[str] = "\n".join(
     [
         "_d = flame.projects.current_project.current_workspace.desktop",
-        "_bg = _d.create_batch_group(@NAME@)",
+        "_bg = _d.create_batch_group(@NAME@, reels=['sch'])",
         "_n = _bg.create_node(@TYPE@)",
         "_r = _bg.create_node(@RENDER@)",
         "_cur = _v(_d.current_batch_group)",
@@ -285,12 +322,36 @@ READ_NODE_CODE: Final[str] = "\n".join(
     ]
 )
 
+ADD_CLIP_NODE_CODE: Final[str] = "\n".join(
+    [
+        "_d = flame.projects.current_project.current_workspace.desktop",
+        "_bg = [_x for _x in _d.batch_groups if _v(_x.uid) == @UID@][0]",
+        "def _clip_nodes():",
+        "    return [_x for _x in _bg.nodes if str(_v(_x.type)) == 'Clip']",
+        "_had = [_v(_x.name) for _x in _clip_nodes()]",
+        "_result = {'had': _had}",
+        "if len(_had) == 0:",
+        "    _reel = [_r for _r in list(_bg.reels) if str(_v(_r.name)) == 'sch'][0]",
+        "    _fx = flame.find_by_wiretap_node_id(@FX_WT@)",
+        "    try:",
+        "        _result['fxCopyReturned'] = repr(flame.media_panel.copy(_fx, _reel))",
+        "    except BaseException as _e:",
+        "        _result['fxCopyRaised'] = type(_e).__name__ + ': ' + str(_e)",
+        "    _result['clipNodesAfterFxCopy'] = [_v(_x.name) for _x in _clip_nodes()]",
+        "    if len(_result['clipNodesAfterFxCopy']) == 0:",
+        "        _src = flame.find_by_wiretap_node_id(@WT@)",
+        "        _result['copyReturned'] = repr(flame.media_panel.copy(_src, _reel))",
+        "_result['clipNodes'] = [_v(_x.name) for _x in _clip_nodes()]",
+    ]
+)
+
 TEMPLATES: Final[dict[str, str]] = {
     "prepare": PREPARE_CODE,
     "create_fx": CREATE_FX_CODE,
     "read_fx": READ_FX_CODE,
     "batch": BATCH_CODE,
     "read_node": READ_NODE_CODE,
+    "add_clip_node": ADD_CLIP_NODE_CODE,
     "cleanup": CLEANUP_CODE,
     "left": LEFT_CODE,
 }
@@ -340,11 +401,23 @@ async def read_mode(ctx: Ctx, wiretap: str, rin: int, tag: str) -> str | None:
     return frame_mode(await read_fx(ctx, wiretap, rin, tag))
 
 
-async def read_node(ctx: Ctx, tag: str) -> dict[str, Any] | None:
+def file_tag(read: Any, ext: str, tag: str) -> str | None:
+    """The value of `tag` (once) in the file with extension `ext` of a read made by transport."""
+    if not isinstance(read, dict):
+        return None
+    files, texts = read.get("files") or [], read.get("texts") or []
+    hits = [t for f, t in zip(files, texts, strict=False) if str(f).endswith("." + ext)]
+    if len(hits) != 1:
+        return None
+    found = tag_values(hits[0], tag)
+    return found[0] if len(found) == 1 else None
+
+
+async def read_node(ctx: Ctx, tag: str, name: str | None = None) -> dict[str, Any] | None:
     code = fill(
         READ_NODE_CODE,
         UID=ctx.ids["batchUid"],
-        NAME=ctx.ids["nodeName"],
+        NAME=name if name is not None else ctx.ids["nodeName"],
         DIR=str(files_dir(ctx)),
         BASE=f"{tag}_{time.monotonic_ns()}",
     )
@@ -577,7 +650,17 @@ async def stage_c(ctx: Ctx) -> None:
             edit_args(seg_at(sel(new_wt), 0, rin), {TAG: NEW_VALUE}, keep_files=True),
         )
         await judge_kept_files(ctx, keep)
-        await revert(session, ctx, keep)
+        kept_back = await revert(session, ctx, keep)
+        kept_wt = restored_wt(kept_back)
+        rec(
+            ctx,
+            "c6a_the_revert_of_the_kept_edit_gives_the_restored_clip_a_wiretap_id",
+            kept_back.get("ok") is True and kept_wt is not None,
+            error=kept_back.get("error"),
+            wiretap=kept_wt,
+        )
+        if kept_wt:
+            ids["clipWt"][SOURCE_CLIP] = kept_wt
         observe(
             ctx,
             "c6_how_often_the_value_tag_occurs_in_the_file",
@@ -746,6 +829,124 @@ async def stage_n(ctx: Ctx) -> None:
             error=out.get("error"),
             errorCode=out.get("errorCode"),
             transport=frame_mode(back),
+        )
+        await judge_render_and_clip_edits(session, ctx, node)
+
+
+async def judge_multi_file_edit(
+    session: Any,
+    ctx: Ctx,
+    call_id: str,
+    stage: str,
+    node: dict[str, Any],
+    file: str,
+    tag: str,
+    values: tuple[int, int],
+) -> None:
+    """Edit `tag` of the node's own file `file`, judge it by the transport's own save, revert."""
+    name = node["name"]
+    before = file_tag(await read_node(ctx, f"{stage}a", name), file, tag)
+    rec(
+        ctx,
+        f"{stage}a_the_transport_reads_{tag}_of_the_{file}_file",
+        before is not None,
+        tag=before,
+    )
+    if before is None:
+        return
+    wanted = values[1] if before == str(values[0]) else values[0]
+    env = await run_call(
+        session, ctx, call_id, {"target": node, "values": {tag: wanted}, "file": file}
+    )
+    result = _result_of(env)
+    saved = await read_node(ctx, f"{stage}b", name)
+    rec(
+        ctx,
+        f"{stage}b_the_edit_of_{file}_is_ok_the_independent_read_says_{wanted}_other_files_listed",
+        env.get("ok") is True
+        and result.get("file") == file
+        and file_tag(saved, file, tag) == str(wanted)
+        and isinstance(result.get("otherFilesChanged"), list),
+        error=env.get("error"),
+        errorCode=env.get("errorCode"),
+        before=before,
+        transport=file_tag(saved, file, tag),
+        resultFile=result.get("file"),
+        otherFilesChanged=result.get("otherFilesChanged"),
+    )
+    observe(
+        ctx,
+        f"{stage}b_what_the_edit_of_{file}_said",
+        savedFiles=result.get("savedFiles"),
+        tags=result.get("tags"),
+        otherFilesChanged=result.get("otherFilesChanged"),
+        otherDifferences=result.get("otherDifferences"),
+        degraded=env.get("degraded"),
+        transportFiles=saved and saved.get("files"),
+    )
+    out = await revert(session, ctx, env)
+    back = file_tag(await read_node(ctx, f"{stage}c", name), file, tag)
+    rec(
+        ctx,
+        f"{stage}c_the_revert_puts_{tag}_back_to_{before}",
+        out.get("ok") is True and back == before,
+        error=out.get("error"),
+        errorCode=out.get("errorCode"),
+        transport=back,
+    )
+
+
+async def judge_render_and_clip_edits(session: Any, ctx: Ctx, node: dict[str, Any]) -> None:
+    render_name = ctx.ids.get("renderName")
+    if not render_name:
+        rec(ctx, "n4_the_render_node_is_ready", False, ids=sorted(ctx.ids))
+    else:
+        await judge_multi_file_edit(
+            session,
+            ctx,
+            "n_edit_render",
+            "n4",
+            {**node, "name": render_name},
+            RENDER_FILE,
+            RENDER_EDIT_TAG,
+            (RENDER_EDIT_VALUE, RENDER_EDIT_OTHER),
+        )
+    added = await tx_val(
+        ctx,
+        fill(
+            ADD_CLIP_NODE_CODE,
+            UID=ctx.ids["batchUid"],
+            FX_WT=ctx.ids["clipWt"][SOURCE_CLIP],
+            WT=ctx.ids["clipWt"][PLAIN_CLIP],
+        ),
+        "pp5e_add_clip_node",
+        MAKE_TIMEOUT_S,
+    )
+    names = added.get("clipNodes") if isinstance(added, dict) else None
+    rec(
+        ctx,
+        "n6_the_batch_group_has_a_clip_node",
+        isinstance(names, list) and len(names) >= 1,
+        added=added,
+    )
+    if isinstance(added, dict):
+        observe(
+            ctx,
+            "n6_what_media_panel_copy_of_the_clip_with_a_timewarp_into_the_schematic_reel_did",
+            fxCopyReturned=added.get("fxCopyReturned"),
+            fxCopyRaised=added.get("fxCopyRaised"),
+            clipNodesAfterFxCopy=added.get("clipNodesAfterFxCopy"),
+        )
+    if isinstance(names, list) and names:
+        await judge_multi_file_edit(
+            session,
+            ctx,
+            "n_edit_clip",
+            "n6",
+            {**node, "name": names[0]},
+            CLIP_FILE,
+            CLIP_EDIT_TAG,
+            (CLIP_EDIT_VALUE, CLIP_EDIT_OTHER),
         )
 
 

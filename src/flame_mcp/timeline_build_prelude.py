@@ -293,15 +293,17 @@ def _tb_expected_length(clip):
 
 def _tb_placement_problem(parent, version, track, at, name, length):
     # why the clip is not in the track as asked (None when it is): a media segment must start at
-    # `at`, carry the clip's name as source_name and be as long as the clip's used range
+    # `at`, carry the clip's name as source_name (an empty source_name skips that comparison)
+    # and be as long as the clip's used range
     index, found = _tl_find_at(parent, version, track, at)
     if found is None or _j(found.type) == 'Gap':
         return None, 'no media segment starts at ' + str(at) + ' in track ' + str(track)
     found_name = _v(found.source_name)
     found_length = found.record_out.frame - found.record_in.frame + 1
-    row = {'expectedName': name, 'foundName': found_name, 'expectedLength': length,
-           'foundLength': found_length}
-    if name is not None and found_name != name:
+    name_checked = name is not None and found_name != ''
+    row = {'expectedName': name, 'foundName': found_name, 'nameChecked': name_checked,
+           'expectedLength': length, 'foundLength': found_length}
+    if name_checked and found_name != name:
         return row, (
             'the segment at ' + str(at) + ' has source_name ' + repr(found_name) + ', not '
             + repr(name)
@@ -366,6 +368,11 @@ def _tb_put(parent, version, track, clip, at, mode):
             'partial: ' + mode + ' changed the sequence but the clip is not in track ' + str(track)
             + ' as asked: ' + problem + ' (read result.after.tracks to see what changed; '
             'journal.revert puts the sequence back)',
+        )
+    if not out['placement']['nameChecked']:
+        out.setdefault('degradedNotes', []).append(
+            "the segment's source_name is empty (or the clip's name could not be read), so the "
+            'placement was judged by its start and length only'
         )
     if length is None:
         out['warnings'].append(

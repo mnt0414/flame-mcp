@@ -32,7 +32,7 @@ from fake_media_tree import (
 )
 from flame_mcp import checkpoints
 from flame_mcp.journal import Index
-from flame_mcp.render_run import judge_render
+from flame_mcp.render_run import judge_render, missing_outputs
 from journal_test_helpers import BG1, Rig, make_rig
 from timeline_p32a_helpers import S1, make_timeline_rig
 
@@ -631,6 +631,113 @@ def test_a_render_node_only_render_that_gained_no_clip_is_silent_noop(rig: Rig) 
     assert env["result"]["newClips"] == [] and "gained a clip" in env["error"]
     [view] = Index(rig.records()).groups[env["journal"]["group"]]
     assert view.state() == "failed"
+
+
+def add_second_render_node(rig: Rig, destination: Any = None) -> PyRenderNode:
+    second = PyRenderNode("render2", 1, 24)
+    bg(rig).nodes.append(second)
+    second._owner = bg(rig)
+    bg(rig).connect_nodes(node(rig, "blur1"), "Default", second, "Default")
+    if destination is not None:
+        second.destination = destination
+    return second
+
+
+def land_clips(rig: Rig, *names: str) -> None:
+    shelf = bg(rig).shelf_reels[0]
+    bg(rig).render_before_write = lambda batch: shelf._children.extend(
+        PyClip(n, wiretap_id=f"/w/{n}") for n in names
+    )
+
+
+def test_fewer_clips_than_render_nodes_for_a_reel_is_reported_as_missing_outputs(
+    rig: Rig,
+) -> None:
+    add_render_node(rig)
+    add_second_render_node(rig)
+    land_clips(rig, "render1")
+    env = rig.do("render.batch", {"target": BG1})
+    assert env["ok"] is True, env
+    assert env["result"]["missingOutputs"] == [
+        {"reel": "Batch Renders", "expected": 2, "gained": 1, "nodes": ["render1", "render2"]}
+    ]
+    assert any("missingOutputs" in note for note in env["degraded"]), env["degraded"]
+
+
+def test_as_many_clips_as_render_nodes_leaves_no_missing_outputs(rig: Rig) -> None:
+    add_render_node(rig)
+    add_second_render_node(rig)
+    land_clips(rig, "render1", "render2")
+    env = rig.do("render.batch", {"target": BG1})
+    assert env["ok"] is True, env
+    assert not env["result"].get("missingOutputs")
+    assert not any("missingOutputs" in note for note in env["degraded"])
+
+
+def test_a_render_node_whose_destination_cannot_be_read_is_not_counted(rig: Rig) -> None:
+    add_render_node(rig)
+    add_second_render_node(rig, destination=("Other Kind", "x"))
+    land_clips(rig, "render1")
+    env = rig.do("render.batch", {"target": BG1})
+    assert env["ok"] is True, env
+    assert not env["result"].get("missingOutputs")
+    assert not any("missingOutputs" in note for note in env["degraded"]), env["degraded"]
+
+
+def plan_node(name: str, reel: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
+    return {
+        "name": name,
+        "kind": "render",
+        "effective": True,
+        "destinationReel": reel,
+        **extra,
+    }
+
+
+def desktop_dest(group: str = "RG", reel: str = "Reel 1", **extra: Any) -> dict[str, Any]:
+    return {"kind": "desktop", "group": group, "reel": reel, "exists": True, **extra}
+
+
+def test_a_desktop_reel_that_gained_fewer_clips_than_its_nodes_is_missing_outputs() -> None:
+    plan = {"nodes": [plan_node("a", desktop_dest()), plan_node("b", desktop_dest())]}
+    gained = [{"kind": "desktop", "name": "RG/Reel 1", "clips": ["a"]}]
+    assert missing_outputs(plan, gained) == [
+        {"reel": "RG/Reel 1", "expected": 2, "gained": 1, "nodes": ["a", "b"]}
+    ]
+
+
+def test_a_desktop_reel_that_gained_as_many_clips_as_its_nodes_is_not_listed() -> None:
+    plan = {"nodes": [plan_node("a", desktop_dest()), plan_node("b", desktop_dest())]}
+    gained = [{"kind": "desktop", "name": "RG/Reel 1", "clips": ["a", "b"]}]
+    assert missing_outputs(plan, gained) == []
+
+
+def test_a_clip_gained_by_a_reel_of_another_kind_with_the_same_name_is_not_counted() -> None:
+    plan = {"nodes": [plan_node("a", desktop_dest())]}
+    gained = [{"kind": "schematic", "name": "RG/Reel 1", "clips": ["a"]}]
+    assert missing_outputs(plan, gained)[0]["gained"] == 0
+
+
+def test_a_node_whose_reel_group_is_missing_is_not_counted() -> None:
+    plan = {"nodes": [plan_node("a", desktop_dest(groupMissing=True, exists=False))]}
+    assert missing_outputs(plan, []) == []
+
+
+def test_a_node_whose_reel_could_not_be_read_is_not_counted() -> None:
+    unread = plan_node("a", desktop_dest(exists=None))
+    listed_unknown = plan_node("b", desktop_dest("RG", "Reel 2"))
+    plan = {"nodes": [unread, listed_unknown]}
+    unknown = [{"kind": "desktop", "name": "RG/Reel 2"}]
+    assert missing_outputs(plan, [], unknown) == []
+    assert len(missing_outputs(plan, [])) == 1
+
+
+def test_a_reel_that_could_not_be_read_after_the_render_is_not_counted() -> None:
+    plan = {"nodes": [plan_node("a", desktop_dest())]}
+    unread = [{"kind": "desktop", "name": "RG/Reel 1", "clipCount": None}]
+    readable = [{"kind": "desktop", "name": "RG/Reel 1", "clipCount": 0}]
+    assert missing_outputs(plan, [], None, unread) == []
+    assert len(missing_outputs(plan, [], None, readable)) == 1
 
 
 def test_judge_render_rules() -> None:

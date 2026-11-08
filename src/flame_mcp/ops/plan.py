@@ -257,6 +257,7 @@ AUTO_SUMMARY_WRITE_STEPS: Final[int] = 10
 _POSITION_PATH: Final[tuple[str, ...]] = ("position",)
 _APPLIED_PATH: Final[tuple[str, ...]] = ("applied",)
 _NODE_PATH: Final[tuple[str, ...]] = ("node",)
+_COMPARE_PATH: Final[tuple[str, ...]] = ("changed", "changedFiles")
 BRIEF_PATHS: Final[Mapping[str, tuple[str, ...]]] = {
     "segment.trim": _POSITION_PATH,
     "segment.slip": _POSITION_PATH,
@@ -272,6 +273,7 @@ BRIEF_PATHS: Final[Mapping[str, tuple[str, ...]]] = {
     "node.edit_setup": _NODE_PATH,
     "node.set_attributes": _APPLIED_PATH,
     "batch.set_attributes": _APPLIED_PATH,
+    "batch.compare_setup": _COMPARE_PATH,
     "action.set_attributes": _APPLIED_PATH,
     "desktop.set_attributes": _APPLIED_PATH,
     "desktop.rename": _APPLIED_PATH,
@@ -449,7 +451,7 @@ def _step_summary(
     too big for the plan's answer. `detail='summary'`: {index, op, ok, errorCode, brief}, and for
     a failed step its error and its result (under the same size limits, so the reason of a
     partial application can be read). Returns (summary, bytes of result kept, was it left
-    out)."""
+    out). A result left out keeps its `brief` inside the `omitted` marker."""
     result = env.get("result")
     summarised = detail == "summary" and env.get("ok") is True
     if summarised:
@@ -475,6 +477,9 @@ def _step_summary(
             "bytes": size,
             "note": "too big for a plan's answer; run this op on its own for the full result",
         }
+        brief = _brief(str(step.op_name), result)
+        if brief is not None:
+            kept["brief"] = brief
     error = env.get("error")
     summary = {
         "index": step.index,
@@ -875,11 +880,13 @@ def register(registry: Registry) -> None:
                 "A step's result too big for the answer "
                 "(over "
                 f"{PLAN_STEP_RESULT_BYTES} bytes, or beyond {PLAN_TOTAL_RESULT_BYTES} in "
-                "total) is replaced by {omitted, bytes} (result.resultsOmitted lists them). "
+                "total) is replaced by {omitted, bytes, note}, plus the brief of an op that has "
+                "one (the same brief 'summary' gives); result.resultsOmitted lists them. "
                 "A big plan should use result_detail='summary' (the default 'auto' does so above "
                 f"{AUTO_SUMMARY_WRITE_STEPS} write steps): each step is then only its ok, "
                 "errorCode and a small brief (the position of the segment it changed, the "
-                "attributes it applied, or the node a node.create / node.duplicate made), with "
+                "attributes it applied, the node a node.create / node.duplicate made, or whether "
+                "batch.compare_setup found a change and in how many files), with "
                 "no per-step result or journal, except that a "
                 "failed step keeps its error and result (result.detail says which was used; "
                 "the timeline / batch block stays, less its `resolved` list, and "

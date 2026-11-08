@@ -232,7 +232,10 @@ def _duplicate_check(rt: Any, args: Mapping[str, Any]) -> Refusal | None:
         "PRECONDITION_UNMET",
         f"nothing was run: {why}. Flame duplicates a node only in the current Batch group "
         "('Nodes need to be in the current batch to be duplicated.'): make the group current in "
-        "Flame, then call this again.",
+        "Flame, then call this again. Or copy the node by setup: node.save_setup, node.create in "
+        "the same group (leave name out: Flame checks a new name against the nodes of the current "
+        "group), node.load_setup with the saved path, then node.connect for the inputs if "
+        "needed.",
         result={"ran": False, "group": {"name": info.get("name"), "uid": info.get("uid")}},
     )
 
@@ -499,8 +502,10 @@ def register_writes(registry: Registry) -> None:
                 "is the current one: Flame answers 'Nodes need to be in the current batch to be "
                 "duplicated.' otherwise. "
                 "So for any other group the call ends in PRECONDITION_UNMET before anything "
-                "is written or checkpointed. With keep_connections the copy keeps the "
-                "original's input links. result.node = {name, pyType, type, pos, sameNameCount} of "
+                "is written or checkpointed; copy the node there with node.save_setup, "
+                "node.create (name left out), node.load_setup and node.connect instead. "
+                "With keep_connections the copy keeps the original's input links. "
+                "result.node = {name, pyType, type, pos, sameNameCount} of "
                 "the new node (its name is Flame's choice), addedNames, sockets. No new node is "
                 "SILENT_NOOP; two or more new nodes is FLAME_API_ERROR with a message starting "
                 "`partial:` (result.addedNames lists them; journal.revert removes them). "
@@ -540,8 +545,8 @@ def register_writes(registry: Registry) -> None:
                 "node: `.clip_node`, `.clip_node_clip`, `.clip_node_format`, `.lut_node`, "
                 "`.resize`, `.resize_node`): result.files lists every file the save wrote and "
                 "result.path is the one named after the node type (`.clip_node`); a Render node "
-                "(measured on Flame 2025.2.4) writes `.output_node`, `.lut_node`, `.resize` and "
-                "`.resize_node`, and its result.path is the `.output_node`; when several "
+                "also writes several files, and its result.path is the `.output_node` file; "
+                "when several "
                 "files appear and none of them is that one, the call fails and result.files "
                 "still lists them. `path` must be absolute and its directory must exist; a file "
                 "already there under that name is refused unless overwrite=true, which "
@@ -595,7 +600,9 @@ def register_writes(registry: Registry) -> None:
                 "inside Flame (load is then not called). Every attribute of the node is read "
                 "before and after: result.changed = {key: {before, after}}, changedKeys, and "
                 "noChange=true when the load changed nothing (e.g. the node already matched the "
-                "file). " + CHECKPOINTED_NODE_NOTE + "Undo: checkpoint -- journal.revert "
+                "file). On Flame 2025.2.4 loading a Clip node's own `.clip_node` file, even "
+                "unedited, turned its UseLuts from False to True, and the next save wrote a `.lut` "
+                "file as well. " + CHECKPOINTED_NODE_NOTE + "Undo: checkpoint -- journal.revert "
                 "restores the group as saved before the load (settings included)."
             ),
             effect="reversible",

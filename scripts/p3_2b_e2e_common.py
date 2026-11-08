@@ -251,6 +251,12 @@ def _d(ids: dict[str, Any]) -> dict[str, Any]:
     return {"targets": [sel(w) for w in case(ids)["targets"]]}
 
 
+@call_for("w_delete_without_backup", "desktop.delete")
+def _dw(ids: dict[str, Any]) -> dict[str, Any]:
+    targets = [sel(w) for w in case(ids)["targets"]]
+    return {"targets": targets, "without_backup": targets[:1]}
+
+
 @call_for("d_delete_twice", "desktop.delete")
 def _d2(ids: dict[str, Any]) -> dict[str, Any]:
     wt = case(ids)["targets"][0]

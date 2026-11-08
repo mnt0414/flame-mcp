@@ -164,12 +164,16 @@ def _tl_fingerprint(obj):
     shape = []
     segment_count = 0
     effect_count = 0
+    types = set()
+    types_unread = 0
     for ver in list(obj.versions):
         tracks = []
         counts = []
         for trk in list(ver.tracks):
             rows = [_tl_segment_row(s, bad) for s in list(trk.segments)]
             segment_count += len(rows)
+            types.update(r[0] for r in rows if r[0] is not None)
+            types_unread += sum(1 for r in rows if r[0] is None)
             effect_count += sum(len(r[8]) for r in rows)
             counts.append(len(rows))
             tracks.append(rows)
@@ -181,6 +185,8 @@ def _tl_fingerprint(obj):
         'versions': shape,
         'segmentCount': segment_count,
         'effectCount': effect_count,
+        'segmentTypes': sorted(types),
+        'segmentTypesUnread': types_unread,
         'unreadable': bad[0],
     }
 

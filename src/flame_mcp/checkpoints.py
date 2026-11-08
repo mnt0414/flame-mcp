@@ -18,11 +18,15 @@ the file name and directory, and records what came back. The directory is
 its checkpoints there too). File names carry no dot: `save_setup` turns dots into
 underscores, and the glob that finds the real path is simpler without any.
 
-Files are not cleaned up here: cleanup is a human, explicit act.
+Files are not cleaned up here: cleanup is a human, explicit act. The exception is the work
+directory of `batch.compare_setup` (`run_compare_setup`), which only exists for one call (it stays
+after BRIDGE_LOST and after a TIMEOUT that Flame may have started).
 """
 
 from __future__ import annotations
 
+import re
+import shutil
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -30,14 +34,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import execution
+from flame_mcp import execution, setup_compare, setup_edit, setup_work
 from flame_mcp.journal import Journal, new_id, now_iso
+from flame_mcp.private_fs import make_private_dirs
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
 from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime, ServerContext
+    from flame_mcp.types import ErrorCode
 
 CHECKPOINT_TIMEOUT_S: Final[float] = 30.0
 """`save_setup` / `load_setup` of a big Batch take longer than an attribute write."""
@@ -66,6 +72,18 @@ DIR_ARG: Final[str] = "_dir"
 BASE_ARG: Final[str] = "_base"
 """Reserved args keys carrying the directory and file stem into `to_python`. They are not
 declared parameters, so `validate_op_args` rejects them from a caller."""
+COMPARE_DIR_PREFIX: Final[str] = "cmp"
+"""The work directory of one `batch.compare_setup` call is `<journal dir>/setups/cmp_<12 hex>`."""
+COMPARE_BASE: Final[str] = "setup"
+"""The name `batch.compare_setup` gives `save_setup`; the `.batch` it wrote is found by what the
+directory holds."""
+COMPARE_KEPT_CODES: Final[frozenset[str]] = frozenset({"TIMEOUT", "BRIDGE_LOST"})
+"""After these the work directory is left where it is: Flame may still be writing into it. A
+TIMEOUT whose `timeoutPhase` is `queued` is the exception: Flame never started the call, so the
+directory is removed."""
+QUEUED_PHASE: Final[str] = "queued"
+_COMPARE_DIR_NAME: Final[re.Pattern[str]] = re.compile(rf"{COMPARE_DIR_PREFIX}_[0-9a-f]{{12}}")
+_SECONDS_PER_DAY: Final[int] = 86400
 
 
 @dataclass(frozen=True)
@@ -261,3 +279,149 @@ def fingerprint_of(env: Mapping[str, Any]) -> str | None:
     result = env.get("result")
     value = result.get("fingerprint") if isinstance(result, dict) else None
     return value if isinstance(value, str) and value else None
+
+
+def sweep_compare_dirs(root: Path) -> None:
+    """Remove the work directories of `batch.compare_setup` under `root` that are older than
+    `setup_edit.WORKDIR_MAX_AGE_DAYS`: only a real directory (not a link) whose name is
+    `cmp_<12 hex>`. A directory that cannot be removed is left."""
+    cutoff = time.time() - setup_edit.WORKDIR_MAX_AGE_DAYS * _SECONDS_PER_DAY
+    try:
+        names = [entry.name for entry in root.iterdir()]
+    except OSError:
+        return
+    for name in names:
+        path = root / name
+        if _COMPARE_DIR_NAME.fullmatch(name) is None:
+            continue
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path)
+        except OSError:
+            continue
+
+
+def _remove_work_dir(workdir: Path) -> str | None:
+    try:
+        shutil.rmtree(workdir)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _note_cleanup_error(env: dict[str, Any], problem: str) -> None:
+    result = env.get("result")
+    if isinstance(result, dict):
+        result["cleanupError"] = problem
+    elif result is None:
+        env["result"] = {"cleanupError": problem}
+
+
+def _keeps_work_dir(env: Mapping[str, Any]) -> bool:
+    code = env.get("errorCode")
+    if code == "TIMEOUT":
+        return env.get("timeoutPhase") != QUEUED_PHASE
+    return code in COMPARE_KEPT_CODES
+
+
+def _compare_failure(
+    op: RegisteredOperation,
+    started: float,
+    result: Any,
+    message: str,
+    error_code: ErrorCode = "FLAME_API_ERROR",
+) -> dict[str, Any]:
+    return envelope_mod.build_envelope(
+        ok=False,
+        result=result,
+        error=message,
+        error_code=error_code,
+        execution=envelope_mod.execution_meta(op),
+        duration_ms=elapsed_ms(started),
+    )
+
+
+def _compared(
+    op: RegisteredOperation,
+    env: dict[str, Any],
+    baseline: str,
+    workdir: Path,
+    started: float,
+) -> dict[str, Any]:
+    raw = env.get("result")
+    saved: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    saved.pop("error", None)
+    saved.pop("saveSetupReturned", None)
+    try:
+        written = sorted(p for p in workdir.iterdir() if p.suffix == ".batch" and p.is_file())
+    except OSError as exc:
+        return _compare_failure(op, started, saved, f"the work directory could not be read ({exc})")
+    if len(written) != 1:
+        return _compare_failure(
+            op,
+            started,
+            saved,
+            f"save_setup wrote no single .batch file in the work directory; found "
+            f"{[p.name for p in written]}",
+        )
+    try:
+        compared = setup_compare.compare_setups(Path(baseline), written[0])
+    except OSError as exc:
+        return _compare_failure(
+            op,
+            started,
+            saved,
+            f"a setup file could not be read ({exc}); the baseline may have been moved or removed",
+            "PRECONDITION_UNMET",
+        )
+    env["result"] = {"baseline": baseline, **saved, **compared}
+    return env
+
+
+def run_compare_setup(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` handler of `batch.compare_setup`: Flame saves the group's setup into a work
+    directory the server made (one `save_setup`), and the comparison with `baseline` runs here, so
+    Flame's main thread is not held for it. A read: no journal record, no write lock. The work
+    directory is removed before the call ends, except after BRIDGE_LOST and after a TIMEOUT that was
+    not `queued`, when Flame may still be writing into it (a later call removes it once it is old
+    enough). A work directory that cannot be made, or a baseline that cannot be read, ends the call
+    in an envelope and not in an exception."""
+    started = time.monotonic()
+    root = Path(setup_work.work_root())
+    sweep_compare_dirs(root)
+    workdir = root / new_id(COMPARE_DIR_PREFIX)
+    try:
+        make_private_dirs(workdir)
+    except OSError as exc:
+        return _compare_failure(
+            op,
+            started,
+            None,
+            f"nothing was sent to Flame: the work directory could not be made ({exc})",
+            "POLICY_DENIED",
+        )
+    baseline = str(op_args["baseline"])
+    flame_args = {
+        **{key: value for key, value in op_args.items() if key != "baseline"},
+        DIR_ARG: str(workdir),
+        BASE_ARG: COMPARE_BASE,
+    }
+    keep = False
+    env: dict[str, Any] | None = None
+    try:
+        env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
+        if env.get("ok") is True:
+            env = _compared(op, env, baseline, workdir, started)
+        else:
+            keep = _keeps_work_dir(env)
+        return env
+    finally:
+        if not keep:
+            problem = _remove_work_dir(workdir)
+            if problem is not None and env is not None:
+                _note_cleanup_error(env, problem)

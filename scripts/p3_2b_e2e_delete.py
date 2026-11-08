@@ -1,7 +1,7 @@
-"""Stages d, m and g of the plan / delete real-Flame e2e: desktop.delete (clips, sequences, a list,
-an empty reel, a library clip refused, what the Timeline shows, the refusals, a parent that is
-gone), the Timeline after a desktop.move, and journal.purge_checkpoints; see
-p3_2b_plan_delete_e2e.py."""
+"""Stages d, w, m and g of the plan / delete real-Flame e2e: desktop.delete (clips, sequences, a
+list, without_backup, an empty reel, a library clip refused, what the Timeline shows, the
+refusals, a parent that is gone), the Timeline after a desktop.move, and
+journal.purge_checkpoints; see p3_2b_plan_delete_e2e.py."""
 
 from __future__ import annotations
 
@@ -185,6 +185,64 @@ async def stage_d(ctx: Ctx) -> None:
         await refusals(session, ctx, del_wt)
         await empty_reel_case(session, ctx)
         await parent_gone(session, ctx)
+
+
+async def stage_w(ctx: Ctx) -> None:
+    ids = ctx.ids
+    wt_reel = await make_reel(ctx, "WOB")
+    if wt_reel is None:
+        return
+    copies = await make_copies(
+        ctx, [(ids["clipWt"]["clip1"], "wob_clip"), (ids["s2Wt"], "wob_seq")], wt_reel
+    )
+    if len(copies) != 2:
+        return
+    bare, kept = copies
+    async with server_session(ctx, "p32b-w") as session:
+        stash0 = {e[3] for e in stash_rows(await tx_stash(ctx))}
+        checkpoints0 = {r["id"] for r in checkpoint_records(ctx)}
+        env = await run_call(
+            session, ctx, "w_delete_without_backup", case={"targets": [bare["wt"], kept["wt"]]}
+        )
+        res = mine(env)
+        rows = {(d.get("from") or {}).get("uid"): d for d in res.get("deleted") or []}
+        bare_row, kept_row = rows.get(bare["uid"]) or {}, rows.get(kept["uid"]) or {}
+        new_stash = [e for e in stash_rows(await tx_stash(ctx)) if e[3] not in stash0]
+        new_checkpoints = [r for r in checkpoint_records(ctx) if r["id"] not in checkpoints0]
+        rec(
+            ctx,
+            "w1_without_backup_deletes_one_with_no_copy_and_the_other_with_a_stashed_copy",
+            env.get("ok") is True
+            and await tx_find_uid(ctx, bare["uid"]) is None
+            and await tx_find_uid(ctx, kept["uid"]) is None
+            and bare_row.get("withoutBackup") is True
+            and bare_row.get("stash") is None
+            and bare_row.get("checkpoint") is None
+            and kept_row.get("withoutBackup") is False
+            and kept_row.get("stash") is not None
+            and [e[2] for e in new_stash] == [kept["name"]]
+            and [r["id"] for r in new_checkpoints] == [kept_row.get("checkpoint")],
+            error=env.get("error"),
+            stashAdded=[e[2] for e in new_stash],
+            checkpointsAdded=len(new_checkpoints),
+        )
+        back = await revert(session, ctx, env)
+        rres = mine(back)
+        restored = rres.get("reverted") or []
+        lost = rres.get("notReverted") or []
+        children = await tx_children(ctx, wt_reel)
+        rec(
+            ctx,
+            "w2_revert_puts_back_the_stashed_one_and_reports_the_other_as_precondition_unmet",
+            back.get("ok") is False
+            and back.get("errorCode") == "PRECONDITION_UNMET"
+            and [r["from"]["uid"] for r in restored] == [kept["uid"]]
+            and [r["from"]["uid"] for r in lost] == [bare["uid"]]
+            and lost[0].get("errorCode") == "PRECONDITION_UNMET"
+            and names_of(children) == [kept["name"]],
+            error=back.get("error"),
+            names=names_of(children),
+        )
 
 
 async def empty_reel_case(session: Any, ctx: Ctx) -> None:

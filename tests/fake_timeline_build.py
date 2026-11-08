@@ -32,6 +32,7 @@ from fake_media_tree import (
 from fake_segment_edit import clip_media, new_effect, put_into
 
 LOCKED = "Clip is locked."
+EMPTY_SOURCE_NAME = False  # a test sets True: the put segment then has source_name ''
 BIT_DEPTHS = (8, 10, 12, 16, 32)
 PROJECT_BIT_DEPTH = 10
 
@@ -72,7 +73,7 @@ def _segment_for(clip: PyClip, at: int) -> PySegment:
     first, last, head, tail = _used_range(clip)
     return PySegment(
         name=str(clip.name.get_value()),
-        source_name=str(clip.name.get_value()),
+        source_name="" if EMPTY_SOURCE_NAME else str(clip.name.get_value()),
         record_in=at,
         record_out=at + (last - first),
         source_in=first,

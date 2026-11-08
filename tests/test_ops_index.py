@@ -30,5 +30,5 @@ def test_the_index_shows_each_summary_sentence_whole() -> None:
     generator = _generator()
     rendered = generator.render(generator._build_registry())
     rows = [line for line in rendered.splitlines() if line.startswith("| `")]
-    assert len(rows) == 110
+    assert len(rows) == 111
     assert not [row for row in rows if row.endswith("… |")]

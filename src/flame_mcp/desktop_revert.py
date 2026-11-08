@@ -374,11 +374,12 @@ def revert_flow(
             "journal.check has settled the intent"
         ]
     if not ok:
+        hint = result.pop("hint", None) or env.get("hint")
         raise ServerOpError(
             as_error_code(str(end_code)),
             f"the revert of {view.id} failed: {env.get('error')}",
             result={"reverts": group, "group": new_group, **result},
-            hint=env.get("hint"),
+            hint=hint,
             affected=touched,
             partial=profile.partial(result) if profile.partial is not None else None,
             journal=journal_ref,

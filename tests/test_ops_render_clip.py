@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from fake_media_tree import PyClip, PyTimelineFX, PyTrack, PyVersion, adopt, uid_of
+from fake_media_tree import PyClip, PySegment, PyTimelineFX, PyTrack, PyVersion, adopt, uid_of
 from flame_mcp import server as server_mod
 from flame_mcp import transport
 from flame_mcp.journal import Index
@@ -361,6 +361,81 @@ def test_a_clip_without_timeline_fx_is_refused_and_not_called_rendered(rig: Rig)
     assert env["result"]["ran"] is False and env["result"]["effects"] == []
     assert plain.render_calls == [] and rig.records() == []
     assert plain.is_rendered_calls == []
+
+
+def clip_with_gap(
+    container: Any,
+    name: str,
+    gap_type: str = "Gap",
+    gap_effects: tuple[str, ...] = (),
+    *,
+    with_media: bool = True,
+    gap_range: tuple[int, int] = (24, 47),
+) -> PyClip:
+    media_segment = media("clip1", 0, 23, effects=(PyTimelineFX("Blur"),))
+    gap = PySegment._new_gap(*gap_range)
+    gap.type = gap_type
+    gap.effects = [PyTimelineFX(t) for t in gap_effects]
+    clip = PyClip(
+        name,
+        wiretap_id=f"{container.get_wiretap_node_id()}/{name}",
+        duration=gap_range[1] + 1,
+        versions=[PyVersion([PyTrack([media_segment, gap] if with_media else [gap])])],
+    )
+    adopt(container, [clip])
+    container._children.append(clip)
+    return clip
+
+
+def test_a_sequence_with_a_gap_batch_fx_segment_is_refused_and_not_rendered(rig: Rig) -> None:
+    gapfx = clip_with_gap(rig.handles["reel"], "GAPFX", gap_type="Gap Batch FX")
+    env = render_clip(rig, sel(gapfx))
+    assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET", env
+    assert "Gap Batch FX" in env["error"] and "lift" in env["hint"]
+    result = env["result"]
+    assert result["ran"] is False
+    assert result["gapBatchFx"] == [{"version": 0, "track": 0, "recordIn": 24, "recordOut": 47}]
+    assert gapfx.render_calls == [] and rig.records() == []
+
+
+def test_a_sequence_whose_only_segment_is_a_gap_batch_fx_gets_the_gap_batch_fx_refusal(
+    rig: Rig,
+) -> None:
+    only = clip_with_gap(
+        rig.handles["reel"],
+        "GAPONLY",
+        gap_type="Gap Batch FX",
+        with_media=False,
+        gap_range=(0, 100),
+    )
+    env = render_clip(rig, sel(only))
+    assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET", env
+    assert "Gap Batch FX" in env["error"] and "no Timeline FX" not in env["error"]
+    assert env["result"]["gapBatchFx"] == [
+        {"version": 0, "track": 0, "recordIn": 0, "recordOut": 100}
+    ]
+    assert only.render_calls == [] and rig.records() == []
+
+
+def test_a_plain_gap_does_not_stop_the_render(rig: Rig) -> None:
+    plain_gap = clip_with_gap(rig.handles["reel"], "GAPPLAIN")
+    env = render_clip(rig, sel(plain_gap))
+    assert env["ok"] is True, env
+    assert plain_gap.render_calls != []
+
+
+def test_a_gap_with_an_ordinary_timeline_fx_does_not_stop_the_render(rig: Rig) -> None:
+    gap = clip_with_gap(rig.handles["reel"], "GAPTEXT", gap_effects=("Text",))
+    env = render_clip(rig, sel(gap))
+    assert env["ok"] is True, env
+    assert gap.render_calls != []
+
+
+def test_force_does_not_lift_the_gap_batch_fx_refusal(rig: Rig) -> None:
+    gapfx = clip_with_gap(rig.handles["reel"], "GAPFX", gap_type="Gap Batch FX")
+    env = render_clip(rig, sel(gapfx), force=True)
+    assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET", env
+    assert gapfx.render_calls == []
 
 
 def test_a_clip_that_is_already_rendered_is_refused_and_force_renders_it_again(

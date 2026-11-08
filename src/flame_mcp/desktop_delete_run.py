@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 DELETE_OP: Final[str] = "desktop.delete"
 SNAPSHOT_ARG: Final[str] = "_snapshot"
 PHASE_STASH: Final[str] = "stash"
+SKIP_ARG: Final[str] = "_skip_stash"
 """Reserved args key / phase only this module puts into the op's args (a caller cannot send them:
 `validate_op_args` rejects an unknown key)."""
 
@@ -87,6 +88,10 @@ REEL_NOTE: Final[str] = (
     "reel group that already has a reel of that name is a CONFLICT. A schematic reel of a Batch "
     "group is made again the same way with PyBatch.create_reel at the end of the group's "
     "schematic reels."
+)
+WITHOUT_BACKUP_NOTE: Final[str] = (
+    "Deleted with no stashed copy (without_backup): {names}. journal.revert cannot put them back "
+    "(they come back as notRestored with PRECONDITION_UNMET); the others are as described."
 )
 DELETE_REVERT_NOTE: Final[str] = (
     "The things were copied back into their old parents from their stashed copies: each has a NEW "
@@ -149,13 +154,67 @@ def stash_record(rt: Any, op: RegisteredOperation, group_id: str, stash: Mapping
     return checkpoint_id
 
 
+def _skip_and_refusal(
+    op: RegisteredOperation, op_args: dict[str, Any], rows: list[dict[str, Any]]
+) -> tuple[list[int], dict[str, Any] | None]:
+    """The indexes of the targets named in without_backup (no copy is taken), and the refusal of
+    a call that holds a clip that cannot be copied without being named there."""
+    without = op_args.get("without_backup") or []
+    skip = [i for i, t in enumerate(op_args["targets"]) if t in without]
+    unstashable = [
+        {"index": i, "name": row.get("name"), "uid": row.get("uid")}
+        for i, row in enumerate(rows)
+        if row.get("noMedia") is True and i not in skip
+    ]
+    if not unstashable:
+        return skip, None
+    return skip, _refuse(
+        op,
+        "PRECONDITION_UNMET",
+        f"{len(unstashable)} clip(s) hold only Gap Batch FX (and Gap) segments and have no "
+        "media to copy; on Flame 2025.2.4 the copy into the stash of a clip whose only "
+        "segment is a Gap Batch FX raised 'Invalid source entries supplied.'; nothing was "
+        "copied or deleted (result.unstashable lists them)",
+        result={"ran": False, "unstashable": unstashable},
+        hint="After the user confirms that they may be deleted with no way back, name them "
+        "in without_backup.",
+    )
+
+
+def _copy_failure(
+    op: RegisteredOperation, env: dict[str, Any], value: Mapping[str, Any], ids: list[str | None]
+) -> dict[str, Any]:
+    recorded = [i for i in ids if i is not None]
+    failure = dict(env)
+    failure["execution"] = envelope_mod.execution_meta(op)
+    failure["error"] = (
+        f"nothing was deleted: the copy that makes the delete revertible failed "
+        f"({env.get('error')}); {len(recorded)} copy(ies) made before it are recorded as "
+        f"checkpoint(s) {recorded}"
+    )
+    if value.get("failed"):
+        failure["error"] += (
+            ". To delete the thing whose copy failed with no copy (it then cannot be put "
+            "back by journal.revert), name its selector in without_backup, after the user "
+            "has confirmed"
+        )
+    failure["ok"] = False
+    if not failure.get("errorCode"):
+        failure["errorCode"] = "FLAME_API_ERROR"
+    return failure
+
+
 def _prepare(
     rt: Any, op: RegisteredOperation, op_args: dict[str, Any], pre: dict[str, Any], group_id: str
 ) -> dict[str, Any] | None:
     """Copy every target into the stash and record the copies as checkpoints (nothing is deleted
     yet). A copy that failed ends the call; the copies made before it stay recorded."""
     rows = pre.get("sources") or []
+    skip, refusal = _skip_and_refusal(op, op_args, rows)
+    if refusal is not None:
+        return refusal
     args = dict(op_args)
+    args[SKIP_ARG] = skip
     args["targets"] = [
         row.get("selector") if isinstance(row.get("selector"), dict) else original
         for original, row in zip(op_args["targets"], rows, strict=True)
@@ -185,18 +244,7 @@ def _prepare(
             "are in the checkpoint library (journal.purge_checkpoints lists them as unknown).",
         )
     if env.get("ok") is not True or len(stashes) != len(rows):
-        recorded = [i for i in ids if i is not None]
-        failure = dict(env)
-        failure["execution"] = envelope_mod.execution_meta(op)
-        failure["error"] = (
-            f"nothing was deleted: the copy that makes the delete revertible failed "
-            f"({env.get('error')}); {len(recorded)} copy(ies) made before it are recorded as "
-            f"checkpoint(s) {recorded}"
-        )
-        failure["ok"] = False
-        if not failure.get("errorCode"):
-            failure["errorCode"] = "FLAME_API_ERROR"
-        return failure
+        return _copy_failure(op, env, value, ids)
     pre["stashed"] = [{**stash, "checkpoint": cp} for stash, cp in zip(stashes, ids, strict=True)]
     return None
 
@@ -221,6 +269,7 @@ def _stable_args(
             "stash": st.get("stash"),
             "batchReel": (row.get("parent") or {}).get("type") == "PyBatch",
             "batchUid": (row.get("parent") or {}).get("uid"),
+            "withoutBackup": bool(st.get("withoutBackup")),
         }
         for row, st in zip(rows, stashed, strict=True)
     }
@@ -271,6 +320,9 @@ def _intent_record(
             }
             for st in stashed
         ],
+        "withoutBackup": [
+            (st.get("source") or {}).get("uid") for st in stashed if st.get("withoutBackup")
+        ],
         "checkpoints": [st.get("checkpoint") for st in stashed if st.get("checkpoint")],
         "shown": pre.get("shown"),
     }
@@ -300,8 +352,12 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
     reels = [
         d for d in deleted if isinstance(d, dict) and (d.get("from") or {}).get("type") == "PyReel"
     ]
+    lost = [d for d in deleted if isinstance(d, dict) and d.get("withoutBackup") is True]
     added = []
-    if len(reels) < len(deleted):
+    if lost:
+        names = ", ".join(repr((d.get("from") or {}).get("name")) for d in lost)
+        added.append(WITHOUT_BACKUP_NOTE.format(names=names))
+    if len(reels) + len(lost) < len(deleted):
         added.append(DELETE_NOTE)
     if reels:
         added.append(REEL_NOTE)
@@ -431,6 +487,7 @@ def _alive_args(items: list[dict[str, Any]]) -> dict[str, Any]:
 def _created_from_intent(view: IntentView) -> dict[str, Any]:
     intent = view.intent
     stashes = {s.get("uid"): s for s in intent.get("stashes") or [] if isinstance(s, dict)}
+    without = intent.get("withoutBackup") or []
     deletes = []
     for source in intent.get("sources") or []:
         stash = stashes.get(source.get("uid")) or {}
@@ -448,6 +505,7 @@ def _created_from_intent(view: IntentView) -> dict[str, Any]:
                 "fingerprint": source.get("fingerprint"),
                 "segmentCount": source.get("segmentCount"),
                 "wasDisplayed": source.get("displayed"),
+                "withoutBackup": source.get("uid") in without,
             }
         )
     return {"deletes": deletes}

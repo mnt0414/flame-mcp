@@ -1,11 +1,15 @@
-"""Batch checkpoints: `batch.checkpoint` / `batch.fingerprint` / `batch.load_setup`
-run in Flame; `journal.restore_checkpoint` / `journal.list_checkpoints` run on the server.
+"""Batch checkpoints: `batch.checkpoint` / `batch.fingerprint` / `batch.load_setup` /
+`batch.compare_setup` run in Flame; `journal.restore_checkpoint` / `journal.list_checkpoints` run
+on the server.
 
 `batch.checkpoint` is `create` with no undo of its own (it only writes a file); the server
 wraps its call to journal the checkpoint (`checkpoints.run_checkpoint`). `batch.load_setup`
 is the one public way to replace a group's contents from a setup file; it never calls Flame's
 `load_setup` on a path that is not a file, because a failed load empties the group (measured on
 Flame 2025.2.4: `load_setup` on a missing path raised and left the group empty).
+`batch.compare_setup` is a read: Flame saves the setup once into a work directory the server
+made and the comparison with an earlier `.batch` file runs in the server
+(`checkpoints.run_compare_setup`, `setup_compare`).
 The rest -- what a restore does, in what order -- is in `restore.py`.
 """
 
@@ -15,7 +19,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from flame_mcp import selectors
+from flame_mcp import selectors, setup_compare
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
 from flame_mcp.checkpoints import (
     BASE_ARG,
@@ -28,10 +32,12 @@ from flame_mcp.checkpoints import (
     TIMELINE_KIND,
     kind_named,
     run_checkpoint,
+    run_compare_setup,
 )
 from flame_mcp.clip_order import CLIP_ORDER_NOTE
 from flame_mcp.journal import Index
 from flame_mcp.ops._common import build_source, limit_param, offset_param
+from flame_mcp.ops._segment_edit import no_undo_steps
 from flame_mcp.registry import Registry
 from flame_mcp.restore import restore_checkpoint, run_load_setup
 from flame_mcp.runtime import ServerContext
@@ -112,6 +118,94 @@ def _fingerprint_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | Non
             f"unknown fingerprint section(s) {unknown}; known: {list(FINGERPRINT_SECTIONS)}",
         )
     return None
+
+
+def _compare_to_python(args: Mapping[str, Any]) -> str:
+    directory, base = args.get(DIR_ARG), args.get(BASE_ARG)
+    return build_source(
+        selectors.resolve_code(args["target"], "target"),
+        "\n".join(
+            [
+                f"_result = _save_for_compare(target, {directory!r}, {base!r})",
+                "_result['stable'] = _batch_selector(target)",
+                "if _result['error'] is not None:",
+                "    raise _OpError('FLAME_API_ERROR', _result['error'])",
+            ]
+        ),
+    )
+
+
+def _compare_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
+    """Refuse a `baseline` that is not an existing `.batch` file with its directory beside it;
+    nothing is sent to Flame."""
+    baseline = str(args.get("baseline") or "")
+    suffix = ".batch"
+    if (
+        not os.path.isabs(baseline)
+        or not baseline.endswith(suffix)
+        or os.path.basename(baseline) == suffix
+    ):
+        return Refusal(
+            "INVALID_ARGS",
+            f"baseline must be the absolute path of a .batch file: {baseline!r}",
+        )
+    if not os.path.isfile(baseline):
+        return Refusal(
+            "PRECONDITION_UNMET", f"nothing was sent to Flame: no setup file at {baseline!r}"
+        )
+    directory = baseline.removesuffix(suffix)
+    if not os.path.isdir(directory):
+        return Refusal(
+            "PRECONDITION_UNMET",
+            f"nothing was sent to Flame: the setup's directory {directory!r} is not beside "
+            f"{baseline!r}",
+        )
+    return None
+
+
+_COMPARE_DESCRIPTION = (
+    "Compare a Batch group's current setup with an earlier saved one and list the lines that "
+    "changed; the project is not changed. "
+    "Save the earlier setup with batch.save_setup or batch.checkpoint (result.path) and pass its "
+    "`.batch` file as `baseline`: an absolute path of an existing file whose directory of the "
+    "same name is beside it, else nothing is sent to Flame (INVALID_ARGS, PRECONDITION_UNMET). "
+    "The group need not be current. Flame saves the group's setup once into a work directory of "
+    "the server's own and the comparison runs in the server; the directory is removed before the "
+    "call ends (result.cleanupError says so if it could not be), stays after BRIDGE_LOST and "
+    "after a TIMEOUT that is not queued, and one older than 7 days is removed by a later call. "
+    "No checkpoint, no journal record. "
+    "After a TIMEOUT or BRIDGE_LOST call it again with the same arguments: it only reads, and "
+    "journal.poll does not give the comparison. A baseline that vanished after the check ends in "
+    "PRECONDITION_UNMET; a work directory the server cannot make, in POLICY_DENIED. "
+    "result: changed, filesCompared, changedFiles, files, truncated, baseline, batch, stable. "
+    "files lists each file that differs, the `.batch` file first and then by name, as {file, "
+    "status 'changed' | 'added' | 'removed'}. A changed file has lineCount (the lines that "
+    "differ) and hunks [{where {node, channel}, before [lines], after [lines]}]: node is the "
+    "nearest `Name` line (or `<NAME>` / `<Name>` tag) above the change and channel the nearest "
+    "`Channel` line (or `<Channel Name=...>` tag) between that node and the change, null when "
+    "there is none; lines are trimmed and cut to "
+    f"{setup_compare.MAX_LINE_CHARS} characters, and before and after to "
+    f"{setup_compare.MAX_HUNK_LINES} lines each (the hunk then has truncated true, lineCount "
+    "still counts them all). A file whose changed middle, once the common head and tail are "
+    f"left out, is over {setup_compare.MAX_DIFF_LINES} lines on either side has no hunks and "
+    "tooLargeToList true; a file that is not UTF-8 text, or holds a control character other than "
+    "tab and line breaks, has notText true. "
+    f"At most {setup_compare.MAX_HUNKS_PER_FILE} hunks per file and "
+    f"{setup_compare.MAX_LISTED_FILES} files are listed; truncated is true when some were left "
+    "out, and changedFiles and lineCount still count them all. "
+    "Not compared, because they change while no value changes: MV.json (the view layout), the "
+    "time of the save, the frame the Batch or a node is on, clip ids that only live in memory, "
+    "whether a section is open, the position and size of nodes in the schematic, the first Value "
+    "of a channel that has keys, and the Flags bits 6, 7, 18, 19, 24 and 26 of the `.batch` file "
+    "(any other Flags bit is a change). A value changed by hand shows here though "
+    "batch.fingerprint stays the same. Timeline FX of a reel clip are not in a Batch setup, so a "
+    "change to them is not found here; a Timewarp node's own setup is."
+)
+
+_VALUES_NOTE = (
+    " It does not look at values; to find a value that changed, compare setups with "
+    "batch.compare_setup."
+)
 
 
 def _load_setup_to_python(args: Mapping[str, Any]) -> str:
@@ -198,7 +292,7 @@ def register(registry: Registry) -> None:
                 "hash of the group's nodes (name, type) and input wiring, and of the inner "
                 "nodes (name, type) of Action / Image / GMask Tracer nodes. Changes nothing in "
                 "Flame. Files go to <journal dir>/checkpoints/ and are never deleted here. "
-                "Restore with journal.restore_checkpoint."
+                "Restore with journal.restore_checkpoint." + _VALUES_NOTE
             ),
             effect="create",
             undo="none",
@@ -242,7 +336,7 @@ def register(registry: Registry) -> None:
                 "reels / shelf reels / iterations; `attributes` adds every node's attribute "
                 "values). Also nodeCount, "
                 "connectionCount, unreadableNodes; include_nodes adds the hashed list; "
-                "`stable` addresses the group by uid."
+                "`stable` addresses the group by uid." + _VALUES_NOTE
             ),
             effect="read",
             params=(
@@ -273,6 +367,35 @@ def register(registry: Registry) -> None:
             to_python=_fingerprint_to_python,
             precheck=_fingerprint_precheck,
             requires=("PyBatch.nodes", "PyBatch.uid", "PyNode.sockets"),
+        )
+    )
+    registry.register(
+        OperationSpec(
+            name="batch.compare_setup",
+            category="batch",
+            description=_COMPARE_DESCRIPTION,
+            effect="read",
+            undo="none",
+            params=(
+                _TARGET,
+                OperationParam(
+                    name="baseline",
+                    type="string",
+                    description=(
+                        "Absolute path of the earlier `.batch` file (batch.save_setup, "
+                        "batch.checkpoint result.path); the directory of the same name must be "
+                        "beside it."
+                    ),
+                    required=True,
+                    non_empty=True,
+                ),
+            ),
+            accepts=("batch",),
+            to_python=_compare_to_python,
+            precheck=_compare_precheck,
+            undo_steps=no_undo_steps,
+            wrap=run_compare_setup,
+            requires=("PyBatch.save_setup", "PyBatch.uid", "PyBatch.name"),
         )
     )
     registry.register(

@@ -31,7 +31,10 @@ _DESCRIPTION = (
     "(BRIDGE_UNAVAILABLE or TIMEOUT). Make timeout_s long enough for the whole render: this "
     "server has no op to stop a render. "
     "Refused before anything is rendered or journaled (PRECONDITION_UNMET, result.ran false): a "
-    "clip in a library; a clip without Timeline FX (result.effects is empty); a clip that "
+    "clip in a library; a sequence with a Gap Batch FX segment ("
+    "one whose PySegment.type reads 'Gap Batch FX', as on Flame 2025.2.4; result.gapBatchFx "
+    "lists them, and force=true does not lift this); a clip without Timeline "
+    "FX (result.effects is empty); a clip that "
     "is_rendered() already reads true for, unless force=true. A target that is not a PyClip or "
     "PySequence is SELECTOR_TYPE. "
     "is_rendered() is read before and after the render (result.isRenderedBefore / "
@@ -184,6 +187,7 @@ def register(registry: Registry) -> None:
                 "PyVersion.tracks",
                 "PyTrack.segments",
                 "PySegment.effects",
+                "PySegment.type",
                 "PyTimelineFX.type",
             ),
         )

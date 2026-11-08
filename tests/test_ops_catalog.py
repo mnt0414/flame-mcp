@@ -1,6 +1,6 @@
 """Completion check of the op catalog.
 
-The 110 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
+The 111 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
 the actual MCP tool surface, and READONLY hides/rejects exactly the write ops (`desktop.rename`
 and every `*.set_attributes`) in all 3 policy checkpoints. No bridge/socket is needed here:
 `flame_catalog`/`flame_do`'s POLICY_DENIED path and `tools/list` never touch the bridge.
@@ -25,7 +25,7 @@ from flame_mcp.registry import Registry, sample_selector_for
 from flame_mcp.server import create_server
 from flame_mcp.types import SelectorKind
 
-PROJECTED_OP_COUNT = 110
+PROJECTED_OP_COUNT = 111
 """The number of real ops the listing is projected for; the whole listing must still fit."""
 PROJECTED_BUDGET_SHARE = 0.8
 LISTING_KEYS = {"name", "category", "effect", "undo", "summary", "params", "accepts"}
@@ -91,6 +91,7 @@ EXPECTED_OP_NAMES = {
     "plan.run",
     "batch.checkpoint",
     "batch.fingerprint",
+    "batch.compare_setup",
     "batch.load_setup",
     "journal.restore_checkpoint",
     "journal.list_checkpoints",
@@ -268,7 +269,7 @@ def _structured(result: Any) -> dict[str, Any]:
 
 def test_registered_op_count_is_103() -> None:
     registry = make_full_registry()
-    assert len(registry.list_ops()) == 110
+    assert len(registry.list_ops()) == 111
     assert {op.name for op in registry.list_ops()} == EXPECTED_OP_NAMES
 
 

@@ -200,7 +200,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages a-h, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages a-i, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p2_3d_desktop",
@@ -320,7 +320,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         None,
         "600",
-        "(setup, stages p, d, m, k, r, g, z; each stage starts a flame_mcp subprocess)",
+        "(setup, stages p, d, w, m, k, r, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p3_3_segment",

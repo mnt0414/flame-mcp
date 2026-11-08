@@ -126,6 +126,23 @@ def preflight_problems(
                 ),
             }
         )
+    for node in plan.get("nodes") or []:
+        if node.get("kind") != "render" or node.get("bypass") is True:
+            continue
+        if node.get("wiredInputs") == 0:
+            name = node.get("name")
+            problems.append(
+                {
+                    "code": "render_node_unwired",
+                    "node": name,
+                    "message": (
+                        f"{name!r}: a Render node with no input connected: PyBatch.render "
+                        "raises 'Render failed.' while the other nodes still write their "
+                        "clips; connect an input (node.connect) or delete the node "
+                        "(node.delete)"
+                    ),
+                }
+            )
     total = 0
     for node in effective:
         name = node.get("name")

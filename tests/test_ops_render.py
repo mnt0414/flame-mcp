@@ -28,6 +28,7 @@ from fake_media_tree import (
 from flame_mcp import render_files, transport
 from flame_mcp.journal import Index, IntentView
 from flame_mcp.policy import Policy
+from flame_mcp.render_plan import preflight_problems
 from flame_mcp.transport import BridgeProtocolError, BridgeResult
 from journal_test_helpers import BG1, FakeBridge, Rig, bridge_result, make_rig
 
@@ -1983,3 +1984,58 @@ def test_the_descriptions_say_destination_reel_is_a_prediction_and_newclips_is_t
         assert "destinationReel is a prediction" in op.description, name
         assert "Flame chooses the name of a Desktop reel" in op.description, name
         assert "result.newClips" in op.description, name
+
+
+def would_refuse(rig: Rig) -> list[dict[str, Any]]:
+    plan = rig.do("render.plan", {"target": BG1})["result"]
+    return list(plan["summary"]["wouldRefuse"])
+
+
+def test_a_render_node_with_no_input_is_refused_before_anything_is_written(rig: Rig) -> None:
+    add_render_node(rig, "r_a")
+    add_render_node(rig, "r_b", connected=False)
+    env = render(rig)
+    assert_nothing_happened(rig, env)
+    problems = env["result"]["problems"]
+    assert [p["code"] for p in problems] == ["render_node_unwired"]
+    assert problems[0]["node"] == "r_b"
+    assert "node.connect" in env["error"]
+
+
+def test_the_plan_lists_a_render_node_with_no_input_as_would_refuse(rig: Rig) -> None:
+    add_render_node(rig, "r_a")
+    add_render_node(rig, "r_b", connected=False)
+    refusals = would_refuse(rig)
+    assert [(p["code"], p["node"]) for p in refusals] == [("render_node_unwired", "r_b")]
+
+
+def test_a_write_file_with_no_input_is_not_flagged_as_an_unwired_render_node(
+    rig: Rig, tmp_path: Path
+) -> None:
+    add_writer(rig, tmp_path, "w_ok", last=4)
+    add_writer(rig, tmp_path, "w_loose", last=4, connected=False)
+    env = render(rig)
+    assert env["ok"] is True, env
+    assert "render_node_unwired" not in [p["code"] for p in would_refuse(rig)]
+
+
+def test_a_bypassed_render_node_with_no_input_is_not_flagged(rig: Rig) -> None:
+    add_render_node(rig, "r_a")
+    add_render_node(rig, "r_bypassed", connected=False, bypass=True)
+    assert "render_node_unwired" not in [p["code"] for p in would_refuse(rig)]
+
+
+def test_a_render_node_whose_wiring_cannot_be_read_is_not_flagged() -> None:
+    plan = {"nodes": [{"name": "r_x", "kind": "render", "bypass": False, "wiredInputs": None}]}
+    problems = preflight_problems(plan, max_frames=1000, allow_default_path=False)
+    assert [p["code"] for p in problems] == ["no_effective_node"]
+
+
+def test_a_group_whose_only_node_is_an_unwired_render_node_gives_both_refusals(rig: Rig) -> None:
+    add_render_node(rig, "r_only", connected=False)
+    env = render(rig)
+    assert_nothing_happened(rig, env)
+    assert [(p["code"], p["node"]) for p in env["result"]["problems"]] == [
+        ("no_effective_node", None),
+        ("render_node_unwired", "r_only"),
+    ]

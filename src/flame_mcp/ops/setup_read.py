@@ -67,8 +67,8 @@ _SEGMENT_DESCRIPTION = (
 _NODE_DESCRIPTION = (
     "Read the value of tags in a Batch node's setup file (PyNode.save_node_setup into a work "
     "file); the project is not changed. The group need not be current. Example: a Timewarp "
-    "node, tags ['TW_FrameMode']. A Render node (measured on Flame 2025.2.4) writes "
-    "`.output_node`, `.lut_node`, `.resize` and `.resize_node`; its `.lut_node` holds "
+    "node, tags ['TW_FrameMode']. A Render node writes "
+    "several files; its `.lut_node` holds "
     "LogLinTargetPixelFormat (137 for 10-bit). " + _READ_NOTE + "result also has node."
 )
 

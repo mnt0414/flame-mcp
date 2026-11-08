@@ -274,6 +274,14 @@ def _dd_check_target(obj, label, library_name):
     return parent
 
 
+def _dd_no_media(obj, fp):
+    # a clip of Gap Batch FX (and Gap) segments only: its stash copy raises on Flame 2025.2.4
+    if type(obj).__name__ != 'PyClip' or fp.get('segmentTypesUnread', 0) != 0:
+        return False
+    kinds = fp.get('segmentTypes', [])
+    return 'Gap Batch FX' in kinds and all(k in ('Gap Batch FX', 'Gap') for k in kinds)
+
+
 def _dd_snapshot(targets, library_name):
     rows = []
     seen = []
@@ -303,6 +311,7 @@ def _dd_snapshot(targets, library_name):
         row['fingerprint'] = fp['fingerprint']
         row['segmentCount'] = fp['segmentCount']
         row['effectCount'] = fp['effectCount']
+        row['noMedia'] = _dd_no_media(obj, fp)
         row['displayed'] = _tl_is_displayed(obj)
         row['location'] = _tl_location(obj)
         rows.append(row)
@@ -318,7 +327,23 @@ def _dd_snapshot(targets, library_name):
     }
 
 
-def _dd_stash(targets, library_name, reel_name):
+def _dd_stash_row(i, source, fp, **over):
+    row = {
+        'index': i,
+        'source': source,
+        'stash': None,
+        'fingerprint': fp['fingerprint'],
+        'segmentCount': fp['segmentCount'],
+        'effectCount': fp['effectCount'],
+        'displayed': False,
+        'display': None,
+        'withoutBackup': False,
+    }
+    row.update(over)
+    return row
+
+
+def _dd_stash(targets, library_name, reel_name, skip):
     out = {
         'stashes': [],
         'libraryCreated': False,
@@ -329,19 +354,13 @@ def _dd_stash(targets, library_name, reel_name):
     }
     for i, obj in enumerate(targets):
         if type(obj).__name__ == 'PyReel':
+            out['stashes'].append(_dd_stash_row(i, _tl_ident(obj), _dd_fingerprint(obj)))
+            continue
+        if i in skip:
             fp = _dd_fingerprint(obj)
-            out['stashes'].append(
-                {
-                    'index': i,
-                    'source': _tl_ident(obj),
-                    'stash': None,
-                    'fingerprint': fp['fingerprint'],
-                    'segmentCount': 0,
-                    'effectCount': 0,
-                    'displayed': False,
-                    'display': None,
-                }
-            )
+            displayed = _tl_is_displayed(obj)
+            row = _dd_stash_row(i, _tl_ident(obj), fp, displayed=displayed, withoutBackup=True)
+            out['stashes'].append(row)
             continue
         try:
             res = _tl_stash_copy(obj, library_name, reel_name)
@@ -359,16 +378,14 @@ def _dd_stash(targets, library_name, reel_name):
             out['errorCode'] = res['errorCode']
             return out
         out['stashes'].append(
-            {
-                'index': i,
-                'source': res['source'],
-                'stash': res['stash'],
-                'fingerprint': res['fingerprint'],
-                'segmentCount': res['segmentCount'],
-                'effectCount': res['effectCount'],
-                'displayed': res['displayed'],
-                'display': res['display'],
-            }
+            _dd_stash_row(
+                i,
+                res['source'],
+                res,
+                stash=res['stash'],
+                displayed=res['displayed'],
+                display=res['display'],
+            )
         )
     return out
 
@@ -394,7 +411,11 @@ def _dd_delete_conflicts(targets, uids, snapshot, expected):
     for obj, uid in zip(targets, uids):
         name = _try(lambda o=obj: _v(o.name))
         info = snapshot.get(uid)
-        if info is None:
+        if info is None or (
+            type(obj).__name__ != 'PyReel'
+            and info.get('stash') is None
+            and not info.get('withoutBackup')
+        ):
             problems.append(repr(name) + ' (uid ' + str(uid) + ') has no stashed copy on record')
             continue
         if info.get('batchReel'):
@@ -436,6 +457,7 @@ def _dd_delete_one(obj, uid, info, shown_before):
         },
         'checkpoint': info.get('checkpoint'),
         'stash': info.get('stash'),
+        'withoutBackup': bool(info.get('withoutBackup')),
         'fingerprint': info.get('fingerprint'),
         'segmentCount': info.get('segmentCount'),
         'wasDisplayed': shown_before is not None and shown_before['uid'] == uid,
@@ -463,6 +485,7 @@ def _dd_unread_one(obj, uid, info, shown_before, exc):
         },
         'checkpoint': info.get('checkpoint'),
         'stash': info.get('stash'),
+        'withoutBackup': bool(info.get('withoutBackup')),
         'fingerprint': info.get('fingerprint'),
         'segmentCount': info.get('segmentCount'),
         'wasDisplayed': shown_before is not None and shown_before['uid'] == uid,
@@ -649,6 +672,16 @@ def _dd_revert_reel(item):
 
 def _dd_revert_one(item):
     origin = item.get('from') or {}
+    if item.get('withoutBackup'):
+        return None, {
+            'from': origin,
+            'checkpoint': None,
+            'stash': None,
+            'reason': 'it was deleted without a stashed copy (without_backup), so it cannot be '
+            'put back',
+            'errorCode': 'PRECONDITION_UNMET',
+            'withoutBackup': True,
+        }
     if origin.get('type') == 'PyReel':
         return _dd_revert_reel(item)
     stash_row = item.get('stash') or {}
@@ -728,6 +761,12 @@ def _dd_revert(created):
                 repr((r['from'] or {}).get('name')) + ' ' + r['reason'] for r in out['notReverted']
             )
         )
+        if any(r.get('withoutBackup') for r in out['notReverted']):
+            out['hint'] = (
+                'The items in notReverted with withoutBackup true were deleted with no stashed '
+                'copy (without_backup); no retry of journal.revert can put them back. For any '
+                'others, see their reason.'
+            )
     return out
 """
 

@@ -576,6 +576,8 @@ def test_duplicate_in_a_group_that_is_not_current_is_refused_before_anything_is_
     env = rig.do("node.duplicate", {"target": BLUR})
     assert env["errorCode"] == "PRECONDITION_UNMET" and "not the current one" in env["error"]
     assert "Nodes need to be in the current batch" in env["error"]
+    assert "node.save_setup" in env["error"] and "node.create" in env["error"]
+    assert "node.load_setup" in env["error"] and "node.connect" in env["error"]
     assert env["result"]["ran"] is False
     assert env["result"]["group"] == {"name": "BG1", "uid": "uid-b1"}
     assert left_nothing_behind(rig) and "node.duplicate" not in sent(rig)

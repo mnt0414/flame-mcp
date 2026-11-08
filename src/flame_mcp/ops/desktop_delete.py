@@ -10,6 +10,7 @@ from flame_mcp import selectors
 from flame_mcp.desktop_delete_run import (
     DELETE_OP,
     PHASE_STASH,
+    SKIP_ARG,
     SNAPSHOT_ARG,
     run_delete,
 )
@@ -40,8 +41,8 @@ _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
 _DESCRIPTION = (
     "Delete clips / sequences, and empty reels: a reel of a Desktop reel group, or a schematic "
-    "reel of a Batch group (flame.delete, confirm=False). Each clip / sequence is first copied "
-    "into the "
+    "reel of a Batch group (flame.delete, confirm=False). Each clip / sequence, except "
+    "those named in without_backup, is first copied into the "
     f"stash reel of the checkpoint library ('{DEFAULT_LIBRARY}', reel '{REEL_PREFIX}<YYMMDD>'; the "
     f"environment variable {LIBRARY_ENV} names another library) so that journal.revert can put it "
     f"back. `targets`: 1 to {MAX_SOURCES} wiretap / path / selection selectors, each a PyClip or "
@@ -53,7 +54,12 @@ _DESCRIPTION = (
     "with journal.purge_checkpoints), a reel that holds a clip or a sequence (PRECONDITION_UNMET: "
     "deleting a reel of a Batch group also deletes the Clip nodes that use its clips), a "
     "reel group, a folder, a library or a Batch group (PRECONDITION_UNMET: only clips, "
-    "sequences and empty reels are deleted; batch.delete deletes a Batch group), a shelf reel "
+    "sequences and empty reels are deleted; batch.delete deletes a Batch group), a clip whose "
+    "segments are all Gap Batch FX or Gap with at least one Gap Batch FX (PRECONDITION_UNMET, "
+    "result.unstashable; on Flame 2025.2.4 the copy into the stash of a clip whose only segment "
+    "is a Gap Batch FX raised 'Invalid source entries supplied.'; a clip whose other segments "
+    "are plain Gap has no media to copy and is refused the same way, its copy was not seen to "
+    "fail; name it in without_backup to delete it with no copy), a shelf reel "
     "of a Batch group (PRECONDITION_UNMET), "
     "a schematic reel that is, or together with the other targets of the call would leave, the "
     "last schematic reel of its Batch group (PRECONDITION_UNMET: at least one stays), a clip "
@@ -69,10 +75,16 @@ _DESCRIPTION = (
     "(result.deleted[].nodeCountBefore / nodeCountAfter); a count that changed is "
     "FLAME_API_ERROR (the reel stays journaled: nodes deleted with it are not brought back by "
     "journal.revert). "
+    "`without_backup`: targets (each written as in `targets`) that are deleted without the "
+    "stashed copy, for a thing whose copy fails (e.g. 'Invalid source entries supplied.'); "
+    "journal.revert cannot put them back (result.deleted[].withoutBackup is true, stash null). "
+    "Ask the user to confirm before naming a thing there. A reel is never copied into the stash, "
+    "so naming one there changes nothing (journal.revert remakes it as for any empty reel). "
     "FLOW: every target's type, name, uid, parent and fingerprint (timeline.fingerprint: segments "
-    "and effects) are read and journaled first; each target is copied into the stash and the "
-    "copy's fingerprint must equal the original's (a copy that fails ends the call before anything "
-    "is deleted; the copies already made stay recorded as checkpoints); after each copy the "
+    "and effects) are read and journaled first; each target (except those named in "
+    "without_backup) is copied into the stash and the copy's fingerprint must equal the original's "
+    "(a copy that fails ends the call before anything is deleted; the copies already made stay "
+    "recorded as checkpoints); after each copy the "
     "Timeline is put back on what it showed if the copy moved it, as timeline.checkpoint does; "
     "the intent is written "
     "(it lists the checkpoint ids); then one Flame call checks every target still has the "
@@ -82,8 +94,9 @@ _DESCRIPTION = (
     "cannot be shown again: the Timeline is left empty (result.shownAfterDelete is null). "
     "result: requested, deleted [{from: {parent {type, name, uid, wiretapId, selector}, name, "
     "type, uid}, checkpoint, stash {type, name, uid, wiretapId, library, reel}, fingerprint, "
-    "segmentCount, wasDisplayed}], notDeleted, partial, shownBefore / shownAfterDelete / "
-    "shownAfter / reshown / reshownNote (the Timeline's sequence {type, uid, name}). A call "
+    "segmentCount, wasDisplayed, withoutBackup}], notDeleted, partial, shownBefore / "
+    "shownAfterDelete / shownAfter / reshown / reshownNote (the Timeline's sequence "
+    "{type, uid, name}). A call "
     "after which every target is still there is SILENT_NOOP; only some gone: FLAME_API_ERROR "
     "whose message starts with 'partial:', result.partial = true and the envelope's partial "
     "{deleted, notDeleted}; what was deleted is journaled (journal state partial), so "
@@ -99,7 +112,9 @@ _DESCRIPTION = (
     "Undo: journal.revert(group) copies each stashed copy back into the thing's old parent "
     "(flame.media_panel.copy): the thing has a new uid and wiretap id and is at the end of the "
     "reel (its old place is not restored) -- result.reverted[].to.selector; a sequence that was "
-    "shown in the Timeline before the delete is opened again. An empty reel is made again as a "
+    "shown in the Timeline before the delete is opened again. A thing deleted with without_backup "
+    "is not put back: it is in result.notReverted (envelope notRestored) with PRECONDITION_UNMET, "
+    "and the others are put back (partial). An empty reel is made again as a "
     "new empty reel of the same name and type at the end of its old reel group (new uid; its "
     "old place, colour and other attributes are not restored; a CONFLICT if that group already "
     "has a reel of that name; a made reel with another name is deleted again and reported). A "
@@ -143,9 +158,10 @@ def _delete_to_python(args: Mapping[str, Any]) -> str:
         )
     if phase == PHASE_STASH:
         reel = args.get(REEL_ARG) or stash_reel_name()
+        skip = list(args[SKIP_ARG])
         return build_source(
             *blocks,
-            f"_result = _dd_stash({listed}, {library!r}, {reel!r})",
+            f"_result = _dd_stash({listed}, {library!r}, {reel!r}, {skip!r})",
             raise_on_error_src(),
             "_affected = 0",
         )
@@ -176,6 +192,27 @@ def _delete_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     ]
     if problems:
         return Refusal("INVALID_ARGS", "invalid arguments: " + "; ".join(problems))
+    without = args.get("without_backup")
+    if without is None:
+        return None
+    if not isinstance(without, list) or not without:
+        return Refusal(
+            "INVALID_ARGS",
+            "without_backup must be a non-empty list of selectors that are also in targets; "
+            "nothing was sent to Flame",
+        )
+    for i, entry in enumerate(without):
+        if entry not in targets:
+            return Refusal(
+                "INVALID_ARGS",
+                f"without_backup[{i}] is not equal to any entry of targets (write it the same "
+                "way); nothing was sent to Flame",
+            )
+        if entry in without[:i]:
+            return Refusal(
+                "INVALID_ARGS",
+                f"without_backup[{i}] is listed twice; nothing was sent to Flame",
+            )
     return None
 
 
@@ -198,6 +235,16 @@ def register(registry: Registry) -> None:
                         "group, or an empty schematic PyReel of a Batch group."
                     ),
                     required=True,
+                    item_type="selector",
+                ),
+                OperationParam(
+                    name="without_backup",
+                    type="array",
+                    description=(
+                        "Optional. Entries of targets (written the same way) to delete without "
+                        "the stashed copy; they cannot be put back. Ask the user first."
+                    ),
+                    required=False,
                     item_type="selector",
                 ),
             ),

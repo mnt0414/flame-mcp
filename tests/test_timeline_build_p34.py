@@ -228,6 +228,85 @@ def test_a_change_that_is_not_at_the_frame_is_a_partial_flame_api_error(
     assert view.state() == "partial" and env["journal"]["revert"]["op"] == "journal.revert"
 
 
+@pytest.mark.parametrize("op", [OVERWRITE, INSERT])
+def test_a_segment_without_a_source_name_is_judged_by_its_start_and_length(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    monkeypatch.setattr("fake_timeline_build.EMPTY_SOURCE_NAME", True)
+    env = put(rig, op, S2, 30)
+    assert env["ok"] is True, env
+    placement = env["result"]["placement"]
+    assert placement["nameChecked"] is False and placement["foundName"] == ""
+    assert placement["foundLength"] == placement["expectedLength"] == 12
+    assert any("source_name is empty" in note for note in env["degraded"]), env["degraded"]
+
+
+def test_a_put_whose_clip_name_could_not_be_read_does_not_count_the_name_as_checked(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip = rig.handles["c12"]
+    healthy = clip.name
+    original = PySequence.overwrite
+
+    class Unreadable:
+        def get_value(self) -> Any:
+            raise RuntimeError("unreadable")
+
+    Unreadable.__name__ = "PyAttribute"
+
+    def restored(self: PySequence, clip_: PyClip, time: PyTime, track: PyTrack) -> Any:
+        clip.name = healthy
+        return original(self, clip_, time, track)
+
+    monkeypatch.setattr(PySequence, "overwrite", restored)
+    clip.name = Unreadable()
+    env = put(rig, OVERWRITE, S2, 30)
+    placement = (env.get("result") or {}).get("placement")
+    assert placement is not None, env
+    assert placement["expectedName"] is None and placement["foundName"] == "len12"
+    assert placement["nameChecked"] is False
+
+
+def test_a_segment_with_another_source_name_is_still_partial(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = PySequence.overwrite
+
+    def renamed(self: PySequence, clip: PyClip, time: PyTime, track: PyTrack) -> Any:
+        out = original(self, clip, time, track)
+        for seg in track.segments:
+            if seg.record_in.frame == time.frame:
+                seg.source_name = "other"
+        return out
+
+    monkeypatch.setattr(PySequence, "overwrite", renamed)
+    env = put(rig, OVERWRITE, S1, 30)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and "'other'" in env["error"]
+
+
+def test_a_segment_without_a_source_name_and_of_another_length_is_partial(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("fake_timeline_build.EMPTY_SOURCE_NAME", True)
+    clip = rig.handles["c12"]
+    clip.in_mark = PyTime(0, clip.frame_rate)
+    clip.out_mark = PyTime(5, clip.frame_rate)
+    original = PySequence.overwrite
+
+    def longer(self: PySequence, clip: PyClip, time: PyTime, track: PyTrack) -> Any:
+        out = original(self, clip, time, track)
+        for seg in track.segments:
+            if seg.record_in.frame == time.frame:
+                seg.record_out = PyTime(seg.record_out.frame + 3, self.frame_rate)
+        return out
+
+    monkeypatch.setattr(PySequence, "overwrite", longer)
+    env = put(rig, OVERWRITE, S1, 30)
+    assert env["ok"] is False and env["errorCode"] == "FLAME_API_ERROR", env
+    assert env["error"].startswith("partial:") and "frame(s) long" in env["error"]
+
+
 def test_a_revert_puts_the_sequence_back_with_the_fingerprint_it_had(rig: Rig) -> None:
     before = fingerprint_of_target(rig, S1)
     env = put(rig, INSERT, S1, 20)

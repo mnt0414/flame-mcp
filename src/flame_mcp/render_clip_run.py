@@ -171,6 +171,14 @@ def _problem(facts: Mapping[str, Any], force: bool) -> tuple[ErrorCode, str, str
             "Batch group (its parents could not be followed)",
             None,
         )
+    if facts.get("gapBatchFx"):
+        return (
+            "PRECONDITION_UNMET",
+            f"nothing was rendered: {label} has a Gap Batch FX segment, "
+            "which this operation does not render",
+            "Render it in Flame, or lift those segments from a duplicate and render the "
+            "duplicate; result.gapBatchFx lists the segments.",
+        )
     if not facts.get("effectCount"):
         return (
             "PRECONDITION_UNMET",
@@ -285,6 +293,8 @@ def run_render_clip(
             "location": facts.get("location"),
             "effects": facts.get("effects"),
             "effectCount": facts.get("effectCount"),
+            "gapBatchFx": facts.get("gapBatchFx"),
+            "gapBatchFxMore": facts.get("gapBatchFxMore"),
             "isRendered": facts.get("isRendered"),
         }
         if problem is not None:

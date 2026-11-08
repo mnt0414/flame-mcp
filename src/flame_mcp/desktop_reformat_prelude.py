@@ -275,7 +275,7 @@ def _rf_write(obj, spec, expected):
 
 
 def _rf_stash(targets, library_name, reel_name):
-    out = _dd_stash(targets, library_name, reel_name)
+    out = _dd_stash(targets, library_name, reel_name, [])
     for item in out['stashes']:
         copy = _dc_find_by_uid((item.get('stash') or {}).get('uid'))
         item['sourceAttrs'] = _rf_attrs(targets[item['index']])

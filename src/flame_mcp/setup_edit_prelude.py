@@ -14,9 +14,13 @@ a namespace of their own, so the server checks a request with the same code that
 their names joins the namespace every op shares; only the `_se_` names bound below do.
 
 What it encodes:
-  - the setup of a Timewarp effect and of a Timewarp node is ONE file; a setup of more files (a
-    Clip node writes six, Burn-in Letterbox two) is refused, because only the file that holds the
-    values is edited and the others would be loaded as they were.
+  - the setup of a Timewarp effect and of a Timewarp node is ONE file. An effect setup of more
+    files (Burn-in Letterbox two) is refused. A node setup of more files (a Render node writes
+    four, a Clip node six) is edited only when `file` names the node's own file
+    (`_node_save_setup`'s `path`): `edited.<ext>` is written next to the saved `original.*`
+    companions it refers to by name, and the read-back's `readback.<ext>` references are put back
+    to `original.<ext>` before it is judged. Whether Flame reads those companions on the load is
+    not measured; `otherFilesChanged` reports the companions whose bytes differ.
   - the work directory is `<journal dir>/setups/s_<id>`, made private (0700; the files 0600,
     because Flame writes its files 0666), and removed after a success unless `keep_files` is set.
     A failure keeps the files it wrote, and so does a refusal when `keep_files` is set, so that
@@ -115,11 +119,14 @@ def _se_tighten(paths):
         os.chmod(path, 0o600)
 
 
-def _se_read_text(path):
+def _se_read_bytes(path):
     with open(path, 'rb') as fh:
-        data = fh.read()
+        return fh.read()
+
+
+def _se_read_text(path):
     try:
-        return data.decode('utf-8')
+        return _se_read_bytes(path).decode('utf-8')
     except UnicodeDecodeError:
         return None
 
@@ -168,8 +175,8 @@ def _se_one_file(out, paths, what):
         _te_fail(
             out,
             'PRECONDITION_UNMET',
-            what + ' wrote ' + str(len(paths)) + ' files ' + names + ': only a setup of exactly '
-            'one file can be edited',
+            what + ' wrote ' + str(len(paths)) + ' files ' + names + ' and which of them is the '
+            'setup to edit could not be told, so none is edited',
         )
     return False
 
@@ -384,7 +391,42 @@ def _se_node_again(batch, node, index, count_before):
     return None
 
 
-def _se_node_look(batch, node, values, base):
+def _se_ext_of(path, stem):
+    # the extension of a saved file: 'output_node' for 'original.output_node'
+    return path.rsplit('/', 1)[-1][len(stem) + 1:]
+
+
+def _se_choose_file(out, saved, paths, file):
+    # which of the files a node save wrote is edited: its path, or None with the failure in out
+    exts = [_se_ext_of(p, 'original') for p in paths]
+    main = saved['path']
+    if file is not None and file not in exts:
+        _te_fail(
+            out, 'INVALID_ARGS',
+            'file=' + repr(file) + ' is not one of the files the node saved: ' + repr(exts),
+        )
+        return None
+    if len(paths) == 1:
+        return paths[0]
+    main_ext = _se_ext_of(main, 'original')
+    if file is None:
+        _te_fail(
+            out, 'PRECONDITION_UNMET',
+            'save_node_setup wrote ' + str(len(paths)) + ' files with the extensions ' + repr(exts)
+            + ': name the own file of the node with file=' + repr(main_ext),
+        )
+        return None
+    if file != main_ext:
+        _te_fail(
+            out, 'PRECONDITION_UNMET',
+            'only the own file of the node (' + main_ext + ') can be edited; the other files are '
+            'left as saved',
+        )
+        return None
+    return main
+
+
+def _se_node_look(batch, node, values, file, base):
     import os
     out = {
         'ran': False,
@@ -402,7 +444,7 @@ def _se_node_look(batch, node, values, base):
         saved = _node_save_setup(batch, node, os.path.join(workdir, 'original'), False)
         paths = list(saved['files'])
         _se_tighten(paths)
-        if len(paths) != 1:
+        if len(paths) == 0 or saved['path'] is None:
             _se_one_file(out, paths, 'save_node_setup')
             if saved['error'] is not None:
                 if len(paths) == 0:
@@ -410,26 +452,47 @@ def _se_node_look(batch, node, values, base):
                 else:
                     out['error'] = out['error'] + ' (' + saved['error'] + ')'
             return out, None
-        if saved['error'] is not None:
-            out['savedFiles'] = paths
-            return _te_fail(out, 'FLAME_API_ERROR', saved['error']), None
         out['savedFiles'] = paths
-        out['files']['original'] = paths[0]
-        text = _se_read_text(paths[0])
+        if saved['error'] is not None:
+            return _te_fail(out, 'FLAME_API_ERROR', saved['error']), None
+        main = _se_choose_file(out, saved, paths, file)
+        if main is None:
+            return out, None
+        if file is not None:
+            out['file'] = file
+        out['files']['original'] = main
+        text = _se_read_text(main)
         if text is None:
             return _te_fail(
                 out, 'PRECONDITION_UNMET', 'the setup file is not UTF-8 text: it cannot be edited'
             ), None
-        return _se_inspect(out, text, values), (text, paths[0])
+        return _se_inspect(out, text, values), (text, main)
     except BaseException:
         _se_remove_workdir(out, workdir)
         raise
 
 
-def _se_node_edit_check(batch, node, values, keep_files, base):
-    out, held = _se_node_look(batch, node, values, base)
+def _se_node_edit_check(batch, node, values, file, keep_files, base):
+    out, held = _se_node_look(batch, node, values, file, base)
     _se_discard(out, keep_files and out['error'] is not None)
     return out
+
+
+def _se_files_changed(originals, readbacks):
+    # readbacks: extension -> path of the second save's companion files. The extensions of the
+    # companion files whose bytes differ between the two saves, or that only one of them wrote
+    before = {}
+    for path in originals:
+        before[_se_ext_of(path, 'original')] = path
+    changed = []
+    for ext in list(before) + [e for e in readbacks if e not in before]:
+        if (
+            ext not in before
+            or ext not in readbacks
+            or _se_read_bytes(before[ext]) != _se_read_bytes(readbacks[ext])
+        ):
+            changed.append(ext)
+    return changed
 
 
 def _se_node_after_write(batch, node, values, out, edited, edited_text):
@@ -451,27 +514,33 @@ def _se_node_after_write(batch, node, values, out, edited, edited_text):
     again = _node_save_setup(batch, fresh, os.path.join(os.path.dirname(edited), 'readback'), False)
     paths = list(again['files'])
     _se_tighten(paths)
-    if again['error'] is not None or len(paths) != 1:
+    if again['error'] is not None or again['path'] is None:
         out['savedFiles'] = paths
         return _te_fail(
             out, 'FLAME_API_ERROR',
             'the setup was loaded, but it could not be saved again to read it back: '
             + str(again['error'] or (str(len(paths)) + ' files')),
         )
-    out['files']['readback'] = paths[0]
-    back = _se_read_text(paths[0])
+    out['files']['readback'] = again['path']
+    back = _se_read_text(again['path'])
     if back is None:
         return _te_fail(
             out, 'FLAME_API_ERROR', 'the setup saved for the read-back is not UTF-8 text'
         )
+    originals = [p for p in out['savedFiles'] if p != out['files']['original']]
+    companions = {_se_ext_of(p, 'readback'): p for p in paths if p != again['path']}
+    for ext in companions:
+        back = back.replace('readback.' + ext, 'original.' + ext)
     _se_judge(out, values, edited_text, back)
+    if len(originals) > 0:
+        out['otherFilesChanged'] = _se_files_changed(originals, companions)
     out['node'] = _node_row(fresh, _name_counts(_node_names(batch)))
     return out
 
 
-def _se_node_edit(batch, node, values, keep_files, base):
+def _se_node_edit(batch, node, values, file, keep_files, base):
     import os
-    out, held = _se_node_look(batch, node, values, base)
+    out, held = _se_node_look(batch, node, values, file, base)
     if out['error'] is not None:
         _se_discard(out, keep_files)
         return out

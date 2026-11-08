@@ -30,18 +30,35 @@ RENDER_CLIP_HELPER = """
 _RC_MEDIA_TYPES = ('PyClip', 'PySequence')
 
 
+_RC_GAP_FX_LIMIT = 50
+
+
+def _rc_is_gap_fx(segment):
+    return _j(segment.type) == 'Gap Batch FX'
+
+
 def _rc_effect_types(clip):
     found = []
     count = 0
-    for version in list(clip.versions):
-        for track in list(version.tracks):
+    gaps = []
+    gaps_more = 0
+    for vi, version in enumerate(list(clip.versions)):
+        for ti, track in enumerate(list(version.tracks)):
             for segment in list(track.segments):
-                for fx in list(segment.effects):
+                effects = list(segment.effects)
+                for fx in effects:
                     count += 1
                     name = _j(fx.type)
                     if name not in found:
                         found.append(name)
-    return found, count
+                if _rc_is_gap_fx(segment):
+                    if len(gaps) < _RC_GAP_FX_LIMIT:
+                        gaps.append({'version': vi, 'track': ti,
+                                     'recordIn': segment.record_in.frame,
+                                     'recordOut': segment.record_out.frame})
+                    else:
+                        gaps_more += 1
+    return found, count, gaps, gaps_more
 
 
 def _rc_is_rendered(clip, render_mode, render_quality):
@@ -56,12 +73,15 @@ def _rc_failure(out, text, exc):
 def _rc_inspect(clip, render_mode, render_quality):
     out = _ex_identity(clip)
     out.update(
-        location=None, effects=[], effectCount=0, isRendered=None, error=None, errorCode=None
+        location=None, effects=[], effectCount=0, gapBatchFx=[], gapBatchFxMore=0,
+        isRendered=None, error=None, errorCode=None
     )
     if out['type'] not in _RC_MEDIA_TYPES:
         return out
     out['location'] = _tl_location(clip)
-    out['effects'], out['effectCount'] = _rc_effect_types(clip)
+    out['effects'], out['effectCount'], out['gapBatchFx'], out['gapBatchFxMore'] = (
+        _rc_effect_types(clip)
+    )
     if out['effectCount']:
         try:
             out['isRendered'] = _rc_is_rendered(clip, render_mode, render_quality)

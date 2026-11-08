@@ -38,6 +38,9 @@ What it encodes:
     and reads the all-section fingerprint back. A reel that holds a clip or a sequence is never
     deleted: deleting one also deleted the Clip nodes that use it. The order matters: deleting
     the last reel of a group made Flame create its default ones.
+  - `batch.compare_setup` saves the setup into a work directory of the server's own with one
+    `save_setup` (`_save_for_compare`) and leaves the comparison to the server: it reads nothing
+    else in Flame, so the main thread is held for the save only.
   - Timeline FX of the reel clips: a Batch setup does not hold them, and a clip whose FX were
     changed or rendered inside the group came back from `load_setup` without them, and a clip
     that was only copied in can lose them too (Flame 2025.2.4).
@@ -508,6 +511,20 @@ def _save_checkpoint(batch, directory, base, sections=None, full_sections=None):
         'sectionData': full.get('sectionData') if full else None,
         'error': error,
     }
+
+
+def _save_for_compare(batch, directory, base):
+    # the one Flame call of batch.compare_setup: the setup goes into a directory the server made
+    # and removes; nothing is globbed, the server finds the .batch it wrote
+    import os
+    if not isinstance(directory, str) or not directory or not isinstance(base, str) or not base:
+        raise _OpError('INVALID_ARGS', 'a comparison needs a directory and a base name')
+    returned = batch.save_setup(os.path.join(directory, base))
+    _make_private_tree(directory)
+    error = None
+    if returned is not True:
+        error = 'save_setup returned ' + repr(returned) + ' (expected True)'
+    return {'saveSetupReturned': _ja(returned), 'batch': _batch_ident(batch), 'error': error}
 
 
 def _count_nodes(batch):

@@ -46,7 +46,7 @@ DEFAULT_TIMEOUT=600
 e2e_table() {
     cat <<'EOF'
 p3_3_segment|standard|p3|yes|no|no|-|setup, stages s, r, e, x, p, y, z
-p3_2b_plan_delete|standard|p3|yes|no|no|-|setup, stages p, d, m, k, r, g, z
+p3_2b_plan_delete|standard|p3|yes|no|no|-|setup, stages p, d, w, m, k, r, g, z
 p3_2a_checkpoint|standard|p3|yes|no|no|-|setup, stages a-k, z
 p3_1b_write|standard|p3|yes|no|no|-|setup, stages a, a2, b, c, e, g, z
 p3_1a_read|standard|p3|yes|no|no|-|setup, stages a-f, h, i, g, z
@@ -60,7 +60,7 @@ p2_2c_checkpoint_eval|standard|p2|yes|no|no|-|stages a-e, z
 p2_3a_batch|standard|p2|yes|no|no|-|stages a-e, z
 p2_3b_node_action|standard|p2|yes|no|no|-|stages a-f, z
 p2_3r_reel_fidelity|standard|p2|yes|no|no|-|stages a-e, z
-p2_3c_render|standard|p2|yes|no|no|-|setup, stages a-h, z
+p2_3c_render|standard|p2|yes|no|no|-|setup, stages a-i, z
 p2_3d_desktop|standard|p2|yes|no|no|-|setup, stages a-g, z
 p94_arrange_insert|standard|p2|yes|no|no|-|setup, stages a-e, g, z
 p95_prep_ops|standard|p2|yes|no|no|-|setup, stages c, t, b, r, u, s, o, z

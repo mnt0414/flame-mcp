@@ -56,6 +56,10 @@ def untouched(rig: Rig) -> bool:
     return rig.records() == [] and not [c for c in rig.exec.calls if c.label == "batch.checkpoint"]
 
 
+def nothing_loaded_or_left(rig: Rig, behaviour: Any) -> bool:
+    return untouched(rig) and behaviour.loads == 0 and leftovers(rig) == []
+
+
 def test_the_value_is_replaced_loaded_and_read_back(rig: Rig, xml: XmlBehaviour) -> None:
     env = edit(rig, {"Red": 0.5})
     assert env["ok"] is True, env
@@ -105,7 +109,7 @@ def test_a_bool_is_written_as_true_or_false(rig: Rig, xml: XmlBehaviour) -> None
 def test_nothing_to_change_is_refused_before_the_checkpoint(rig: Rig, xml: XmlBehaviour) -> None:
     env = edit(rig, {"Red": 0.0, "Bypass": False})
     assert env["errorCode"] == "PRECONDITION_UNMET" and "nothing to change" in env["error"]
-    assert untouched(rig) and xml.loads == 0 and leftovers(rig) == []
+    assert nothing_loaded_or_left(rig, xml)
 
 
 def test_a_tag_that_is_not_there_is_refused_before_the_checkpoint(
@@ -134,12 +138,102 @@ def test_a_tag_name_of_another_shape_is_refused_and_nothing_is_sent(
     assert env["errorCode"] == "INVALID_ARGS" and rig.exec.calls == []
 
 
-def test_a_setup_of_several_files_is_refused(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_setup_of_several_files_without_file_is_refused(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state = install_node_xml(monkeypatch, XmlBehaviour(files=6))
     env = edit(rig, {"Red": 0.5})
     assert env["errorCode"] == "PRECONDITION_UNMET" and "6 files" in env["error"]
     assert len(env["result"]["savedFiles"]) == 6
-    assert untouched(rig) and state.loads == 0 and leftovers(rig) == []
+    assert nothing_loaded_or_left(rig, state)
+
+
+def render(monkeypatch: pytest.MonkeyPatch, **kw: Any) -> XmlBehaviour:
+    return install_node_xml(
+        monkeypatch, XmlBehaviour(companions=("lut_node", "resize", "resize_node"), **kw)
+    )
+
+
+def test_the_main_file_of_several_is_edited_and_the_references_are_normalized(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = render(monkeypatch)
+    env = edit(rig, {"Red": 0.5}, file="exposure_node")
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert red(rig) == 0.5 and result["file"] == "exposure_node"
+    assert result["tags"]["Red"]["after"] == "0.5"
+    assert "otherDifferences" not in result and env["degraded"] == []
+    assert result["otherFilesChanged"] == []
+    assert len(result["savedFiles"]) == 4
+    assert state.loaded[0].endswith("/edited.exposure_node")
+    assert leftovers(rig) == []
+
+
+def test_several_files_without_file_name_the_extensions_and_the_argument(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = render(monkeypatch)
+    env = edit(rig, {"Red": 0.5})
+    assert env["errorCode"] == "PRECONDITION_UNMET", env
+    for ext in ("exposure_node", "lut_node", "resize", "resize_node"):
+        assert ext in env["error"]
+    assert "file=" in env["error"]
+    assert nothing_loaded_or_left(rig, state)
+
+
+def test_a_file_that_was_not_written_is_invalid_args_and_lists_the_extensions(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = render(monkeypatch)
+    env = edit(rig, {"Red": 0.5}, file="nope")
+    assert env["errorCode"] == "INVALID_ARGS" and "lut_node" in env["error"], env
+    assert nothing_loaded_or_left(rig, state)
+
+
+def test_a_companion_file_cannot_be_edited(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = render(monkeypatch)
+    env = edit(rig, {"Red": 0.5}, file="lut_node")
+    assert env["errorCode"] == "PRECONDITION_UNMET", env
+    assert "exposure_node" in env["error"]
+    assert nothing_loaded_or_left(rig, state)
+
+
+def test_a_companion_whose_bytes_change_is_listed_and_the_call_is_ok(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    render(monkeypatch, drifting=("resize",))
+    env = edit(rig, {"Red": 0.5}, file="exposure_node")
+    assert env["ok"] is True, env
+    assert env["result"]["otherFilesChanged"] == ["resize"]
+
+
+def test_a_tag_only_in_a_companion_is_refused_like_an_unknown_tag(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = render(monkeypatch, companion_text="<OnlyThere>1</OnlyThere>")
+    env = edit(rig, {"OnlyThere": 2}, file="exposure_node")
+    assert env["errorCode"] == "PRECONDITION_UNMET", env
+    assert env["result"]["tagCounts"] == {"OnlyThere": 0}
+    assert nothing_loaded_or_left(rig, state)
+
+
+def test_a_single_file_node_takes_its_own_extension_only(rig: Rig, xml: XmlBehaviour) -> None:
+    wrong = edit(rig, {"Red": 0.5}, file="lut_node")
+    assert wrong["errorCode"] == "INVALID_ARGS" and "exposure_node" in wrong["error"], wrong
+    assert nothing_loaded_or_left(rig, xml)
+    env = edit(rig, {"Red": 0.5}, file="exposure_node")
+    assert env["ok"] is True, env
+    assert red(rig) == 0.5 and "otherFilesChanged" not in env["result"]
+
+
+@pytest.mark.parametrize("value", ["a.b", "", "Output", "out put", "caf\u00e9", "a/b"])
+def test_a_bad_file_value_is_refused_and_nothing_is_sent(
+    rig: Rig, xml: XmlBehaviour, value: str
+) -> None:
+    env = edit(rig, {"Red": 0.5}, file=value)
+    assert env["errorCode"] == "INVALID_ARGS", env
+    assert rig.exec.calls == [] and rig.records() == []
 
 
 def test_a_node_that_is_not_there_is_refused_before_the_checkpoint(
@@ -208,7 +302,7 @@ def test_the_op_is_declared_as_a_reversible_checkpointed_node_edit(rig: Rig) -> 
     assert op is not None and op.checkpoint is not None
     assert (op.category, op.effect, op.undo) == ("node", "reversible", "checkpoint")
     assert op.checkpoint.target_kind == "batch" and op.accepts == ("node",)
-    assert [p.name for p in op.params] == ["target", "values", "keep_files"]
+    assert [p.name for p in op.params] == ["target", "values", "file", "keep_files"]
     assert "PRECONDITION_UNMET" in op.description and "nothing to change" in op.description
 
 

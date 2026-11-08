@@ -8,7 +8,9 @@ the rendered files on disk, the journal record, the refusals made before anythin
 puts into that group's reel (`Batch Renders` when the destination reads back as 2 elements,
 the reel its 3rd element names when it reads back as 3), and the `outputs` that `batch.list`
 lists for the Write File and Render nodes of these groups, and the file `node.save_setup` of a
-Render node reports as its own.
+Render node reports as its own, and the refusal of render.batch (and the same problem in
+render.plan's wouldRefuse) for a group holding a Render node with no input connected, which
+renders nothing, writes no journal record, and goes away once the node is wired.
 
 Same shape and helpers as scripts/p2_3b_node_action_e2e.py (imported from p2_2a / p1): a real MCP
 stdio client drives `python -m flame_mcp` against a live Flame + dev bridge; `flame_mcp.transport`
@@ -16,8 +18,8 @@ is scaffolding only (create the groups and the library, and READ EVERY STATE BAC
 the ops under test: the resolved path, the directory, the shelf reel's clips). The rendered files
 are read by this client process directly (the same machine) AND by Flame's own Python. Everything
 happens in the probe project `flame_mcp_probe`, in Batch groups that are NOT current (the decoy
-group is created last, so it is the current one; stage g, the last group-building stage, makes
-its own group the current one). The journal directory is this run's own
+group is created last, so it is the current one; stages g and i, the last two group-building
+stages, make their own groups the current one in turn). The journal directory is this run's own
 (`p2/journal_p23c_e2e_<ts>/`, never the production one). No test hook is set for any server.
 
 The groups are built with the ops themselves (batch.add_clips of a LIBRARY clip into the group's
@@ -87,6 +89,15 @@ Stages
      stage g, and must be a list: a stage g that ended early leaves none). Observed: the
      outputs of groups C, D and F, the number of pages, every stoppedEarly, the elapsed time, and
      the current group before and after (the call is not expected to change it).
+  i  group I, created by the stage itself after stage h (it becomes the current group): a Clip
+     node -> Render node `render_i_wired`, plus a Render node `render_i_open` with NO input
+     connected and not bypassed, range 1-3 on both. JUDGED: render.plan is ok, its node row for
+     `render_i_open` has wiredInputs 0 and effective false, and summary.wouldRefuse holds a
+     render_node_unwired problem naming it; render.batch is refused (PRECONDITION_UNMET,
+     result.ran false, problem codes exactly ['render_node_unwired'] naming `render_i_open`),
+     nothing new in the journal, and the clip counts of the group's reels and shelf reels (read by
+     transport) are the same as before. Then node.connect wires `render_i_open` to the Clip node
+     and render.plan no longer lists render_node_unwired.
   z  cross-cutting checks over every envelope; nothing left undecided
 
 Cleanup: this run's own Desktop reel group (`P23C_RG_<ts>`) is deleted and checked gone; no Batch
@@ -147,6 +158,10 @@ RENDER_GROUP: Final[str] = "G"
 RENDER_NODE: Final[str] = "render_g"
 RENDER_SETUP_SUFFIXES: Final[list[str]] = [".lut_node", ".output_node", ".resize", ".resize_node"]
 RENDER_RANGE: Final[tuple[int, int]] = (1, 8)
+UNWIRED_GROUP: Final[str] = "I"
+UNWIRED_WIRED_NODE: Final[str] = "render_i_wired"
+UNWIRED_OPEN_NODE: Final[str] = "render_i_open"
+UNWIRED_RANGE: Final[tuple[int, int]] = (1, 3)
 DESKTOP_REEL: Final[str] = "Batch Renders"
 LIST_PAGE: Final[int] = 20
 LIST_MAX_PAGES: Final[int] = 100
@@ -511,6 +526,77 @@ async def build_render_group(ctx: Ctx, session: Any, group: str = RENDER_GROUP) 
         clipNodes=clip_nodes,
         written=values,
         errors=[e.get("error") for e in (added, created, connected, written) if not e.get("ok")],
+    )
+
+
+async def build_unwired_group(ctx: Ctx, session: Any, group: str = UNWIRED_GROUP) -> None:
+    """Clip node -> Render node UNWIRED_WIRED_NODE, plus Render node UNWIRED_OPEN_NODE with no
+    input connected; both with range UNWIRED_RANGE."""
+    target = target_of(ctx, group)
+    info = _result_of(await do(session, ctx, "batch.info", {"target": target}))
+    reel = (info.get("reels") or [{}])[0].get("name")
+    lib_clip = ctx.ids["libClips"][0][1]
+    added = await do(
+        session,
+        ctx,
+        "batch.add_clips",
+        {"target": target, "reel": reel, "clips": [{"kind": "wiretap", "id": lib_clip}]},
+    )
+    listed = _result_of(await do(session, ctx, "node.list", {"target": target}))
+    clip_nodes = [n["name"] for n in listed.get("items", []) if n.get("type") == "Clip"]
+    ctx.ids["unwiredClipNode"] = clip_nodes[0] if clip_nodes else None
+    envs = [added]
+    for name in (UNWIRED_WIRED_NODE, UNWIRED_OPEN_NODE):
+        envs.append(
+            await do(
+                session, ctx, "node.create", {"target": target, "type": "Render", "name": name}
+            )
+        )
+    envs.append(
+        await do(
+            session,
+            ctx,
+            "node.connect",
+            {
+                "source": node_sel(ctx, group, clip_nodes[0]),
+                "target": node_sel(ctx, group, UNWIRED_WIRED_NODE),
+            }
+            if clip_nodes
+            else {"source": target, "target": target},
+        )
+    )
+    keys = ["range_start", "range_end"]
+    values_written: dict[str, Any] = {}
+    for name in (UNWIRED_WIRED_NODE, UNWIRED_OPEN_NODE):
+        current = _result_of(
+            await do(
+                session,
+                ctx,
+                "node.get_attributes",
+                {"target": node_sel(ctx, group, name), "keys": keys},
+            )
+        ).get("attributes", {})
+        now = {k: (current.get(k) or {}).get("value") for k in keys}
+        values = {
+            "range_start": value_like(now["range_start"], UNWIRED_RANGE[0]),
+            "range_end": value_like(now["range_end"], UNWIRED_RANGE[1]),
+        }
+        values_written[name] = values
+        envs.append(
+            await do(
+                session,
+                ctx,
+                "node.set_attributes",
+                {"target": node_sel(ctx, group, name), "values": values},
+            )
+        )
+    rec(
+        ctx,
+        "prepare_i_built_with_the_ops",
+        all(e.get("ok") is True for e in envs) and len(clip_nodes) == 1,
+        clipNodes=clip_nodes,
+        written=values_written,
+        errors=[e.get("error") for e in envs if not e.get("ok")],
     )
 
 
@@ -1229,6 +1315,115 @@ async def stage_g(ctx: Ctx) -> None:
         )
 
 
+async def tx_reel_counts(ctx: Ctx, uid: str) -> Any:
+    """Clip counts of every schematic reel and shelf reel of the group, read from Flame."""
+    body = "\n".join(
+        [
+            "_result = {'reels': {_v(r.name): len(r.clips) for r in _bg.reels},",
+            "           'shelf': {_v(r.name): len(r.clips) for r in _bg.shelf_reels}}",
+        ]
+    )
+    return await tx_scaffold(ctx, uid, body, "p23c_reel_counts")
+
+
+def unwired_problems(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = plan.get("summary") or {}
+    return [p for p in summary.get("wouldRefuse") or [] if p.get("code") == "render_node_unwired"]
+
+
+async def stage_i(ctx: Ctx) -> None:
+    group = UNWIRED_GROUP
+    if not await create_own_batch_group(ctx, group):
+        return
+    uid, target = uid_of(ctx, group), target_of(ctx, group)
+    async with server_session(ctx, "i-build") as build_session:
+        await build_unwired_group(ctx, build_session, group)
+    groups_before = journal_group_count(ctx)
+    counts_before = await tx_reel_counts(ctx, uid)
+    async with server_session(ctx, "i-plain") as session:
+        plan_env = await do(session, ctx, "render.plan", {"target": target})
+        plan = _result_of(plan_env)
+        row = next((n for n in plan.get("nodes", []) if n.get("name") == UNWIRED_OPEN_NODE), {})
+        wired_row = next(
+            (n for n in plan.get("nodes", []) if n.get("name") == UNWIRED_WIRED_NODE), {}
+        )
+        found = unwired_problems(plan)
+        plan_ok = (
+            plan_env.get("ok") is True
+            and row.get("wiredInputs") == 0
+            and row.get("effective") is False
+            and wired_row.get("effective") is True
+            and [p.get("node") for p in found] == [UNWIRED_OPEN_NODE]
+        )
+        rec(
+            ctx,
+            "i_plan_lists_the_unwired_render_node_as_would_refuse",
+            plan_ok,
+            error=plan_env.get("error"),
+            openRow={k: row.get(k) for k in ("kind", "bypass", "wiredInputs", "effective")},
+            wiredRow={k: wired_row.get(k) for k in ("kind", "bypass", "wiredInputs", "effective")},
+            wouldRefuse=(plan.get("summary") or {}).get("wouldRefuse"),
+        )
+        if not plan_ok:
+            # the plan does not show the refusal: render.batch could really render, so it is not
+            # called
+            rec(ctx, "i_render_batch_skipped_because_the_plan_check_failed", False)
+            return
+        env = await do(session, ctx, "render.batch", {"target": target})
+        result = _result_of(env)
+        problems = result.get("problems") or []
+        counts_after = await tx_reel_counts(ctx, uid)
+        rec(
+            ctx,
+            "i_render_batch_is_refused_for_a_render_node_with_no_input",
+            env.get("ok") is False
+            and env.get("errorCode") == "PRECONDITION_UNMET"
+            and result.get("ran") is False
+            and [p.get("code") for p in problems] == ["render_node_unwired"]
+            and [p.get("node") for p in problems] == [UNWIRED_OPEN_NODE],
+            error=env.get("error"),
+            errorCode=env.get("errorCode"),
+            ran=result.get("ran"),
+            problems=problems,
+        )
+        rec(
+            ctx,
+            "i_the_refused_render_journaled_nothing_and_rendered_nothing",
+            journal_group_count(ctx) == groups_before
+            and isinstance(counts_before, dict)
+            and counts_after == counts_before,
+            journalGroupsBefore=groups_before,
+            journalGroupsAfter=journal_group_count(ctx),
+            reelsBefore=counts_before,
+            reelsAfter=counts_after,
+        )
+        clip_node = ctx.ids.get("unwiredClipNode")
+        connected = await do(
+            session,
+            ctx,
+            "node.connect",
+            {
+                "source": node_sel(ctx, group, str(clip_node)),
+                "target": node_sel(ctx, group, UNWIRED_OPEN_NODE),
+            },
+        )
+        plan_after = _result_of(await do(session, ctx, "render.plan", {"target": target}))
+        row_after = next(
+            (n for n in plan_after.get("nodes", []) if n.get("name") == UNWIRED_OPEN_NODE), {}
+        )
+        rec(
+            ctx,
+            "i_plan_no_longer_lists_the_node_once_it_is_wired",
+            connected.get("ok") is True
+            and unwired_problems(plan_after) == []
+            and row_after.get("wiredInputs") == 1
+            and row_after.get("effective") is True,
+            error=connected.get("error"),
+            row={k: row_after.get(k) for k in ("wiredInputs", "effective")},
+            wouldRefuse=(plan_after.get("summary") or {}).get("wouldRefuse"),
+        )
+
+
 async def list_outputs(
     session: Any, ctx: Ctx, wanted: dict[str, str]
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
@@ -1459,10 +1654,11 @@ async def async_main(ctx: Ctx) -> None:
                 ("f", stage_f),
                 ("g", stage_g),
                 ("h", stage_h),
+                ("i", stage_i),
             ):
                 await guarded(ctx, name, stage)
         else:
-            rec(ctx, "prepare_incomplete_stages_a_to_h_skipped", False, ids=ctx.ids)
+            rec(ctx, "prepare_incomplete_stages_a_to_i_skipped", False, ids=ctx.ids)
         await guarded(ctx, "z", stage_z)
     finally:
         cleanup(ctx)

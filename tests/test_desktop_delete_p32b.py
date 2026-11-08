@@ -332,6 +332,7 @@ def test_a_stash_copy_that_fails_ends_the_call_before_anything_is_deleted(
     env = delete(rig, [S2, S3])
     assert env["ok"] is False and "scripted copy failure" in env["error"]
     assert "nothing was deleted" in env["error"]
+    assert "without_backup" in env["error"] and "cannot be put back" in env["error"]
     assert reel_names(reel(rig)) == ["c1", "S1", "S2", "S3", "CLIPX"]
     cps = checkpoints(rig)
     assert len(cps) == 1 and cps[0]["source"]["name"] == "S2"
@@ -521,3 +522,187 @@ def test_two_deletes_stack_in_the_stash_and_revert_one_by_one(rig: Rig) -> None:
     assert revert(rig, second)["ok"] is True
     assert rows(rig.handles["reel"].children[-1])[0][1:3] == [0, 23]
     assert reel2(rig)["kind"] == "wiretap" and LIBREEL["kind"] == "wiretap"
+
+
+def delete_wb(rig: Rig, targets: list[dict[str, Any]], without: Any) -> dict[str, Any]:
+    return rig.do(DELETE, {"targets": targets, "without_backup": without})
+
+
+def test_a_target_in_without_backup_is_deleted_with_no_stash_and_no_checkpoint(rig: Rig) -> None:
+    env = delete_wb(rig, [S2], [S2])
+    assert env["ok"] is True, env
+    assert "S2" not in reel_names(reel(rig))
+    row = env["result"]["deleted"][0]
+    assert row["withoutBackup"] is True and row["stash"] is None and row["checkpoint"] is None
+    assert row["fingerprint"] and row["from"]["name"] == "S2"
+    assert stash_library(rig) is None and checkpoints(rig) == []
+    assert rig.flame.media_panel.copy_calls == []
+    intent = next(r for r in rig.records() if r["type"] == "intent")
+    assert intent["withoutBackup"] == [intent["sources"][0]["uid"]]
+    assert intent["stashes"][0]["stash"] is None and intent["stashes"][0]["checkpoint"] is None
+    assert intent["checkpoints"] == []
+    notes = " ".join(env["result"]["notes"])
+    assert "no stashed copy" in notes and "journal.revert cannot put them back" in notes
+    assert "NEW uid" not in notes
+
+
+def test_a_mix_stashes_only_the_other_target_and_revert_is_partial(rig: Rig) -> None:
+    env = delete_wb(rig, [S2, S3], [S2])
+    assert env["ok"] is True, env
+    by_name = {d["from"]["name"]: d for d in env["result"]["deleted"]}
+    assert by_name["S2"]["withoutBackup"] is True and by_name["S2"]["stash"] is None
+    assert by_name["S3"]["withoutBackup"] is False and by_name["S3"]["stash"] is not None
+    assert [str(e.name.get_value()) for e in stash_entries(rig)] == ["S3"]
+    assert len(checkpoints(rig)) == 1
+    assert any("NEW uid" in n for n in env["result"]["notes"])
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "PRECONDITION_UNMET", out
+    assert out["partial"] == {"done": 1, "failed": 1, "notRun": 0}
+    assert [r["from"]["name"] for r in out["result"]["reverted"]] == ["S3"]
+    lost = out["result"]["notReverted"][0]
+    assert lost["from"]["name"] == "S2" and lost["errorCode"] == "PRECONDITION_UNMET"
+    assert "without_backup" in lost["reason"]
+    assert reel_names(reel(rig)) == ["c1", "S1", "CLIPX", "S3"]
+
+
+def test_revert_of_an_all_without_backup_delete_fails(rig: Rig) -> None:
+    env = delete_wb(rig, [S2, S3], [S2, S3])
+    assert env["ok"] is True, env
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "PRECONDITION_UNMET", out
+    assert len(out["result"]["notReverted"]) == 2
+    assert reel_names(reel(rig)) == ["c1", "S1", "CLIPX"]
+    check = rig.do("journal.check", {})
+    assert check["ok"] is True
+
+
+def test_check_of_a_without_backup_delete_whose_answer_was_lost_is_landed(rig: Rig) -> None:
+    rig.exec.fault(DELETE, "TIMEOUT", when="after", skip=2)
+    env = delete_wb(rig, [S2], [S2])
+    assert env["errorCode"] == "TIMEOUT"
+    out = rig.do("journal.check", {})
+    assert out["result"]["checked"][0]["verdict"] == "landed"
+    check = next(r for r in rig.records() if r["type"] == "check")
+    row = check["created"]["deletes"][0]
+    assert row["withoutBackup"] is True and row["stash"] is None
+
+
+@pytest.mark.parametrize(
+    "without",
+    [[], [CLIPX], [S2, S2], "S2", {"kind": "wiretap", "id": "x"}],
+    ids=["empty", "not among targets", "twice", "str", "dict"],
+)
+def test_a_bad_without_backup_is_invalid_args_and_nothing_is_sent(rig: Rig, without: Any) -> None:
+    env = delete_wb(rig, [S2, S3], without)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    assert "without_backup" in env["error"]
+    assert rig.exec.calls == []
+    assert untouched_world(rig)
+
+
+def test_an_empty_reel_in_without_backup_is_deleted_and_remade_by_revert(rig: Rig) -> None:
+    env = delete_wb(rig, [reel2(rig)], [reel2(rig)])
+    assert env["ok"] is True, env
+    row = env["result"]["deleted"][0]
+    assert row["withoutBackup"] is False and row["stash"] is None
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert "Reel 2" in [str(r.name.get_value()) for r in rig.handles["reel_group"].reels]
+
+
+def test_without_backup_naming_the_second_of_three_stashes_only_the_other_two(rig: Rig) -> None:
+    env = delete_wb(rig, [S2, CLIPX, S3], [CLIPX])
+    assert env["ok"] is True, env
+    flags = {d["from"]["name"]: d["withoutBackup"] for d in env["result"]["deleted"]}
+    assert flags == {"S2": False, "CLIPX": True, "S3": False}
+    assert sorted(str(e.name.get_value()) for e in stash_entries(rig)) == ["S2", "S3"]
+    assert len(checkpoints(rig)) == 2
+    out = revert(rig, env)
+    assert out["partial"] == {"done": 2, "failed": 1, "notRun": 0}
+
+
+def test_a_reel_and_a_without_backup_clip_in_one_call(rig: Rig) -> None:
+    env = delete_wb(rig, [reel2(rig), CLIPX], [CLIPX])
+    assert env["ok"] is True, env
+    flags = {d["from"]["name"]: d["withoutBackup"] for d in env["result"]["deleted"]}
+    assert flags == {"Reel 2": False, "CLIPX": True}
+    assert stash_library(rig) is None and checkpoints(rig) == []
+    out = revert(rig, env)
+    assert out["partial"] == {"done": 1, "failed": 1, "notRun": 0}
+    assert out["result"]["reverted"][0]["from"]["name"] == "Reel 2"
+
+
+def test_a_successful_revert_carries_no_hint_key(rig: Rig) -> None:
+    env = delete(rig, [S2])
+    out = revert(rig, env)
+    assert out["ok"] is True, out
+    assert "hint" not in out["result"] and not out.get("hint")
+
+
+def test_the_write_refuses_a_clip_with_no_stash_on_record_and_deletes_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from flame_mcp import transport
+
+    inner: Any = rig.exec
+    needle = "def _dd_delete_conflicts(targets, uids, snapshot, expected):\n"
+
+    def run(code: str, *args: Any, **kwargs: Any) -> Any:
+        if "_result = _dd_delete(" in code:
+            tamper = "    snapshot = {u: dict(i, stash=None) for u, i in snapshot.items()}\n"
+            code = code.replace(needle, needle + tamper, 1)
+        return inner(code, *args, **kwargs)
+
+    monkeypatch.setattr(transport, "exec", run)
+    env = delete(rig, [S2, S3])
+    assert env["ok"] is False and env["errorCode"] == "CONFLICT", env
+    assert "no stashed copy on record" in env["error"]
+    assert reel_names(reel(rig)) == ["c1", "S1", "S2", "S3", "CLIPX"]
+
+
+def test_the_without_backup_advice_is_not_given_when_the_stash_call_itself_fails(
+    rig: Rig,
+) -> None:
+    rig.exec.fault(DELETE, "TIMEOUT", when="before", skip=1)
+    env = delete(rig, [S2])
+    assert env["ok"] is False, env
+    assert "nothing was deleted" in env["error"] and "without_backup" not in env["error"]
+    assert "S2" in reel_names(reel(rig))
+
+
+NO_RETRY_HINT = "no retry of journal.revert can put them back"
+
+
+def test_revert_of_a_without_backup_row_marks_it_and_says_a_retry_cannot_help(rig: Rig) -> None:
+    env = delete_wb(rig, [S2], [S2])
+    out = revert(rig, env)
+    assert out["ok"] is False and out["errorCode"] == "PRECONDITION_UNMET", out
+    assert out["result"]["notReverted"][0]["withoutBackup"] is True
+    assert NO_RETRY_HINT in out["hint"]
+    assert "hint" not in out["result"]
+
+
+def test_revert_hint_is_not_the_no_retry_one_when_only_a_stashed_row_fails(rig: Rig) -> None:
+    rig.flame.media_panel.move(rig.handles["clipx"], rig.handles["reel2"])
+    moved = wt(rig.handles["reel2"].children[-1].get_wiretap_node_id())
+    env = delete(rig, [moved])
+    rig.handles["reel_group"].reels.remove(rig.handles["reel2"])
+    rig.handles["reel_group"].sync_children()
+    out = revert(rig, env)
+    assert out["errorCode"] == "CONFLICT", out
+    assert not out["result"]["notReverted"][0].get("withoutBackup")
+    assert NO_RETRY_HINT not in str(out.get("hint"))
+
+
+def test_revert_hint_is_the_no_retry_one_when_a_without_backup_row_is_among_the_failures(
+    rig: Rig,
+) -> None:
+    rig.flame.media_panel.move(rig.handles["clipx"], rig.handles["reel2"])
+    moved = wt(rig.handles["reel2"].children[-1].get_wiretap_node_id())
+    env = delete_wb(rig, [S2, moved], [S2])
+    rig.handles["reel_group"].reels.remove(rig.handles["reel2"])
+    rig.handles["reel_group"].sync_children()
+    out = revert(rig, env)
+    codes = sorted(r["errorCode"] for r in out["result"]["notReverted"])
+    assert codes == ["CONFLICT", "PRECONDITION_UNMET"], out
+    assert NO_RETRY_HINT in out["hint"]

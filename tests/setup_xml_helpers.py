@@ -40,6 +40,13 @@ class XmlBehaviour:
     decimals."""
     files: int = 1
     """How many files one save writes (the first holds the text)."""
+    companions: tuple[str, ...] = ()
+    """Extensions of the other files a node save writes next to the main file (a Render node's
+    `lut_node`, `resize`); the main file names each one as `<Ref_ext>{stem}.ext</Ref_ext>`."""
+    drifting: tuple[str, ...] = ()
+    """Companions whose bytes differ in a save made after a load."""
+    companion_text: str = ""
+    """Added to every companion file (a tag that exists only there)."""
     save_nothing_after_load: bool = False
     save_raises_after_load: bool = False
     replace_node_on_load: bool = False
@@ -122,6 +129,21 @@ def install_node_xml(
         stem = os.path.basename(path)
         directory = os.path.dirname(path)
         base = os.path.join(directory, stem)
+        if state.companions:
+            refs = "".join(f"<Ref_{e}>{stem}.{e}</Ref_{e}>" for e in state.companions)
+            main = base + ".exposure_node"
+            Path(main).write_text(node_text(self) + refs, encoding="utf-8")
+            os.chmod(main, FLAME_FILE_MODE)
+            state.saved.append(main)
+            for ext in state.companions:
+                drift = "<Drift/>" if ext in state.drifting and state.loads else ""
+                target = f"{base}.{ext}"
+                Path(target).write_text(
+                    f"<C>{ext}</C>{state.companion_text}{drift}", encoding="utf-8"
+                )
+                os.chmod(target, FLAME_FILE_MODE)
+                state.saved.append(target)
+            return True
         for position in range(state.files):
             target = base + (".exposure_node" if position == 0 else f".part{position}")
             Path(target).write_text(node_text(self) if position == 0 else "{}", encoding="utf-8")

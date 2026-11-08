@@ -396,7 +396,7 @@ async def revert(session: Any, ctx: Ctx, env: dict[str, Any], **extra: Any) -> d
 
 
 def restored_wt(env: dict[str, Any]) -> str | None:
-    """The new wiretap id of a sequence a revert put back (it always has another one)."""
+    """The new wiretap id of a sequence or clip a revert put back (it always has another one)."""
     selector = (_result_of(env).get("restored") or {}).get("selector") or {}
     value = selector.get("id")
     return value if isinstance(value, str) else None

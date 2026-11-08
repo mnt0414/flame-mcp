@@ -1728,6 +1728,7 @@ class PyBatch(PyFlameObject):
         self.load_return: Any = True
         self.save_writes_nothing = False
         self.save_stem_suffix = ""  # a rewrite of the name the caller could not predict
+        self.save_setup_extra_files: dict[str, str] = {}  # node files save_setup writes beside
         self._created = 0
         self.reels: list[PyReel] = []
         self.shelf_reels: list[PyReel] = []
@@ -2059,6 +2060,9 @@ class PyBatch(PyFlameObject):
         with open(batch_file, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         os.chmod(batch_file, 0o666)  # Flame runs with umask 0
+        for extra_name, extra_text in self.save_setup_extra_files.items():
+            with open(os.path.join(directory, stem, extra_name), "w", encoding="utf-8") as extra:
+                extra.write(extra_text)
         return True
 
     def _clip_position(self, node: PyClipNode) -> list[Any] | None:

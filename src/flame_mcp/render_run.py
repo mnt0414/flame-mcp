@@ -553,6 +553,52 @@ def judge_render(
     return RenderJudgement(True, None, None, degraded)
 
 
+def _reel_key(kind: str, group: Any, reel: Any) -> tuple[str, str]:
+    """How Flame names a reel in newClips / reelsAfter: a Desktop reel as `group/reel`."""
+    return (kind, f"{group}/{reel}" if kind == "desktop" else str(reel))
+
+
+def missing_outputs(
+    plan: Mapping[str, Any], new_clips: Any, unknown: Any = None, reels_after: Any = None
+) -> list[dict[str, Any]]:
+    """Per destination reel, the effective Render nodes that write into it against the clips the
+    reel gained. A reel that gained fewer clips than it has nodes is listed. A node whose
+    destination could not be read or followed, or whose reel could not be read before the render
+    (`unknown`, Flame's `newClipsUnknown`) or after it (`reels_after`, Flame's `reelsAfter`, a
+    `clipCount` of None), is not counted."""
+    unread = {(e.get("kind"), e.get("name")) for e in unknown or [] if isinstance(e, Mapping)}
+    unread |= {
+        (r.get("kind"), r.get("name"))
+        for r in reels_after or []
+        if isinstance(r, Mapping) and r.get("clipCount") is None
+    }
+    by_reel: dict[tuple[str, str], list[str]] = {}
+    for row in plan.get("nodes") or []:
+        info = row.get("destinationReel")
+        if not info or row.get("kind") != "render" or not row.get("effective"):
+            continue
+        if info.get("groupMissing") or info.get("exists") is None:
+            continue
+        kind = info.get("kind")
+        if kind not in ("shelf", "desktop") or not isinstance(info.get("reel"), str):
+            continue
+        key = _reel_key(kind, info.get("group"), info.get("reel"))
+        if key not in unread:
+            by_reel.setdefault(key, []).append(str(row.get("name")))
+    gained: dict[tuple[str, str], int] = {}
+    for entry in new_clips if isinstance(new_clips, list) else []:
+        if isinstance(entry, Mapping) and entry.get("kind") in ("shelf", "desktop"):
+            clips = entry.get("clips")
+            gained[(entry["kind"], str(entry.get("name")))] = (
+                len(clips) if isinstance(clips, list) else 0
+            )
+    return [
+        {"reel": key[1], "expected": len(nodes), "gained": gained.get(key, 0), "nodes": nodes}
+        for key, nodes in by_reel.items()
+        if gained.get(key, 0) < len(nodes)
+    ]
+
+
 def _finish(
     rt: Runtime,
     op: RegisteredOperation,
@@ -578,6 +624,19 @@ def _finish(
     )
     ok, code, message, degraded = judged.ok, judged.code, judged.message, judged.degraded
     verified: bool | None = (written >= expected) if checked else None
+    missing = (
+        missing_outputs(
+            plan, flame.get("newClips"), flame.get("newClipsUnknown"), flame.get("reelsAfter")
+        )
+        if ok
+        else []
+    )
+    if missing:
+        degraded = [
+            *degraded,
+            "some Render nodes wrote no clip into their destination reel (result.missingOutputs "
+            "lists, per reel, the clips expected and the clips gained)",
+        ]
     result: dict[str, Any] = {
         "ran": True,
         "group": plan.get("batch"),
@@ -596,6 +655,7 @@ def _finish(
         "nodes": rows,
         "newClips": flame.get("newClips"),
         "newClipsUnknown": flame.get("newClipsUnknown"),
+        "missingOutputs": missing or None,
         "reelsBefore": flame.get("reelsBefore"),
         "reelsAfter": flame.get("reelsAfter"),
         "destinationUnsupported": flame.get("destinationUnsupported"),
