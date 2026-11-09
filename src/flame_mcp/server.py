@@ -43,7 +43,7 @@ from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import NO_DEFAULT, SelectorKind
 from flame_mcp_bridge.impl import BRIDGE_ABI
 
-SERVER_VERSION: Final[str] = "0.3.0"
+SERVER_VERSION: Final[str] = "0.4.0"
 TESTED_FLAME_VERSIONS: Final[tuple[str, ...]] = ("2025.2.4", "2026.2.3")
 
 TOOL_VERSION_INFO: Final[str] = "flame_version_info"

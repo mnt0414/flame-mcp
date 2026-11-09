@@ -59,14 +59,19 @@ IGNORED_XML_TAGS: Final[tuple[str, ...]] = (
     "ScrollBar",
     "CUIDsec",
     "CUIDusec",
+    "ClipUIDPath",
 )
 """Tags of the XML format, `<TAG>value</TAG>`, that are dropped: the time of the save, the frame
 the node was on, whether a section was open, the scroll position of a panel, and the two halves of
-an id that is made again on every load (`CUIDsec` and `CUIDusec`: 20 lines)."""
+an id that is made again on every load (`CUIDsec` and `CUIDusec`: 20 lines), and the path of a
+Clip node's clip (`ClipUIDPath`), whose `H_..._S_..._U_...` ids are made again on every load: empty
+in a checkpoint's save, filled after a load, and different between two loads. A Clip node switched
+to another clip of the same name shows only there, so that switch is not found."""
 
-IGNORED_XML_EMPTY_TAGS: Final[tuple[str, ...]] = ("Uncollapsed",)
-"""Tags of the XML format written `<TAG/>` that are dropped: `<Uncollapsed/>`, whether a section was
-open."""
+IGNORED_XML_EMPTY_TAGS: Final[tuple[str, ...]] = ("Uncollapsed", "ClipUIDPath")
+"""Tags of the XML format that are dropped when they are empty, written `<TAG/>` or `<TAG></TAG>`
+(white space inside is allowed): `<Uncollapsed/>`, whether a section was open, and an empty
+`<ClipUIDPath/>`."""
 
 BATCH_IGNORED_TAGS: Final[tuple[str, ...]] = (
     "BatchCurrent",
@@ -121,7 +126,7 @@ _SIZE_LINE: Final[re.Pattern[str]] = re.compile(r"Size [1-9]")
 _XML_DROP: Final[re.Pattern[str]] = re.compile(
     "|".join(
         [f"<{tag}>[^<]*</{tag}>" for tag in IGNORED_XML_TAGS]
-        + [rf"<{tag}\s*/>" for tag in IGNORED_XML_EMPTY_TAGS]
+        + [rf"<{tag}\s*/>|<{tag}>\s*</{tag}>" for tag in IGNORED_XML_EMPTY_TAGS]
     )
 )
 _XML_LEADING_VALUE: Final[re.Pattern[str]] = re.compile(r"<Value>[^<]*</Value>(?=\s*<Size>[1-9])")
@@ -131,6 +136,9 @@ _BATCH_DROP: Final[re.Pattern[str]] = re.compile(
         + [rf"<{tag}\b[^>]*/>" for tag in BATCH_IGNORED_ATTRIBUTE_TAGS]
     )
 )
+_XML_EMPTY: Final[re.Pattern[str]] = re.compile(r"<(\w+)((?:\s[^<>]*?)?)>\s*</\1>")
+"""An element with nothing but white space inside, written `<X></X>`: the same as `<X/>`, which is
+how the save after a load writes it (`<Channel Name=...></Channel>` of a resize node)."""
 _FLAGS: Final[re.Pattern[str]] = re.compile(r"<Flags>(\d+)</Flags>")
 _NODE_LINE: Final[re.Pattern[str]] = re.compile(r"Name\s+(\S.*)")
 _NODE_XML: Final[re.Pattern[str]] = re.compile(r"<(NAME|Name)>([^<]*)</\1>")
@@ -152,6 +160,7 @@ def normalize(name: str, text: str) -> list[str]:
     if name == BATCH_FILE:
         text = _BATCH_DROP.sub("", text)
         text = _FLAGS.sub(_clear_noise_bits, text)
+    text = _XML_EMPTY.sub(r"<\1\2/>", text)
     raw = [line.strip() for line in text.splitlines()]
     lines: list[str] = []
     for index, line in enumerate(raw):
@@ -237,10 +246,34 @@ def _where(a: list[str], index: int) -> dict[str, str | None]:
     return {"node": node, "channel": channel}
 
 
+def _named_inside(lines: list[str]) -> str | None:
+    """The `<Name>` / `<NAME>` of a node that the lines themselves hold, else None. Only the XML
+    form is read; a `Name` line of the line format is not."""
+    for line in lines:
+        found = _NODE_XML.fullmatch(line)
+        if found and found.group(2):
+            return found.group(2)
+    return None
+
+
+def _hunk_where(
+    a: list[str], b: list[str], opcode: tuple[str, int, int, int, int]
+) -> dict[str, str | None]:
+    """`_where`, except that a hunk which holds a `<Name>` (a node added or removed as a whole)
+    names that node and the first channel inside the hunk, not the node before it."""
+    _tag, i1, i2, j1, j2 = opcode
+    inside = a[i1:i2] + b[j1:j2]
+    node = _named_inside(inside)
+    if node is None:
+        return _where(a, i1)
+    channel = next((c for c in map(_channel_of, inside) if c is not None), None)
+    return {"node": node, "channel": channel}
+
+
 def _hunk(a: list[str], b: list[str], opcode: tuple[str, int, int, int, int]) -> dict[str, Any]:
     _tag, i1, i2, j1, j2 = opcode
     hunk: dict[str, Any] = {
-        "where": _where(a, i1),
+        "where": _hunk_where(a, b, opcode),
         "before": _cut(a[i1:i2]),
         "after": _cut(b[j1:j2]),
     }

@@ -22,7 +22,7 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 | Read | List libraries, reels, clips, and sequences. Read segments (video and audio), Batch nodes, and their attributes. Compare two sequences. |
 | Organize | Create, duplicate, move, and rename reels, clips, and sequences. Delete clips and sequences. |
 | Edit | Trim, slip, replace, and delete segments (closing the gap or leaving it). Cut, insert, and overwrite. Move video tracks. Shorten a sequence. Read and set segment connections. Add and set up Timeline FX. |
-| Batch | Create, connect, and set up nodes. Save and load setups. Render. |
+| Batch | Create, connect, and set up nodes. Save and load setups. Compare a setup with one saved earlier to find values changed by hand. Render. |
 | Multi-step plans | Run several operations as one procedure (`plan.run`). |
 
 There are 111 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).

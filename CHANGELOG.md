@@ -2,11 +2,13 @@
 
 All notable changes to flame-mcp are recorded here.
 
-## Unreleased
+## 0.4.0
+
+111 operations in 13 categories (0.3.0 had 110). One operation is new: `batch.compare_setup`.
 
 ### New operations
 
-- New operation `batch.compare_setup`: compares a Batch group's current setup with an earlier `.batch` file (`baseline`, from `batch.save_setup` or `batch.checkpoint`) and lists the files and lines that differ (`result.files[].hunks` with the nearest node and channel), so a value changed by hand is found though `batch.fingerprint` is the same. It is a read: Flame saves the setup once into a work folder under `<journal dir>/setups` and the comparison runs in the server; lines that change while no value changes (the time of the save, the frame the Batch is on, schematic positions, whether a section is open, the first Value of a channel that has keys, some `Flags` bits, `MV.json`) are left out. A file over 1,000,000 bytes of text is reported as changed without its lines (`tooLargeToList`), and at most 20 hunks per file and 50 files are listed (`truncated`). Timeline FX of the reel clips are not in a Batch setup and are not compared.
+- New operation `batch.compare_setup`: compares a Batch group's current setup with an earlier `.batch` file (`baseline`, from `batch.save_setup` or `batch.checkpoint`) and lists the files and lines that differ (`result.files[].hunks` with the nearest node and channel), so a value changed by hand is found though `batch.fingerprint` is the same. It is a read: Flame saves the setup once into a work folder under `<journal dir>/setups` and the comparison runs in the server; lines that change while no value changes (the time of the save, the frame the Batch is on, schematic positions, whether a section is open, the first Value of a channel that has keys, some `Flags` bits, `MV.json`, the `ClipUIDPath` of a Clip node, which is made again on every load) are left out, and an empty element is the same written `<X></X>` or `<X/>`. Because `ClipUIDPath` is left out, a Clip node switched to another clip of the same name is not found. A hunk that adds or removes a whole node in an XML setup names that node. A file over 1,000,000 bytes of text is reported as changed without its lines (`tooLargeToList`), and at most 20 hunks per file and 50 files are listed (`truncated`). Timeline FX of the reel clips are not in a Batch setup and are not compared. Checked on Flame 2025.2.4 and 2026.2.3.
 
 ### Changes to existing operations
 

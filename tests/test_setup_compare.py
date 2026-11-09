@@ -746,3 +746,111 @@ def test_a_line_that_does_not_start_with_a_tag_is_not_split(tmp_path: Path) -> N
     a, b = pair(tmp_path, before={"x.txt": "a><b old\n"}, after={"x.txt": "a><b new\n"})
     [hunk] = compare_setups(a, b)["files"][0]["hunks"]
     assert hunk["before"] == ["a><b old"]
+
+
+def test_an_empty_xml_element_is_the_same_whichever_way_it_is_written(tmp_path: Path) -> None:
+    a, b = pair(
+        tmp_path,
+        before={
+            "r.resize_node": '<A><Channel Name="X">\n  </Channel><Channel Name="Y"></Channel></A>'
+        },
+        after={"r.resize_node": '<A><Channel Name="X"/><Channel Name="Y"/></A>'},
+    )
+    assert compare_setups(a, b)["changed"] is False
+
+
+def test_an_element_with_a_value_is_not_the_same_as_an_empty_one(tmp_path: Path) -> None:
+    a, b = pair(
+        tmp_path,
+        before={"r.resize_node": '<A><Channel Name="X"></Channel></A>'},
+        after={"r.resize_node": '<A><Channel Name="X"><Value>1</Value></Channel></A>'},
+    )
+    assert compare_setups(a, b)["changed"] is True
+
+
+def test_an_empty_ignored_tag_is_still_dropped(tmp_path: Path) -> None:
+    a, b = pair(
+        tmp_path,
+        before={"x.xml": "<A><ScrollBar></ScrollBar><B>1</B></A>"},
+        after={"x.xml": "<A><B>1</B></A>"},
+    )
+    assert compare_setups(a, b)["changed"] is False
+
+
+def test_a_clip_uid_path_is_ignored_whether_empty_or_filled_or_different(tmp_path: Path) -> None:
+    def clip(path: str) -> str:
+        return f"<Clip><ClipUIDPath>{path}</ClipUIDPath><ClipName>c</ClipName></Clip>"
+
+    cases = [
+        ("\n", "/a/b"),
+        ("/a/b", "\n"),
+        ("/H_1_S_2_U_3", "/H_1_S_2_U_4"),
+    ]
+    for number, (first, second) in enumerate(cases):
+        a, b = pair(
+            tmp_path / f"case{number}",
+            before={"c.clip_node": clip(first)},
+            after={"c.clip_node": clip(second)},
+        )
+        assert compare_setups(a, b)["changed"] is False
+
+
+def test_a_clip_name_that_differs_is_a_change_though_the_clip_uid_path_is_ignored(
+    tmp_path: Path,
+) -> None:
+    a, b = pair(
+        tmp_path,
+        before={"c.clip_node": "<Clip><ClipUIDPath>/a</ClipUIDPath><ClipName>c</ClipName></Clip>"},
+        after={"c.clip_node": "<Clip><ClipUIDPath>/b</ClipUIDPath><ClipName>d</ClipName></Clip>"},
+    )
+    [hunk] = compare_setups(a, b)["files"][0]["hunks"]
+    assert hunk["before"] == ["<ClipName>c</ClipName>"]
+    assert hunk["after"] == ["<ClipName>d</ClipName>"]
+
+
+def test_an_empty_batch_date_is_dropped_and_not_turned_into_a_difference(tmp_path: Path) -> None:
+    filled = batch_xml()
+    empty = filled.replace("<BatchDate>1792177580</BatchDate>", "<BatchDate></BatchDate>")
+    assert empty != filled
+    a, b = pair(tmp_path, before_batch=filled, after_batch=empty)
+    assert compare_setups(a, b)["changed"] is False
+
+
+def test_an_ignored_empty_tag_is_dropped_in_both_empty_forms(tmp_path: Path) -> None:
+    a, b = pair(
+        tmp_path,
+        before={"x.xml": "<A><Uncollapsed></Uncollapsed><B>1</B></A>"},
+        after={"x.xml": "<A><Uncollapsed/><B>1</B></A>"},
+    )
+    assert compare_setups(a, b)["changed"] is False
+    c, d = pair(
+        tmp_path / "plain",
+        before={"x.xml": "<A><Uncollapsed> </Uncollapsed><B>1</B></A>"},
+        after={"x.xml": "<A><B>1</B></A>"},
+    )
+    assert compare_setups(c, d)["changed"] is False
+
+
+def test_an_empty_element_with_a_greater_than_in_an_attribute_is_not_normalized(
+    tmp_path: Path,
+) -> None:
+    a, b = pair(
+        tmp_path,
+        before={"x.xml": '<A><X a=">"></X></A>'},
+        after={"x.xml": '<A><X a=">"/></A>'},
+    )
+    assert compare_setups(a, b)["changed"] is True
+
+
+def test_a_node_added_to_the_batch_file_is_named_in_where(tmp_path: Path) -> None:
+    before = batch_xml().replace(
+        "<Links/>", "<Node><Name>render1</Name><Note>a</Note></Node><Links/>"
+    )
+    after = before.replace(
+        "<Links/>", "<Node><Type>Blur</Type><Name>p97_blur</Name></Node><Links/>"
+    )
+    a, b = pair(tmp_path, before_batch=before, after_batch=after)
+    hunks = compare_setups(a, b)["files"][0]["hunks"]
+    assert [h["where"]["node"] for h in hunks] == ["p97_blur"]
+    removed = compare_setups(b, a)["files"][0]["hunks"]
+    assert [h["where"]["node"] for h in removed] == ["p97_blur"]
