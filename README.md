@@ -268,6 +268,7 @@ With `FLAME_MCP_RESPONSE=compact`, the server leaves out of each response what t
 - A list of three or more objects of the same shape is sent as a table, `{columns, rows}`.
 - What the assistant passes back to undo or repeat a call (`revert`, `inverse`, `args`) keeps its full form.
 - `flame_catalog(op=...)` without `detail` answers with `'args'`, the argument shapes only. Pass `detail='full'` for the whole description; the result's `detail` says which form came back.
+- `plan.run` with `result_detail='auto'` (the default) decides for each step: a read step keeps its whole result, a write step that succeeded is cut to a short `brief`, and a step that failed keeps its error, result, and journal.
 
 The server explains this form to the assistant in its instructions and in `flame_context` (`responseFormat`).
 

@@ -268,6 +268,7 @@ flame-mcp がディスクに作成するファイルは、Flame を起動した�
 - 同じ形の辞書が 3 つ以上並ぶ一覧は、表の形 `{columns, rows}` で送ります。
 - アシスタントが元に戻すときや同じ呼び出しを繰り返すときに渡す値 (`revert`、`inverse`、`args`) は、元の形のまま送ります。
 - `flame_catalog(op=...)` は `detail` を省くと `'args'` (引数の形だけ) で答えます。説明の全文は `detail='full'` で読めます。どちらの形で返したかは、結果の `detail` に入ります。
+- `plan.run` は `result_detail='auto'` (既定) のとき、手順ごとに形を決めます。読み取りの手順は結果をすべて返し、成功した書き込みの手順は短い `brief` だけを返します。失敗した手順は、エラー・結果・journal を返します。
 
 この形はサーバーの instructions と `flame_context` (`responseFormat`) でアシスタントに説明します。
 
