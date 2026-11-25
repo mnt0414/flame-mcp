@@ -28,6 +28,8 @@ cannot say whether the segments were synced; read the segments and compare them 
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
@@ -42,9 +44,16 @@ from flame_mcp.journal import (
     new_id,
     now_iso,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import CheckRecord, IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import (
+    UNKNOWN_END_CODES,
+    close_outcome,
+    note_unresolved,
+    outcome_not_journaled_note,
+)
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
+from flame_mcp.types import PHASE_ARG
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime, ServerContext
@@ -59,7 +68,6 @@ REMOVE_KIND: Final[str] = "segment_connection_remove"
 """`kind` of the intent a step of any connection write makes. The intent's `action` says which
 write it was, and `check_remove_intent` decides by it. `journal.check` dispatches on this kind."""
 
-PHASE_ARG: Final[str] = "_phase"
 PHASE_CHECK: Final[str] = "check"
 PHASE_STEP: Final[str] = "step"
 """Reserved args key and its values: only this module puts them into the op's args (a caller cannot
@@ -106,20 +114,19 @@ def _write_intent(
     returns its id. `selector` is the segment's stable address. `connectedBefore` is the number of
     other connected segments as last read; the check compares the count read again with it."""
     intent_id = new_id("i")
-    rt.journal.append(
-        {
-            "type": "intent",
-            "id": intent_id,
-            "group": group,
-            "ts": now_iso(),
-            "op": op_name,
-            "kind": REMOVE_KIND,
-            "action": ACTIONS[op_name],
-            "args": {"target": selector, "step": step},
-            "target": selector,
-            "connectedBefore": connected_before,
-        }
-    )
+    intent: IntentRecord = {
+        "type": "intent",
+        "id": intent_id,
+        "group": group,
+        "ts": now_iso(),
+        "op": op_name,
+        "kind": REMOVE_KIND,
+        "action": ACTIONS[op_name],
+        "args": {"target": selector, "step": step},
+        "target": selector,
+        "connectedBefore": connected_before,
+    }
+    rt.journal.append(intent)
     return intent_id
 
 
@@ -131,44 +138,25 @@ def _close_step(
     the envelope's `degraded`."""
     code = env.get("errorCode")
     if unknown:
-        rt.guard.block(intent_id, group, op_name, str(code or "UNKNOWN_END"))
-        try:
-            rt.journal.append(
-                {
-                    "type": "unresolved",
-                    "id": intent_id,
-                    "group": group,
-                    "ts": now_iso(),
-                    "errorCode": code,
-                    "error": env.get("error"),
-                }
-            )
-        except OSError:
-            pass  # the open intent already says "in doubt"; the guard is what matters
+        note_unresolved(rt, intent_id, group, env, op_name, str(code or "UNKNOWN_END"))
         return []
     raw = env.get("result")
     result: dict[str, Any] = raw if isinstance(raw, dict) else {}
-    try:
-        rt.journal.append(
-            {
-                "type": "outcome",
-                "id": intent_id,
-                "group": group,
-                "ts": now_iso(),
-                "ok": env.get("ok") is True,
-                "applied": [],
-                "changedKeys": [],
-                "failed": {},
-                "errorCode": code,
-                "readBack": {"connected": result.get("connected"), "ran": result.get("ran")},
-            }
-        )
-    except OSError as exc:
-        rt.guard.block(intent_id, group, op_name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-        return [
-            f"the outcome could not be journaled ({exc}); the write's answer stands but this "
-            "server now refuses writes until journal.check has settled the intent"
-        ]
+    outcome: OutcomeRecord = {
+        "type": "outcome",
+        "id": intent_id,
+        "group": group,
+        "ts": now_iso(),
+        "ok": env.get("ok") is True,
+        "applied": [],
+        "changedKeys": [],
+        "failed": {},
+        "errorCode": code,
+        "readBack": {"connected": result.get("connected"), "ran": result.get("ran")},
+    }
+    exc = close_outcome(rt, outcome, intent_id, group, op_name)
+    if exc is not None:
+        return [outcome_not_journaled_note(exc)]
     return []
 
 
@@ -223,144 +211,126 @@ def _run_single(
 ) -> dict[str, Any]:
     started = time.monotonic()
     action = ACTIONS[op.name]
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        check = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_CHECK}, run_dir=rt.run_dir)
-        if check.get("ok") is not True:
-            return check
-        raw = check.get("result")
-        stable = raw.get("stable") if isinstance(raw, dict) else None
-        if not isinstance(stable, dict):
-            return _refused_without_address(op, started, "the target")
-        group_id = group if group is not None else new_id("g")
-        try:
-            intent_id = _write_intent(
-                rt, op.name, group_id, stable, _before_of(raw), {"index": 0, "of": 1}
-            )
-        except OSError as exc:
-            failure = _unwritable(rt, exc)
-            return envelope_mod.from_pre_bridge_error(
-                error=failure["error"],
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=failure["hint"],
-            )
-        env = execution.run_op(op, {**op_args, "target": stable}, run_dir=rt.run_dir)
-        unknown = _is_unknown(env)
-        degraded = _close_step(rt, op.name, intent_id, group_id, env, unknown=unknown)
-        if unknown:
-            env["hint"] = (str(env.get("hint") or "") + unknown_hint(action, group_id)).strip()
-        if degraded:
-            env["degraded"] = [*env.get("degraded", []), *degraded]
-        env["journal"] = {"group": group_id, "id": intent_id}
-        return env
-
-
-def run_connection_write(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
-) -> dict[str, Any]:
-    """The `wrap` of the three connection writes: `target` is one journaled step; `targets`
-    (remove only) is one step per target."""
-    if op_args.get("targets") is None:
-        return _run_single(rt, op, op_args, group)
-    started = time.monotonic()
-    targets: list[dict[str, Any]] = list(op_args["targets"])
+    check = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_CHECK}, run_dir=rt.run_dir)
+    if check.get("ok") is not True:
+        return check
+    raw = check.get("result")
+    stable = raw.get("stable") if isinstance(raw, dict) else None
+    if not isinstance(stable, dict):
+        return _refused_without_address(op, started, "the target")
     group_id = group if group is not None else new_id("g")
-    intent_ids: list[str] = []
-    degraded: list[str] = []
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        check = execution.run_op(
-            op, {"targets": targets, PHASE_ARG: PHASE_CHECK}, run_dir=rt.run_dir
+    try:
+        intent_id = _write_intent(
+            rt, op.name, group_id, stable, _before_of(raw), {"index": 0, "of": 1}
         )
-        raw = check.get("result")
-        if check.get("ok") is not True or not isinstance(raw, dict):
-            return check
-        initial = [i["connected"]["before"] for i in raw["items"]]
-        stables = [i.get("stable") for i in raw["items"]]
-        missing = [i for i, address in enumerate(stables) if not isinstance(address, dict)]
-        if missing:
-            return _refused_without_address(op, started, f"targets[{missing[0]}]")
-        body: dict[str, Any] = {
-            "action": "remove",
-            "requested": len(targets),
-            "ran": True,
-            "removed": [],
-            "notRemoved": [],
-            "unknown": [],
-            "alreadyDisconnected": [],
-            "items": [],
-            "notices": list(raw.get("notices") or []),
-            "warnings": [],
-            "partial": False,
-        }
-        failed: dict[str, Any] | None = None
-        for index in range(len(targets)):
-            try:
-                intent_id = _write_intent(
-                    rt,
-                    op.name,
-                    group_id,
-                    stables[index],
-                    initial[index],
-                    {"index": index, "of": len(targets)},
-                )
-            except OSError as exc:
-                env = _unwritable(rt, exc)
-                body["items"].append(_item(index, env, unknown=False))
-                body["notRemoved"] += list(range(index, len(targets)))
-                failed = {"index": index, "env": env, "unknown": False}
-                break
-            intent_ids.append(intent_id)
-            env = execution.run_op(
-                op, {"targets": [stables[index]], PHASE_ARG: PHASE_STEP}, run_dir=rt.run_dir
-            )
-            unknown = _is_unknown(env)
-            degraded += _close_step(rt, op.name, intent_id, group_id, env, unknown=unknown)
-            step = env.get("result")
-            for text in (step.get("warnings") or []) if isinstance(step, dict) else []:
-                body["warnings"].append(f"targets[{index}]: {text}")
-            if env.get("ok") is True and isinstance(step, dict):
-                body["items"].append(_item(index, env, unknown=False))
-                if step.get("alreadyDisconnected"):
-                    body["alreadyDisconnected"].append(index)
-                    if initial[index] == 0:
-                        body["warnings"].append(
-                            f"targets[{index}] was not connected before this call: "
-                            "remove_connection() was not called for it"
-                        )
-                else:
-                    body["removed"].append(index)
-                continue
-            body["items"].append(_item(index, env, unknown=unknown))
-            (body["unknown"] if unknown else body["notRemoved"]).append(index)
-            body["notRemoved"] += list(range(index + 1, len(targets)))
-            failed = {"index": index, "env": env, "unknown": unknown}
-            break
+    except OSError as exc:
+        failure = _unwritable(rt, exc)
+        return envelope_mod.from_pre_bridge_error(
+            error=failure["error"],
+            error_code="POLICY_DENIED",
+            op=op,
+            duration_ms=elapsed_ms(started),
+            hint=failure["hint"],
+        )
+    env = execution.run_op(op, {**op_args, "target": stable}, run_dir=rt.run_dir)
+    unknown = _is_unknown(env)
+    degraded = _close_step(rt, op.name, intent_id, group_id, env, unknown=unknown)
+    if unknown:
+        env["hint"] = (str(env.get("hint") or "") + unknown_hint(action, group_id)).strip()
+    if degraded:
+        env["degraded"] = [*env.get("degraded", []), *degraded]
+    env["journal"] = {"group": group_id, "id": intent_id}
+    return env
 
-    meta = envelope_mod.execution_meta(op)
+
+@dataclass
+class _RemoveBatch:
+    """The state of one `targets` call while its steps run."""
+
+    rt: Runtime
+    op: RegisteredOperation
+    group_id: str
+    total: int
+    body: dict[str, Any]
+    intent_ids: list[str] = field(default_factory=list)
+    degraded: list[str] = field(default_factory=list)
+
+
+def _new_remove_body(total: int, raw: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "action": "remove",
+        "requested": total,
+        "ran": True,
+        "removed": [],
+        "notRemoved": [],
+        "unknown": [],
+        "alreadyDisconnected": [],
+        "items": [],
+        "notices": list(raw.get("notices") or []),
+        "warnings": [],
+        "partial": False,
+    }
+
+
+def _remove_step(run: _RemoveBatch, index: int, stable: Any, initial: Any) -> dict[str, Any] | None:
+    """One target of a `targets` call: journals its intent, runs the step and closes it. None when
+    the target is done (removed or already disconnected); else the failure that stops the call."""
+    body = run.body
+    try:
+        intent_id = _write_intent(
+            run.rt,
+            run.op.name,
+            run.group_id,
+            stable,
+            initial,
+            {"index": index, "of": run.total},
+        )
+    except OSError as exc:
+        env = _unwritable(run.rt, exc)
+        body["items"].append(_item(index, env, unknown=False))
+        body["notRemoved"] += list(range(index, run.total))
+        return {"index": index, "env": env, "unknown": False}
+    run.intent_ids.append(intent_id)
+    env = execution.run_op(
+        run.op, {"targets": [stable], PHASE_ARG: PHASE_STEP}, run_dir=run.rt.run_dir
+    )
+    unknown = _is_unknown(env)
+    run.degraded += _close_step(run.rt, run.op.name, intent_id, run.group_id, env, unknown=unknown)
+    step = env.get("result")
+    for text in (step.get("warnings") or []) if isinstance(step, dict) else []:
+        body["warnings"].append(f"targets[{index}]: {text}")
+    if env.get("ok") is True and isinstance(step, dict):
+        body["items"].append(_item(index, env, unknown=False))
+        if step.get("alreadyDisconnected"):
+            body["alreadyDisconnected"].append(index)
+            if initial == 0:
+                body["warnings"].append(
+                    f"targets[{index}] was not connected before this call: "
+                    "remove_connection() was not called for it"
+                )
+        else:
+            body["removed"].append(index)
+        return None
+    body["items"].append(_item(index, env, unknown=unknown))
+    (body["unknown"] if unknown else body["notRemoved"]).append(index)
+    body["notRemoved"] += list(range(index + 1, run.total))
+    return {"index": index, "env": env, "unknown": unknown}
+
+
+def _batch_envelope(
+    run: _RemoveBatch, failed: dict[str, Any] | None, started: float
+) -> dict[str, Any]:
+    """The envelope of a `targets` call: ok when every target was done, else the stop at the
+    first failure."""
+    body = run.body
+    group_id = run.group_id
+    meta = envelope_mod.execution_meta(run.op)
     removed = len(body["removed"]) + len(body["unknown"])
     partial = (
         {"removed": removed, "notRemoved": len(body["notRemoved"])} if failed and removed else None
     )
-    ref = {"group": group_id, "id": intent_ids[0], "ids": intent_ids} if intent_ids else None
+    ids = run.intent_ids
+    ref = {"group": group_id, "id": ids[0], "ids": ids} if ids else None
     if failed is None:
         return _with_degraded(
             envelope_mod.build_envelope(
@@ -371,7 +341,7 @@ def run_connection_write(
                 execution=meta,
                 duration_ms=elapsed_ms(started),
             ),
-            degraded,
+            run.degraded,
         )
     body["partial"] = partial is not None
     index = failed["index"]
@@ -401,8 +371,36 @@ def run_connection_write(
             duration_ms=elapsed_ms(started),
             hint_override=hint,
         ),
-        degraded,
+        run.degraded,
     )
+
+
+def run_connection_write(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` of the three connection writes: `target` is one journaled step; `targets`
+    (remove only) is one step per target."""
+    if op_args.get("targets") is None:
+        return _run_single(rt, op, op_args, group)
+    started = time.monotonic()
+    targets: list[dict[str, Any]] = list(op_args["targets"])
+    group_id = group if group is not None else new_id("g")
+    check = execution.run_op(op, {"targets": targets, PHASE_ARG: PHASE_CHECK}, run_dir=rt.run_dir)
+    raw = check.get("result")
+    if check.get("ok") is not True or not isinstance(raw, dict):
+        return check
+    initial = [i["connected"]["before"] for i in raw["items"]]
+    stables = [i.get("stable") for i in raw["items"]]
+    missing = [i for i, address in enumerate(stables) if not isinstance(address, dict)]
+    if missing:
+        return _refused_without_address(op, started, f"targets[{missing[0]}]")
+    run = _RemoveBatch(rt, op, group_id, len(targets), _new_remove_body(len(targets), raw))
+    failed: dict[str, Any] | None = None
+    for index in range(len(targets)):
+        failed = _remove_step(run, index, stables[index], initial[index])
+        if failed is not None:
+            break
+    return _batch_envelope(run, failed, started)
 
 
 def _with_degraded(env: dict[str, Any], notes: list[str]) -> dict[str, Any]:
@@ -479,17 +477,16 @@ def check_remove_intent(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
     per_key = {"connected": finding}
     current = {"connected": count}
     entry.update(verdict=verdict, perKey=per_key, current=current)
-    ctx.journal.append(
-        {
-            "type": "check",
-            "id": view.id,
-            "group": view.group,
-            "ts": now_iso(),
-            "verdict": verdict,
-            "perKey": per_key,
-            "current": current,
-            "target": target,
-        }
-    )
+    check: CheckRecord = {
+        "type": "check",
+        "id": view.id,
+        "group": view.group,
+        "ts": now_iso(),
+        "verdict": verdict,
+        "perKey": per_key,
+        "current": current,
+        "target": target,
+    }
+    ctx.journal.append(check)
     ctx.guard.release(view.id)
     return entry

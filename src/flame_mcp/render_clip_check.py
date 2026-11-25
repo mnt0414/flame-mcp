@@ -8,16 +8,21 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp.desktop_revert import observe
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ
+from flame_mcp.desktop_run import PHASE_READ
 from flame_mcp.journal import (
     STATE_DIVERGED,
-    STATE_FAILED,
     STATE_LANDED,
     STATE_NOT_LANDED,
     IntentView,
 )
-from flame_mcp.render_check import _append_check, _unknown_entry, fetch_answer
+from flame_mcp.render_check import (
+    _append_check,
+    _unknown_entry,
+    fetch_answer,
+    verdict_after_run,
+)
 from flame_mcp.render_clip_run import MEDIA_TYPES, OP_NAME, judge_render_clip
+from flame_mcp.types import PHASE_ARG
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -48,12 +53,7 @@ def _check_with_result(
         env_error=polled.get("error"),
         flame=flame,
     )
-    if judged.ok:
-        verdict = STATE_LANDED
-    elif judged.code == "SILENT_NOOP":
-        verdict = STATE_NOT_LANDED
-    else:
-        verdict = STATE_FAILED
+    verdict = verdict_after_run(ok=judged.ok, code=judged.code, wrote_part=False)
     per_key = {"timelineFx": verdict}
     current = {"isRendered": flame.get("isRenderedAfter")}
     outcome = {
@@ -71,7 +71,7 @@ def _check_with_result(
     if not judged.ok:
         entry["detail"] = f"the render ended and reported: {judged.message}"
     _append_check(
-        ctx, view, verdict, per_key, current, basis="handle", renderOutcome=outcome, flame=outcome
+        ctx, view, verdict, per_key, current, basis="handle", render_outcome=outcome, flame=outcome
     )
     return entry
 

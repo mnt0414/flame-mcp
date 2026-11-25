@@ -18,6 +18,7 @@ from fake_media_tree import PySegment
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     CLIPX,
     S1,
@@ -38,13 +39,10 @@ from timeline_p32a_helpers import (
     wt,
 )
 
+rig = rig_fixture(make_timeline_rig)
+
 GAP = "Gap"
 VIDEO = "Video Segment"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def track0(rig: Rig) -> list[list[Any]]:
@@ -380,7 +378,7 @@ def test_the_intent_is_flushed_before_the_trim_is_sent(rig: Rig) -> None:
 
 def test_the_envelope_says_undo_is_a_checkpoint_and_native_undo_is_not_used(rig: Rig) -> None:
     env = trim(rig, a_seg(), "head", 2)
-    assert env["execution"]["undo"] == "checkpoint" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "checkpoint"
     assert env["execution"]["thread"] == "main" and env["execution"]["effect"] == "reversible"
 
 

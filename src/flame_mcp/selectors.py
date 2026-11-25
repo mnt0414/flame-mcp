@@ -206,6 +206,21 @@ def describe_kind(kind: SelectorKind) -> dict[str, Any]:
     }
 
 
+def describe_kind_brief(kind: SelectorKind) -> dict[str, Any]:
+    """Returns `{"kind", "fields", "example"}`: `describe_kind` without the label and the field
+    descriptions. `fields` maps each key to `{"type", "required"}`. flame_catalog's per-op
+    `accepts` uses it; the descriptions are in flame_context's selectorVocabulary."""
+    full = describe_kind(kind)
+    return {
+        "kind": kind,
+        "fields": {
+            name: {"type": field["type"], "required": field["required"]}
+            for name, field in full["fields"].items()
+        },
+        "example": full["example"],
+    }
+
+
 def _is_non_negative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 

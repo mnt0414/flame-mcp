@@ -29,11 +29,9 @@ from reformat_helpers import (
     uid,
     wt,
 )
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_reformat_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_reformat_rig)
 
 
 def sel(rig: Rig, name: str) -> dict[str, Any]:

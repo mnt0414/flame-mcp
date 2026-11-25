@@ -4,10 +4,7 @@ Also `journal.revert` and `journal.check`. See media_p31b_helpers.py for the rig
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import (
     PyFolder,
@@ -35,11 +32,9 @@ from media_p31b_helpers import (
     write_codes,
     wt,
 )
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 def desk_clips(rig: Rig, *clip_names: str) -> list[dict[str, Any]]:
@@ -75,7 +70,7 @@ def test_move_a_clip_to_another_desktop_reel_gives_the_new_selector_and_kills_th
     assert old["ok"] is False and old["errorCode"] == "SELECTOR_EMPTY"
     new = rig.do("desktop.info", {"target": row["to"]["selector"]})
     assert new["ok"] is True and new["result"]["uid"] == row["to"]["uid"]
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert rig.flame.find_by_uid(old_uid) is None
 
 

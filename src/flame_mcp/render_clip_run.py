@@ -35,29 +35,26 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import errors, execution
-from flame_mcp.checkpointed import ASCII_REFUSAL_HINT, _first_non_ascii
+from flame_mcp import errors
 from flame_mcp.desktop_run import (
     EXPECTED_ARG,
-    PHASE_ARG,
-    PHASE_READ,
     PHASE_WRITE,
-    pre_read_failure,
 )
 from flame_mcp.journal import new_id, now_iso
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
-from flame_mcp.render_run import (
+from flame_mcp.types import PHASE_ARG, ErrorCode
+from flame_mcp.write_run import (
     HANDLE_SOURCE_CLIENT,
+    Refused,
     RenderJudgement,
-    _fail_env,
-    _new_client_handle,
-    _refusal,
-    _remove_result_file,
-    _unknown_end,
+    append_intent,
+    check_ascii,
+    new_client_handle,
+    read_facts,
+    run_and_close,
+    settle_envelope,
 )
-from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -213,7 +210,7 @@ def _intent_record(
     group_id: str,
     timeout_s: float,
     handle: str | None,
-) -> dict[str, Any]:
+) -> IntentRecord:
     return {
         "type": "intent",
         "id": intent_id,
@@ -243,7 +240,7 @@ def _outcome_record(
     group_id: str,
     judged: RenderJudgement,
     flame: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     return {
         "type": "outcome",
         "id": intent_id,
@@ -264,44 +261,29 @@ def _outcome_record(
     }
 
 
-def run_render_clip(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
-) -> dict[str, Any]:
-    """The `wrap` of `render.clip`."""
-    started = time.monotonic()
-    timeout_s = float(op_args["timeout_s"])
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        raw = pre_env.get("result")
-        if pre_env.get("ok") is not True or not isinstance(raw, dict):
-            return pre_read_failure(op, pre_env, "rendered")
-        facts: dict[str, Any] = raw
-        problem = _problem(facts, bool(op_args["force"]))
-        stable = _stable_selector(facts, op_args["target"])
-        shown = {
-            "ran": False,
-            "target": target_info(facts, stable),
-            "location": facts.get("location"),
-            "effects": facts.get("effects"),
-            "effectCount": facts.get("effectCount"),
-            "gapBatchFx": facts.get("gapBatchFx"),
-            "gapBatchFxMore": facts.get("gapBatchFxMore"),
-            "isRendered": facts.get("isRendered"),
-        }
-        if problem is not None:
-            code, message, hint = problem
-            return _refusal(op, code, message, started, result=shown, hint=hint)
-        if stable is None:
-            return _refusal(
+def _check_facts(
+    op: RegisteredOperation, op_args: Mapping[str, Any], facts: Mapping[str, Any], started: float
+) -> Any:
+    """The stable selector of the target; `Refused` for a target that cannot be rendered or found
+    again."""
+    problem = _problem(facts, bool(op_args["force"]))
+    stable = _stable_selector(facts, op_args["target"])
+    shown = {
+        "ran": False,
+        "target": target_info(facts, stable),
+        "location": facts.get("location"),
+        "effects": facts.get("effects"),
+        "effectCount": facts.get("effectCount"),
+        "gapBatchFx": facts.get("gapBatchFx"),
+        "gapBatchFxMore": facts.get("gapBatchFxMore"),
+        "isRendered": facts.get("isRendered"),
+    }
+    if problem is not None:
+        code, message, hint = problem
+        raise Refused(envelope_mod.refusal(op, code, message, started, result=shown, hint=hint))
+    if stable is None:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 "nothing was rendered: the target has no wiretap id, so it could not be found "
@@ -310,73 +292,93 @@ def run_render_clip(
                 result=shown,
                 hint="Give a wiretap or a path selector.",
             )
-
-        issue = _first_non_ascii(
-            target=stable, uid=facts.get("uid"), wiretapId=facts.get("wiretapId")
         )
-        if issue is not None:
-            return _refusal(
-                op,
-                "INVALID_ARGS",
-                f"nothing was rendered: {issue.path}: {issue.message}",
-                started,
-                result={"ran": False},
-                hint=ASCII_REFUSAL_HINT,
-            )
+    return stable
 
+
+def run_render_clip(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` of `render.clip`."""
+    started = time.monotonic()
+    timeout_s = float(op_args["timeout_s"])
+    try:
+        facts = read_facts(rt, op, op_args, "rendered")
+        stable = _check_facts(op, op_args, facts, started)
+        check_ascii(
+            op,
+            started,
+            "rendered",
+            target=stable,
+            uid=facts.get("uid"),
+            wiretapId=facts.get("wiretapId"),
+        )
         group_id = group if group is not None else new_id("g")
         intent_id = new_id("i")
-        client_handle = _new_client_handle(rt)
-        try:
-            rt.journal.append(
-                _intent_record(
-                    op,
-                    op_args,
-                    facts,
-                    stable,
-                    intent_id=intent_id,
-                    group_id=group_id,
-                    timeout_s=timeout_s,
-                    handle=client_handle,
-                )
-            )
-        except OSError as exc:
-            return _refusal(
+        client_handle = new_client_handle(rt)
+        append_intent(
+            rt,
+            op,
+            _intent_record(
                 op,
-                "POLICY_DENIED",
-                f"nothing was rendered: the journal cannot be written ({exc}), and this server "
-                "does not render without an intent on record",
-                started,
-                result={"ran": False},
-                hint=f"Make {rt.journal.directory} writable, then retry.",
-            )
-
-        run_args = {
-            **op_args,
-            "target": stable,
-            PHASE_ARG: PHASE_WRITE,
-            EXPECTED_ARG: facts.get("uid"),
-        }
-        env = execution.run_op(
-            op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s, handle=client_handle
+                op_args,
+                facts,
+                stable,
+                intent_id=intent_id,
+                group_id=group_id,
+                timeout_s=timeout_s,
+                handle=client_handle,
+            ),
+            started,
+            done="rendered",
+            action="render",
         )
-        end_code = env.get("errorCode")
-        if end_code in UNKNOWN_END_CODES or env.get("pending") is not None:
-            return _unknown_end(
-                rt,
-                env,
-                op,
-                intent_id,
-                group_id,
-                str(end_code or "TIMEOUT"),
-                timeout_s,
-                client_handle,
-                reads="Flame",
-            )
-        finished = _finish(rt, op, env, op_args, facts, stable, intent_id, group_id, started)
-        if client_handle is not None and end_code != "BRIDGE_AMBIGUOUS":
-            _remove_result_file(rt, finished, client_handle)
-        return finished
+    except Refused as stop:
+        return stop.env
+    run_args = {
+        **op_args,
+        "target": stable,
+        PHASE_ARG: PHASE_WRITE,
+        EXPECTED_ARG: facts.get("uid"),
+    }
+    return run_and_close(
+        rt,
+        op,
+        run_args,
+        timeout_s=timeout_s,
+        handle=client_handle,
+        intent_id=intent_id,
+        group_id=group_id,
+        finish=lambda env: _finish(
+            rt, op, env, op_args, facts, stable, intent_id, group_id, started
+        ),
+        reads="Flame",
+    )
+
+
+def _clip_result(
+    op_args: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    stable: Any,
+    flame: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ran": True,
+        "target": target_info(facts, stable),
+        "renderMode": op_args["render_mode"],
+        "renderOption": "Foreground",
+        "renderQuality": RENDER_QUALITY,
+        "includeHandles": op_args["include_handles"],
+        "returned": flame.get("returned"),
+        "elapsedS": flame.get("elapsedS"),
+        "isRenderedBefore": flame.get("isRenderedBefore"),
+        "isRenderedAfter": flame.get("isRenderedAfter"),
+        "effects": facts.get("effects"),
+        "effectCount": facts.get("effectCount"),
+        "readBackDecisive": _read_back_decisive(flame),
+        "readBackNote": _read_back_note(flame),
+        "undo": UNDO_NOTE,
+    }
 
 
 def _finish(
@@ -398,39 +400,17 @@ def _finish(
         env_error=env.get("error"),
         flame=flame,
     )
-    result: dict[str, Any] = {
-        "ran": True,
-        "target": target_info(facts, stable),
-        "renderMode": op_args["render_mode"],
-        "renderOption": "Foreground",
-        "renderQuality": RENDER_QUALITY,
-        "includeHandles": op_args["include_handles"],
-        "returned": flame.get("returned"),
-        "elapsedS": flame.get("elapsedS"),
-        "isRenderedBefore": flame.get("isRenderedBefore"),
-        "isRenderedAfter": flame.get("isRenderedAfter"),
-        "effects": facts.get("effects"),
-        "effectCount": facts.get("effectCount"),
-        "readBackDecisive": _read_back_decisive(flame),
-        "readBackNote": _read_back_note(flame),
-        "undo": UNDO_NOTE,
-    }
-    if not judged.ok and judged.code is not None:
-        _fail_env(env, judged.code, judged.message or "")
-    env["result"] = result
-    env["affected"] = 1 if judged.ok else 0
-    env["undoSteps"] = 0
-    env["partial"] = None
-    env["degraded"] = [*env.get("degraded", []), *judged.degraded]
-    env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    env["durationMs"] = elapsed_ms(started)
-    try:
-        rt.journal.append(_outcome_record(intent_id, group_id, judged, flame))
-    except OSError as exc:
-        rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-        env["degraded"] = [
-            *env["degraded"],
-            f"the outcome could not be journaled ({exc}); the run's answer stands but this "
-            "server now refuses writes until journal.check has settled the intent",
-        ]
-    return env
+    return settle_envelope(
+        rt,
+        op,
+        env,
+        judged,
+        _outcome_record(intent_id, group_id, judged, flame),
+        result=_clip_result(op_args, facts, stable, flame),
+        affected=1 if judged.ok else 0,
+        partial=None,
+        degraded=judged.degraded,
+        intent_id=intent_id,
+        group_id=group_id,
+        started=started,
+    )

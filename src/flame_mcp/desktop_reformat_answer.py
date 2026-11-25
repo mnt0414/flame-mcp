@@ -15,7 +15,7 @@ from flame_mcp.desktop_reformat_state import (
     Run,
     elapsed_ms,
 )
-from flame_mcp.errors import as_error_code
+from flame_mcp.errors import PARTIAL_PREFIX, as_error_code, without_partial_prefix
 from flame_mcp.types import ErrorCode
 
 
@@ -52,7 +52,7 @@ def _partial_counts(run: Run) -> dict[str, int]:
 def _reasons(failed: list[dict[str, Any]]) -> str:
     return "; ".join(
         f"targets[{f['index']}] ({(f.get('from') or {}).get('name')!r}): "
-        f"{str(f.get('reason')).removeprefix('partial: ')}"
+        f"{without_partial_prefix(str(f.get('reason')))}"
         for f in failed
     )
 
@@ -92,7 +92,6 @@ def finish(run: Run, started: float) -> dict[str, Any]:
     common: dict[str, Any] = {
         "result": body,
         "affected": run.changed,
-        "undo_steps": 0,
         "context": last.get("context"),
         "execution": envelope_mod.execution_meta(op),
         "duration_ms": elapsed_ms(started),
@@ -131,8 +130,9 @@ def finish(run: Run, started: float) -> dict[str, Any]:
         env = envelope_mod.build_envelope(
             ok=False,
             error=(
-                f"partial: {len(run.reformatted)} of {len(run.rows)} clip(s) were reformatted as "
-                f"asked; the rest were not (result.notReformatted): {_reasons(run.failed)}"
+                f"{PARTIAL_PREFIX} {len(run.reformatted)} of {len(run.rows)} clip(s) were "
+                f"reformatted as asked; the rest were not (result.notReformatted): "
+                f"{_reasons(run.failed)}"
             ),
             error_code="FLAME_API_ERROR",
             partial=_partial_counts(run),

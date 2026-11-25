@@ -32,7 +32,7 @@ from functools import cache
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import execution
-from flame_mcp.checkpointed import note_unresolved, refuse_if_denied
+from flame_mcp.checkpointed import refuse_if_denied
 from flame_mcp.checkpoints import (
     CHECKPOINT_TIMEOUT_S,
     TIMELINE_KIND,
@@ -40,19 +40,24 @@ from flame_mcp.checkpoints import (
     read_fingerprint,
     wiretap_target,
 )
+from flame_mcp.desktop_run import PHASE_READ, PHASE_WRITE
 from flame_mcp.errors import as_error_code
+from flame_mcp.execution import raise_on_error_src
 from flame_mcp.journal import (
+    NO_LINK,
     STATE_DIVERGED,
     STATE_LANDED,
     STATE_NOT_LANDED,
     VERDICT_UNKNOWN,
     Index,
     IntentView,
+    JournalLink,
     new_id,
     now_iso,
     purge_records,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import CheckRecord, IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import UNKNOWN_END_CODES, close_outcome, note_unresolved
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.timeline_checkpoints import (
     LIBRARY_ARG,
@@ -61,19 +66,23 @@ from flame_mcp.timeline_checkpoints import (
     checkpoint_record,
     stash_reel_name,
 )
-from flame_mcp.types import Category, OperationSpec, ServerOpError, ServerResult
+from flame_mcp.types import (
+    PHASE_ARG,
+    Category,
+    OperationSpec,
+    PhaseSpec,
+    ServerOpError,
+    ServerResult,
+)
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
 
 OP_NAME: Final[str] = "journal.restore_checkpoint"
-PHASE_ARG: Final[str] = "_phase"
 UIDS_ARG: Final[str] = "_uids"
 STASH_UID_ARG: Final[str] = "_stash_uid"
 STASH_FP_ARG: Final[str] = "_stash_fp"
 EXPECTED_ARG: Final[str] = "_expected"
-PHASE_READ: Final[str] = "read"
-PHASE_WRITE: Final[str] = "write"
 
 NOT_RESTORED: Final[tuple[str, ...]] = (
     "the uid and the wiretap id: a restored thing always has new ones, so a selector or uid that "
@@ -104,11 +113,6 @@ RESTORE_NOTE: Final[str] = (
 _NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
 
 
-_RAISE_ON_ERROR: Final[str] = (
-    "if _result['error'] is not None:\n    raise _OpError(_result['errorCode'], _result['error'])"
-)
-
-
 def _source(*blocks: str) -> str:
     return "\n\n".join(blocks)
 
@@ -124,18 +128,14 @@ def _restore_to_python(args: Mapping[str, Any]) -> str:
         return _source(
             f"_result = _tl_restore_write({uids!r}, {args.get(EXPECTED_ARG)!r}, {stash_uid!r}, "
             f"{stash_fp!r}, {library!r}, {reel!r})",
-            _RAISE_ON_ERROR,
+            raise_on_error_src(),
             "_affected = 1",
         )
     return _source(
         f"_result = _tl_restore_read({uids!r}, {stash_uid!r}, {stash_fp!r})",
-        _RAISE_ON_ERROR,
+        raise_on_error_src(),
         "_affected = 0",
     )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 @cache
@@ -161,7 +161,7 @@ def restore_op() -> RegisteredOperation:
             description="internal: the Flame side of a Timeline restore",
             effect="destructive",
             to_python=_restore_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(PhaseSpec(PHASE_WRITE),),
             requires=(
                 "PyMediaPanel.copy",
                 "PyMediaPanel.move",
@@ -232,8 +232,7 @@ def restore_timeline_checkpoint(
     check_current: bool = False,
     expected_current: str | None = None,
     force: bool = False,
-    reverts: str | None = None,
-    reverts_intent: str | None = None,
+    link: JournalLink = NO_LINK,
     forced_note: Mapping[str, Any] | None = None,
 ) -> ServerResult:
     """Put the sequence / clip of the timeline checkpoint `record` back, as described above.
@@ -267,20 +266,18 @@ def restore_timeline_checkpoint(
             f"(journal.purge_checkpoints, {purge.get('ts')}): there is nothing to restore from",
         )
     uids = uid_chain(records, source_uid)
-    with ctx.write_lock:
-        return _restore_locked(
-            ctx,
-            record,
-            uids=uids,
-            stash_uid=stash_uid,
-            fingerprint=fingerprint,
-            check_current=check_current,
-            expected_current=expected_current,
-            force=force,
-            reverts=reverts,
-            reverts_intent=reverts_intent,
-            forced_note=forced_note,
-        )
+    return _restore(
+        ctx,
+        record,
+        uids=uids,
+        stash_uid=stash_uid,
+        fingerprint=fingerprint,
+        check_current=check_current,
+        expected_current=expected_current,
+        force=force,
+        link=link,
+        forced_note=forced_note,
+    )
 
 
 def _refuse_read(env: Mapping[str, Any], checkpoint_id: str) -> ServerOpError:
@@ -321,21 +318,70 @@ def _conflict(
     )
 
 
-def _restore_locked(
-    ctx: ServerContext,
-    record: Mapping[str, Any],
+def _check_current_fingerprint(
+    pre: Mapping[str, Any],
+    checkpoint_id: str,
     *,
-    uids: list[str],
-    stash_uid: str,
-    fingerprint: str,
     check_current: bool,
     expected_current: str | None,
     force: bool,
-    reverts: str | None,
-    reverts_intent: str | None,
-    forced_note: Mapping[str, Any] | None = None,
-) -> ServerResult:
-    checkpoint_id = str(record.get("id"))
+    forced_note: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The `forced` note of the restore: what was overridden (the revert's fingerprint check, the
+    caller's own check), or None. Raises CONFLICT when the fingerprint is not the expected one and
+    `force` is not set."""
+    current_fp = pre.get("fingerprint")
+    forced: dict[str, Any] | None = None
+    if check_current and (expected_current is None or current_fp != expected_current):
+        forced, refusal = _conflict(checkpoint_id, expected_current, current_fp, force)
+        if refusal is not None:
+            raise refusal
+    if forced_note is not None:
+        forced = {"used": True, **(forced or {}), **forced_note}
+    return forced
+
+
+def _restore_intent(
+    record: Mapping[str, Any],
+    pre: Mapping[str, Any],
+    link: JournalLink,
+    forced: dict[str, Any] | None,
+    fingerprint: str,
+    ids: tuple[str, str, str],
+) -> IntentRecord:
+    """The intent of the restore; `ids` is (group, intent, pre-restore checkpoint)."""
+    group_id, intent_id, pre_id = ids
+    target = _selector_row(pre.get("target"))
+    intent: IntentRecord = {
+        "type": "intent",
+        "id": intent_id,
+        "group": group_id,
+        "ts": now_iso(),
+        "op": OP_NAME,
+        "kind": "restore",
+        "args": {"checkpoint": str(record.get("id"))},
+        "target": target["selector"] if target else None,
+        "targetKind": TIMELINE_KIND.name,
+        "targetUid": target["uid"] if target else None,
+        "targetIdent": pre.get("target"),
+        "checkpoint": str(record.get("id")),
+        "stash": record.get("stash"),
+        "preCheckpoint": pre_id,
+        "revertCheckpoint": pre_id,
+        "fingerprintBefore": pre.get("fingerprint"),
+        "fingerprintExpected": fingerprint,
+        "segmentCountBefore": pre.get("segmentCount"),
+    }
+    link.stamp(intent)
+    if forced is not None:
+        intent["forced"] = forced
+    return intent
+
+
+def _read_current(
+    ctx: ServerContext, uids: list[str], stash_uid: str, fingerprint: str, checkpoint_id: str
+) -> dict[str, Any]:
+    """The read phase: what the edited thing is now (its fingerprint, address, segment count)."""
     read_env = _run(
         ctx,
         {
@@ -347,56 +393,21 @@ def _restore_locked(
     )
     if read_env.get("ok") is not True:
         raise _refuse_read(read_env, checkpoint_id)
-    pre = _flame_value(read_env)
-    current_fp = pre.get("fingerprint")
-    forced: dict[str, Any] | None = None
-    if check_current and (expected_current is None or current_fp != expected_current):
-        forced, refusal = _conflict(checkpoint_id, expected_current, current_fp, force)
-        if refusal is not None:
-            raise refusal
-    if forced_note is not None:
-        forced = {"used": True, **(forced or {}), **forced_note}
-    target = _selector_row(pre.get("target"))
-    group_id = new_id("g")
-    intent_id = new_id("i")
-    pre_id = new_id("c")
-    library = checkpoint_library_name()
-    reel = stash_reel_name()
-    intent: dict[str, Any] = {
-        "type": "intent",
-        "id": intent_id,
-        "group": group_id,
-        "ts": now_iso(),
-        "op": OP_NAME,
-        "kind": "restore",
-        "args": {"checkpoint": checkpoint_id},
-        "target": target["selector"] if target else None,
-        "targetKind": TIMELINE_KIND.name,
-        "targetUid": target["uid"] if target else None,
-        "targetIdent": pre.get("target"),
-        "checkpoint": checkpoint_id,
-        "stash": record.get("stash"),
-        "preCheckpoint": pre_id,
-        "revertCheckpoint": pre_id,
-        "fingerprintBefore": current_fp,
-        "fingerprintExpected": fingerprint,
-        "segmentCountBefore": pre.get("segmentCount"),
-    }
-    if reverts is not None:
-        intent["reverts"] = reverts
-    if reverts_intent is not None:
-        intent["revertsIntent"] = reverts_intent
-    if forced is not None:
-        intent["forced"] = forced
-    try:
-        ctx.journal.append(intent)
-    except OSError as exc:
-        raise ServerOpError(
-            "POLICY_DENIED",
-            f"nothing was restored: the journal cannot be written ({exc}), and this server does "
-            "not restore a sequence without an intent on record",
-            hint=f"Make {ctx.journal.directory} writable, then retry.",
-        ) from exc
+    return _flame_value(read_env)
+
+
+def _write_restore(
+    ctx: ServerContext,
+    uids: list[str],
+    stash_uid: str,
+    fingerprint: str,
+    current_fp: Any,
+    ids: tuple[str, str, str],
+    checkpoint_id: str,
+) -> dict[str, Any]:
+    """The write phase: Flame's envelope of the restore. Raises when no answer came (the guard is
+    shut and the intent is noted unresolved)."""
+    group_id, intent_id, _ = ids
     env = _run(
         ctx,
         {
@@ -405,14 +416,13 @@ def _restore_locked(
             STASH_UID_ARG: stash_uid,
             STASH_FP_ARG: fingerprint,
             EXPECTED_ARG: current_fp,
-            LIBRARY_ARG: library,
-            REEL_ARG: reel,
+            LIBRARY_ARG: checkpoint_library_name(),
+            REEL_ARG: stash_reel_name(),
         },
     )
     code = env.get("errorCode")
     if code in UNKNOWN_END_CODES:
-        ctx.guard.block(intent_id, group_id, OP_NAME, str(code))
-        note_unresolved(ctx, intent_id, group_id, env)
+        note_unresolved(ctx, intent_id, group_id, env, OP_NAME, str(code))
         raise ServerOpError(
             as_error_code(str(code)),
             f"the restore of checkpoint {checkpoint_id} ended without an answer ({code}); it is "
@@ -422,60 +432,111 @@ def _restore_locked(
             hint=env.get("hint"),
             journal={"group": group_id, "id": intent_id},
         )
+    return env
+
+
+def _restore(
+    ctx: ServerContext,
+    record: Mapping[str, Any],
+    *,
+    uids: list[str],
+    stash_uid: str,
+    fingerprint: str,
+    check_current: bool,
+    expected_current: str | None,
+    force: bool,
+    link: JournalLink,
+    forced_note: Mapping[str, Any] | None = None,
+) -> ServerResult:
+    checkpoint_id = str(record.get("id"))
+    pre = _read_current(ctx, uids, stash_uid, fingerprint, checkpoint_id)
+    current_fp = pre.get("fingerprint")
+    forced = _check_current_fingerprint(
+        pre,
+        checkpoint_id,
+        check_current=check_current,
+        expected_current=expected_current,
+        force=force,
+        forced_note=forced_note,
+    )
+    ids = (
+        link.group if link.group is not None else new_id("g"),
+        new_id("i"),
+        new_id("c"),
+    )
+    intent = _restore_intent(record, pre, link, forced, fingerprint, ids)
+    try:
+        ctx.journal.append(intent)
+    except OSError as exc:
+        raise ServerOpError(
+            "POLICY_DENIED",
+            f"nothing was restored: the journal cannot be written ({exc}), and this server does "
+            "not restore a sequence without an intent on record",
+            hint=f"Make {ctx.journal.directory} writable, then retry.",
+        ) from exc
+    env = _write_restore(ctx, uids, stash_uid, fingerprint, current_fp, ids, checkpoint_id)
     return _finish(
         ctx,
         env,
         record=record,
-        intent_id=intent_id,
-        group_id=group_id,
-        pre_id=pre_id,
+        intent_id=ids[1],
+        group_id=ids[0],
+        pre_id=ids[2],
         fingerprint=fingerprint,
         current_fp=current_fp,
         forced=forced,
     )
 
 
-def _finish(
+def _record_pre_checkpoint(
     ctx: ServerContext,
-    env: Mapping[str, Any],
-    *,
-    record: Mapping[str, Any],
-    intent_id: str,
-    group_id: str,
+    value: Mapping[str, Any],
+    restored: dict[str, Any] | None,
     pre_id: str,
+    group_id: str,
+    checkpoint_id: str,
+) -> tuple[bool, str | None]:
+    """Journals the pre-restore checkpoint when the edited thing was moved and not moved back:
+    `(recorded, journal error)`."""
+    rolled = value.get("rolledBack")
+    try:
+        if value.get("moved") is True and not (
+            isinstance(rolled, dict) and rolled.get("done") is True
+        ):
+            pre_record = checkpoint_record(
+                pre_id,
+                group=group_id,
+                label=f"before restoring {checkpoint_id}",
+                source=value.get("restored"),
+                stash=value.get("preStash"),
+                fingerprint=value.get("fingerprintBefore"),
+                segment_count=None,
+                displayed=value.get("displayedBefore"),
+            )
+            pre_record["replacedUid"] = value.get("replacedUid")
+            pre_record["orphaned"] = restored is None
+            ctx.journal.append(pre_record)
+            return True, None
+    except OSError as exc:
+        return False, str(exc)
+    return False, None
+
+
+def _restore_outcome(
+    env: Mapping[str, Any],
+    value: Mapping[str, Any],
+    restored: dict[str, Any] | None,
+    ids: tuple[str, str, str],
+    pre_recorded: bool,
     fingerprint: str,
-    current_fp: Any,
-    forced: Mapping[str, Any] | None,
-) -> ServerResult:
-    checkpoint_id = str(record.get("id"))
-    value = _flame_value(env)
+) -> tuple[OutcomeRecord, str | None]:
+    """The outcome record of the restore (`ids`: group, intent, pre-restore checkpoint) and the
+    failure text (None when it matched)."""
+    group_id, intent_id, pre_id = ids
     flame_ok = env.get("ok") is True
     matches = value.get("fingerprintMatches") is True
     ok = flame_ok and matches
-    restored = _selector_row(value.get("restored"))
     moved = value.get("moved") is True
-    rolled = value.get("rolledBack")
-    pre_recorded = False
-    journal_error: str | None = None
-    try:
-        if moved and not (isinstance(rolled, dict) and rolled.get("done") is True):
-            ctx.journal.append(
-                checkpoint_record(
-                    pre_id,
-                    group=group_id,
-                    label=f"before restoring {checkpoint_id}",
-                    source=value.get("restored"),
-                    stash=value.get("preStash"),
-                    fingerprint=value.get("fingerprintBefore"),
-                    segment_count=None,
-                    displayed=value.get("displayedBefore"),
-                    replacedUid=value.get("replacedUid"),
-                    orphaned=restored is None,
-                )
-            )
-            pre_recorded = True
-    except OSError as exc:
-        journal_error = str(exc)
     after_fp = value.get("fingerprintAfter")
     new_uid, new_ident = _uid_after(value, restored)
     failure = (
@@ -490,7 +551,7 @@ def _finish(
             )
         )
     )
-    outcome: dict[str, Any] = {
+    outcome: OutcomeRecord = {
         "type": "outcome",
         "id": intent_id,
         "group": group_id,
@@ -514,15 +575,24 @@ def _finish(
         "shownAfter": value.get("shownAfter"),
         "reshown": value.get("reshown"),
     }
-    try:
-        ctx.journal.append(outcome)
-    except OSError as exc:
-        journal_error = str(exc)
-        ctx.guard.block(intent_id, group_id, OP_NAME, "JOURNAL_OUTCOME_NOT_WRITTEN")
-    result: dict[str, Any] = {
+    return outcome, failure
+
+
+def _restore_result(
+    value: Mapping[str, Any],
+    restored: dict[str, Any] | None,
+    ids: tuple[str, str, str],
+    checkpoint_id: str,
+    pre_recorded: bool,
+    fingerprint: str,
+    current_fp: Any,
+) -> dict[str, Any]:
+    group_id, _, pre_id = ids
+    moved = value.get("moved") is True
+    return {
         "group": group_id,
         "checkpoint": checkpoint_id,
-        "matched": matches,
+        "matched": value.get("fingerprintMatches") is True,
         "restored": restored,
         "preCheckpoint": pre_id if pre_recorded else None,
         "preStash": value.get("preStash"),
@@ -536,14 +606,42 @@ def _finish(
         "reshown": value.get("reshown"),
         "reshownNote": value.get("reshownNote"),
         "fingerprintBefore": current_fp,
-        "fingerprintAfter": after_fp,
+        "fingerprintAfter": value.get("fingerprintAfter"),
         "expectedFingerprint": fingerprint,
         "fingerprintMatches": value.get("fingerprintMatches"),
         "preFingerprintMatches": value.get("preFingerprintMatches"),
         "position": value.get("position"),
-        "rolledBack": rolled,
+        "rolledBack": value.get("rolledBack"),
         "notRestored": list(NOT_RESTORED),
     }
+
+
+def _finish(
+    ctx: ServerContext,
+    env: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+    intent_id: str,
+    group_id: str,
+    pre_id: str,
+    fingerprint: str,
+    current_fp: Any,
+    forced: Mapping[str, Any] | None,
+) -> ServerResult:
+    checkpoint_id = str(record.get("id"))
+    value = _flame_value(env)
+    restored = _selector_row(value.get("restored"))
+    ids = (group_id, intent_id, pre_id)
+    pre_recorded, journal_error = _record_pre_checkpoint(
+        ctx, value, restored, pre_id, group_id, checkpoint_id
+    )
+    outcome, failure = _restore_outcome(env, value, restored, ids, pre_recorded, fingerprint)
+    err = close_outcome(ctx, outcome, intent_id, group_id, OP_NAME)
+    if err is not None:
+        journal_error = str(err)
+    result = _restore_result(
+        value, restored, ids, checkpoint_id, pre_recorded, fingerprint, current_fp
+    )
     if pre_recorded:
         result["undo"] = {"op": OP_NAME, "args": {"checkpoint": pre_id}}
     if forced is not None:
@@ -554,7 +652,7 @@ def _finish(
             "writes until journal.check has settled the intent"
         )
     journal_ref = {"group": group_id, "id": intent_id}
-    if ok:
+    if outcome["ok"]:
         return ServerResult(result=result, affected=1, journal=journal_ref)
     hint = (
         f"The edited sequence is saved: journal.restore_checkpoint(checkpoint={pre_id!r}) puts it "
@@ -607,8 +705,10 @@ def revert_timeline_group(
             "restore that stopped before it moved anything leaves none: the group changed "
             "nothing)",
         )
-    outcome = view.outcome or {}
-    target_uid = outcome.get("targetUid") or view.intent.get("targetUid")
+    outcome = view.outcome
+    target_uid = (outcome.get("targetUid") if outcome is not None else None) or view.intent.get(
+        "targetUid"
+    )
     # a plan.run that was bundled has the plan's other writes in the same group (a
     # segment.set_attributes): the one restore puts them back too, so it covers the whole group
     covers_group = len(index.groups[group]) > 1
@@ -619,8 +719,7 @@ def revert_timeline_group(
         check_current=True,
         expected_current=view.fingerprint_after(),
         force=force,
-        reverts=group,
-        reverts_intent=None if covers_group else view.id,
+        link=JournalLink(reverts=group, reverts_intent=None if covers_group else view.id),
         forced_note=forced_note,
     )
     body = dict(result.result) if isinstance(result.result, dict) else {}
@@ -666,17 +765,16 @@ def check_timeline_intent(ctx: ServerContext, view: IntentView) -> dict[str, Any
         verdict, finding = STATE_DIVERGED, "other"
     per_key = {"fingerprint": finding}
     entry.update(verdict=verdict, perKey=per_key, current={"fingerprint": current})
-    ctx.journal.append(
-        {
-            "type": "check",
-            "id": view.id,
-            "group": view.group,
-            "ts": now_iso(),
-            "verdict": verdict,
-            "perKey": per_key,
-            "current": {"fingerprint": current},
-            "target": target,
-        }
-    )
+    check: CheckRecord = {
+        "type": "check",
+        "id": view.id,
+        "group": view.group,
+        "ts": now_iso(),
+        "verdict": verdict,
+        "perKey": per_key,
+        "current": {"fingerprint": current},
+        "target": target,
+    }
+    ctx.journal.append(check)
     ctx.guard.release(view.id)
     return entry

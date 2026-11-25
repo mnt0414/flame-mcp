@@ -38,15 +38,14 @@ from media_p31b_helpers import (
     states,
     wt,
 )
+from rig_fixtures import rig_fixture
 
 ARRANGE = "desktop.arrange"
 COPY = "desktop.copy"
 MOVE = "desktop.move"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 def item(action: str, source: dict[str, Any]) -> dict[str, Any]:
@@ -95,7 +94,7 @@ def test_arrange_moves_three_clips_into_the_reel_in_the_order_given(rig: Rig) ->
     assert order(env) == ["c3", "c1", "c2"]
     assert [a["action"] for a in result["applied"]] == ["move", "move", "move"]
     assert [a["made"]["name"] for a in result["applied"]] == ["c3", "c1", "c2"]
-    assert env["affected"] == 3 and env["undoSteps"] == 0
+    assert env["affected"] == 3
     assert env["execution"]["effect"] == "create"
     assert kinds(rig) == ["desktop_move"] * 3
     group = env["journal"]["group"]
@@ -432,7 +431,6 @@ def test_declaration_of_arrange() -> None:
     op = registry.get(ARRANGE)
     assert op is not None
     assert (op.effect, op.thread, op.undo, op.category) == ("create", "main", "value", "desktop")
-    assert op.undo_steps({}, 3) == 0
     assert op.precheck is not None and op.wrap is not None and op.to_python is not None
     for word in ("journal.revert", "plan.run", "FLAME_API_ERROR", "Native Ctrl+Z"):
         assert word in op.description, word

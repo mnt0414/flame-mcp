@@ -27,12 +27,12 @@ from fake_media_tree import (
     PyClipNode,
     PyNode,
 )
-from flame_mcp.checkpointed import run_declared
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from flame_mcp.registry import RegistrationError, Registry
 from flame_mcp.types import CheckpointSpec, OperationParam, OperationSpec
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 
 BG2 = {"kind": "batch", "name": "BG2"}
 BLUR = {"kind": "node", "batch": BG1, "name": "blur1"}
@@ -59,9 +59,7 @@ CHECKPOINTED = {
 }
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def bg(rig: Rig, key: str = "bg1") -> PyBatch:
@@ -191,7 +189,6 @@ def test_every_write_declares_a_checkpoint_and_says_so(rig: Rig) -> None:
         assert "automatic checkpoint" in op.description, name
         assert "journal.revert" in op.description, name
         assert "Restore side effects" in op.description, name
-        assert op.undo_steps({}, 1) == 0, name
 
 
 def test_the_setup_saver_is_not_checkpointed_and_says_undo_none(rig: Rig) -> None:
@@ -213,7 +210,7 @@ def test_a_checkpointed_node_op_runs_after_its_checkpoint_and_intent_on_the_grou
     assert intent["fingerprintBefore"] == before
     assert intent["target"] == {"kind": "batch", "uid": "uid-b1"}
     assert env["journal"]["revert"] == {"op": "journal.revert", "args": {"group": intent["group"]}}
-    assert env["execution"]["undo"] == "checkpoint" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "checkpoint"
 
 
 def test_a_node_selector_runs_against_the_checkpointed_group_addressed_by_uid(rig: Rig) -> None:
@@ -978,14 +975,6 @@ def test_the_engine_needs_checkpoint_and_fingerprint_to_be_allowed(
     assert "node.delete" not in [c.label for c in denied.exec.calls]
 
 
-def test_a_write_queued_behind_an_unsettled_one_is_refused_inside_the_lock(rig: Rig) -> None:
-    op = rig.registry.get("node.delete")
-    assert op is not None
-    rig.runtime.guard.block("i_x", "g_x", "node.delete", "TIMEOUT")
-    env = run_declared(rig.runtime, op, {"target": BLUR})
-    assert env["errorCode"] == "POLICY_DENIED" and "batch.checkpoint" not in sent(rig)
-
-
 def _registry_with(spec_checkpoint: CheckpointSpec, accepts: tuple[Any, ...]) -> Registry:
     from flame_mcp.ops import register_all
 
@@ -1003,7 +992,6 @@ def _registry_with(spec_checkpoint: CheckpointSpec, accepts: tuple[Any, ...]) ->
             ),
             accepts=accepts,
             to_python=lambda args: "_result = 1",
-            undo_steps=lambda args, affected: 0,
             checkpoint=spec_checkpoint,
         )
     )

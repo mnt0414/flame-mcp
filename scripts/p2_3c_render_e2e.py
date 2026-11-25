@@ -723,7 +723,6 @@ async def stage_b(ctx: Ctx) -> None:
             and result.get("writtenFrames") == 8
             and result.get("verified") is True
             and env.get("affected") == 8
-            and env.get("undoSteps") == 0
             and (env.get("execution") or {}).get("undo") == "unsupported",
             result={k: result.get(k) for k in ("expectedFrames", "writtenFrames", "verified")},
             affected=env.get("affected"),

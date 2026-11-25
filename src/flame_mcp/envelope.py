@@ -19,7 +19,7 @@ from typing import Any, Final, cast, get_args
 from flame_mcp import errors
 from flame_mcp.private_fs import default_root, make_private_dirs
 from flame_mcp.registry import RegisteredOperation
-from flame_mcp.transport import BridgeResult, CrashInfo
+from flame_mcp.transport import BridgeResult, CrashInfo, elapsed_ms
 from flame_mcp.types import ErrorCode
 
 # Layer 3 of the response limit: the byte budget of one envelope (not derived from measured
@@ -65,7 +65,6 @@ def build_envelope(
     ok: bool,
     result: Any = None,
     affected: int = 0,
-    undo_steps: int = 0,
     partial: Mapping[str, int] | None = None,
     pending: Mapping[str, str] | None = None,
     error: str | None = None,
@@ -105,7 +104,6 @@ def build_envelope(
         "ok": ok,
         "result": result,
         "affected": affected,
-        "undoSteps": undo_steps,
         "partial": dict(partial) if partial is not None else None,
         "pending": dict(pending) if pending is not None else None,
         "error": error,
@@ -173,6 +171,27 @@ def from_pre_bridge_error(
     )
 
 
+def refusal(
+    op: RegisteredOperation,
+    code: ErrorCode,
+    message: str,
+    started: float,
+    *,
+    result: Any = None,
+    hint: str | None = None,
+) -> dict[str, Any]:
+    """The envelope of a write that a check of the runner refused before it wrote anything."""
+    return build_envelope(
+        ok=False,
+        result=result,
+        error=message,
+        error_code=code,
+        execution=execution_meta(op),
+        duration_ms=elapsed_ms(started),
+        hint_override=hint,
+    )
+
+
 def timeout_error_and_pending(br: BridgeResult) -> tuple[str | None, dict[str, str] | None]:
     """Returns the error text and `pending` handle for a TIMEOUT.
 
@@ -221,95 +240,34 @@ def _partial_counts(raw: object) -> dict[str, int] | None:
     return counts if len(counts) == len(raw) and counts else None
 
 
-def from_bridge_result(
-    op: RegisteredOperation,
-    args: Mapping[str, Any],
-    br: BridgeResult,
-) -> dict[str, Any]:
-    """Maps a `transport.BridgeResult` for `op` onto the envelope shape.
-
-    `br.result` (when `br.ok`) is the `_result` dict the generated wrapper
-    code assembled inside the bridge; see `execution.build_exec_code`.
-    """
-    execution = execution_meta(op)
-    logs = list(br.app_log)
-    logs_note = br.app_log_note
-    crash = crash_meta(br.crash) if br.crash is not None else None
-
-    if br.error_code is not None:
-        # Transport-level failure (BRIDGE_LOST/BRIDGE_UNAVAILABLE/BRIDGE_AMBIGUOUS/
-        # TIMEOUT/MAIN_THREAD_UNAVAILABLE): the wrapper's `_result` dict was
-        # never produced, so context stays None -- never confused with the
-        # "rider ran and every field failed" shape ({"selected": None, ...}).
-        error_text, pending = timeout_error_and_pending(br)
-        return build_envelope(
-            ok=False,
-            error=error_text,
-            error_code=br.error_code,
-            traceback=br.traceback,
-            context=None,
-            execution=execution,
-            duration_ms=br.duration_ms,
-            logs=logs,
-            logs_note=logs_note,
-            crash=crash,
-            timeout_phase=br.timeout_phase,
-            pending=pending,
-            hint_override=br.hint,
+def _op_error_of(raw: Mapping[str, Any]) -> tuple[str, ErrorCode]:
+    """The message and code of the `_OpError` an op (or its selector resolution) raised to report
+    a specific ErrorCode (SELECTOR_EMPTY/SELECTOR_TYPE/SELECTOR_AMBIGUOUS) instead of the generic
+    FLAME_API_ERROR every other exception maps to. `opErrorCode` is only trusted when it is
+    actually a member of ErrorCode -- an op returning garbage here is a bug in that op, not
+    license to fabricate an unknown error code."""
+    op_error_code_raw = raw.get("opErrorCode")
+    error_message = str(raw.get("opError"))
+    if isinstance(op_error_code_raw, str) and op_error_code_raw in get_args(ErrorCode):
+        return error_message, cast(ErrorCode, op_error_code_raw)
+    if op_error_code_raw is not None:
+        error_message = (
+            f"{error_message} (op raised unknown opErrorCode {op_error_code_raw!r}; "
+            "treated as FLAME_API_ERROR)"
         )
+    return error_message, "FLAME_API_ERROR"
 
-    if br.pending_handle is not None:
-        # main-async optimistic poll didn't resolve within the window.
-        return build_envelope(
-            ok=True,
-            pending={"handle": br.pending_handle},
-            context=None,
-            execution=execution,
-            duration_ms=br.duration_ms,
-            logs=logs,
-            logs_note=logs_note,
-        )
 
-    raw = br.result
-    if not isinstance(raw, dict):
-        # A conforming wrapper always produces a dict; anything else is a
-        # bug in this server's own generated code, not a Flame API failure.
-        return build_envelope(
-            ok=False,
-            error=f"malformed wrapper result (expected dict, got {type(raw).__name__})",
-            error_code="FLAME_API_ERROR",
-            execution=execution,
-            duration_ms=br.duration_ms,
-            logs=logs,
-            logs_note=logs_note,
-        )
-
+def _from_wrapper_result(raw: Mapping[str, Any], common: dict[str, Any]) -> dict[str, Any]:
+    """The envelope of a wrapper's `_result` dict. `common` is what every envelope of this call
+    carries (execution, duration, logs)."""
     context = raw.get("context") if isinstance(raw.get("context"), dict) else None
     partial = _partial_counts(raw.get("partial"))
-    op_error = raw.get("opError")
     affected_raw = raw.get("affected")
     affected = affected_raw if isinstance(affected_raw, int) else 0
-    undo_steps = op.undo_steps(args, affected)
 
-    if op_error is not None:
-        # An op (or its selector resolution) may raise `_OpError(code,
-        # message)` to report a specific ErrorCode (SELECTOR_EMPTY/SELECTOR_TYPE/
-        # SELECTOR_AMBIGUOUS) instead of the generic FLAME_API_ERROR every
-        # other exception maps to. `opErrorCode` is only trusted when it is
-        # actually a member of ErrorCode -- an op returning garbage here is a
-        # bug in that op, not license to fabricate an unknown error code.
-        op_error_code_raw = raw.get("opErrorCode")
-        error_message = str(op_error)
-        op_error_code: ErrorCode
-        if isinstance(op_error_code_raw, str) and op_error_code_raw in get_args(ErrorCode):
-            op_error_code = cast(ErrorCode, op_error_code_raw)
-        else:
-            op_error_code = "FLAME_API_ERROR"
-            if op_error_code_raw is not None:
-                error_message = (
-                    f"{error_message} (op raised unknown opErrorCode {op_error_code_raw!r}; "
-                    "treated as FLAME_API_ERROR)"
-                )
+    if raw.get("opError") is not None:
+        error_message, op_error_code = _op_error_of(raw)
         return build_envelope(
             ok=False,
             result=raw.get("value"),
@@ -317,13 +275,9 @@ def from_bridge_result(
             error_code=op_error_code,
             traceback=raw.get("opTraceback"),
             affected=affected,
-            undo_steps=undo_steps,
             partial=partial,
             context=context,
-            execution=execution,
-            duration_ms=br.duration_ms,
-            logs=logs,
-            logs_note=logs_note,
+            **common,
         )
 
     if raw.get("verified") is False:
@@ -337,13 +291,9 @@ def from_bridge_result(
             ),
             error_code="SILENT_NOOP",
             affected=affected,
-            undo_steps=undo_steps,
             partial=partial,
             context=context,
-            execution=execution,
-            duration_ms=br.duration_ms,
-            logs=logs,
-            logs_note=logs_note,
+            **common,
         )
 
     value = raw.get("value")
@@ -352,17 +302,70 @@ def from_bridge_result(
         ok=True,
         result=value,
         affected=affected,
-        undo_steps=undo_steps,
         partial=partial,
         context=context,
-        execution=execution,
-        duration_ms=br.duration_ms,
-        logs=logs,
-        logs_note=logs_note,
+        **common,
     )
     if notes:
         env["degraded"] = notes
     return env
+
+
+def from_bridge_result(
+    op: RegisteredOperation,
+    br: BridgeResult,
+) -> dict[str, Any]:
+    """Maps a `transport.BridgeResult` for `op` onto the envelope shape.
+
+    `br.result` (when `br.ok`) is the `_result` dict the generated wrapper
+    code assembled inside the bridge; see `execution.build_exec_code`.
+    """
+    common: dict[str, Any] = {
+        "execution": execution_meta(op),
+        "duration_ms": br.duration_ms,
+        "logs": list(br.app_log),
+        "logs_note": br.app_log_note,
+    }
+
+    if br.error_code is not None:
+        # Transport-level failure (BRIDGE_LOST/BRIDGE_UNAVAILABLE/BRIDGE_AMBIGUOUS/
+        # TIMEOUT/MAIN_THREAD_UNAVAILABLE): the wrapper's `_result` dict was
+        # never produced, so context stays None -- never confused with the
+        # "rider ran and every field failed" shape ({"selected": None, ...}).
+        error_text, pending = timeout_error_and_pending(br)
+        return build_envelope(
+            ok=False,
+            error=error_text,
+            error_code=br.error_code,
+            traceback=br.traceback,
+            context=None,
+            crash=crash_meta(br.crash) if br.crash is not None else None,
+            timeout_phase=br.timeout_phase,
+            pending=pending,
+            hint_override=br.hint,
+            **common,
+        )
+
+    if br.pending_handle is not None:
+        # main-async optimistic poll didn't resolve within the window.
+        return build_envelope(
+            ok=True,
+            pending={"handle": br.pending_handle},
+            context=None,
+            **common,
+        )
+
+    raw = br.result
+    if not isinstance(raw, dict):
+        # A conforming wrapper always produces a dict; anything else is a
+        # bug in this server's own generated code, not a Flame API failure.
+        return build_envelope(
+            ok=False,
+            error=f"malformed wrapper result (expected dict, got {type(raw).__name__})",
+            error_code="FLAME_API_ERROR",
+            **common,
+        )
+    return _from_wrapper_result(raw, common)
 
 
 def take_degraded_notes(value: object) -> list[str]:

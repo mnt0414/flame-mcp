@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import transport
@@ -110,6 +110,20 @@ OP_ERROR_HELPER = "\n".join(
 """Raised by an op's `to_python` / selector-resolution code to report a
 specific ErrorCode (SELECTOR_EMPTY/SELECTOR_TYPE/SELECTOR_AMBIGUOUS) instead of falling
 through to the generic FLAME_API_ERROR every other exception maps to."""
+
+
+def raise_on_error_src(code: str | None = None) -> str:
+    """The op's code after a helper that answers `{error, errorCode}`: turn it into `_OpError` so
+    the helper's partial `_result` stays in the envelope (desktop writes). `code`: raise with this
+    error code instead of the helper's `errorCode`."""
+    raised = "_result['errorCode']" if code is None else repr(code)
+    return "\n".join(
+        [
+            "if _result['error'] is not None:",
+            f"    raise _OpError({raised}, _result['error'])",
+        ]
+    )
+
 
 SELECTOR_HELPER = "\n".join(
     [
@@ -442,122 +456,106 @@ to_python output: one place for every op-support function, like `_v`/`_j`/`_OpEr
 """
 
 
-def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
-    """Assembles the full script sent to `transport.exec` for `op`.
+_HELPER_LINES: Final[tuple[str, ...]] = tuple(
+    line
+    for helper in (
+        V_HELPER,
+        J_HELPER,
+        OP_ERROR_HELPER,
+        SELECTOR_HELPER,
+        DESCRIBE_ENTRY_HELPER,
+    )
+    for line in (helper, "")
+) + tuple(
+    line
+    for helper in (
+        ATTRIBUTE_HELPER,
+        CHECKPOINT_HELPER,
+        BATCH_HELPER,
+        NODE_HELPER,
+        ACTION_HELPER,
+        RENDER_HELPER,
+        DESKTOP_HELPER,
+        MEDIA_HELPER,
+        BATCH_COPY_HELPER,
+        LIBRARY_OPEN_HELPER,
+        READ_HELPER,
+        INSPECT_HELPER,
+        USAGE_HELPER,
+        TIMELINE_HELPER,
+        TRIM_HELPER,
+        EDIT_HELPER,
+        BUILD_HELPER,
+        CREATE_HELPER,
+        EXTRACT_HELPER,
+        CONNECTION_HELPER,
+        DELETE_SEGMENTS_HELPER,
+        MOVE_TRACK_HELPER,
+        SHORTEN_HELPER,
+        COMPARE_HELPER,
+        DELETE_HELPER,
+        PURGE_HELPER,
+        REFORMAT_HELPER,
+        RENDER_CLIP_HELPER,
+        COLOUR_HELPER,
+        TC_HELPER,
+        BATCH_DELETE_HELPER,
+        EXPORT_HELPER,
+        STILL_HELPER,
+        SETUP_EDIT_HELPER,
+    )
+    for line in (helper.strip("\n"), "")
+)
+"""The Flame-side helpers every script starts with, each followed by a blank line. The first five
+are used as written; the prelude helpers lose their leading and trailing newlines."""
 
-    Structure:
-      1. `_v` helper
-      2. op code, run via `exec(compile(...), globals())` inside try/except
-         -> `__op_error` / `__op_traceback`
-      3. verify code (if declared), only on op success -> `_verified` / `_verify_detail`
-      4. rider fields, each in its own try/except -> None on failure
-      5. final `_result = {...}`, which overwrites the op's own `_result`, whose
-         value was already captured into `__op_value` first (never lost).
 
-    The op's (and verify's) own source is never re-indented and spliced into this
-    script as literal text, because that would silently corrupt any multi-line
-    string literal the op's code contains (textwrap.indent has no notion of
-    "inside a triple-quoted string").
-    Instead each is embedded as a `repr()`-escaped string constant and run
-    with its own `compile(..., "<op:NAME>" | "<verify:NAME>", "exec")`, so
-    (a) the source text `op.to_python`/`op.verify` returned is preserved
-    byte-for-byte, and (b) a traceback from the op's own code names that
-    op/verify and its own line number, not this wrapper's.
-    """
-    if op.to_python is None:
-        raise ValueError(f"'{op.name}': thread='{op.thread}' operation has no to_python to run")
+_RESULT_LINES: Final[tuple[str, ...]] = (
+    "",
+    "__ctx_project = None",
+    "try:",
+    "    __ctx_project = flame.projects.current_project.name",
+    "except BaseException:",
+    "    __ctx_project = None",
+    "",
+    "__ctx_workspace = None",
+    "try:",
+    "    __ctx_workspace = _v(flame.projects.current_project.current_workspace.name)",
+    "except BaseException:",
+    "    __ctx_workspace = None",
+    "",
+    "__ctx_selected = None",
+    "try:",
+    "    __ctx_selected = len(flame.media_panel.selected_entries)",
+    "except BaseException:",
+    "    __ctx_selected = None",
+    "",
+    "_result = {",
+    "    'value': __op_value,",
+    "    'affected': __op_affected,",
+    "    'partial': __op_partial,",
+    "    'opError': __op_error,",
+    "    'opErrorCode': __op_error_code,",
+    "    'opTraceback': __op_traceback,",
+    "    'verified': _verified,",
+    "    'verifyDetail': _verify_detail,",
+    "    'context': {",
+    "        'project': __ctx_project,",
+    "        'workspace': __ctx_workspace,",
+    "        'selected': __ctx_selected,",
+    "    },",
+    "}",
+)
 
+
+def _op_lines(op: RegisteredOperation, args: Mapping[str, Any], open_lines: list[str]) -> list[str]:
+    """The script's part that runs the op's own code and captures its value, error and counts."""
+    assert op.to_python is not None
     default_affected = 0 if op.effect == "read" else 1
     op_src = op.to_python(args)
     op_filename = f"<op:{op.name}>"
-
-    lines: list[str] = [
-        V_HELPER,
-        "",
-        J_HELPER,
-        "",
-        OP_ERROR_HELPER,
-        "",
-        SELECTOR_HELPER,
-        "",
-        DESCRIBE_ENTRY_HELPER,
-        "",
-        ATTRIBUTE_HELPER.strip("\n"),
-        "",
-        CHECKPOINT_HELPER.strip("\n"),
-        "",
-        BATCH_HELPER.strip("\n"),
-        "",
-        NODE_HELPER.strip("\n"),
-        "",
-        ACTION_HELPER.strip("\n"),
-        "",
-        RENDER_HELPER.strip("\n"),
-        "",
-        DESKTOP_HELPER.strip("\n"),
-        "",
-        MEDIA_HELPER.strip("\n"),
-        "",
-        BATCH_COPY_HELPER.strip("\n"),
-        "",
-        LIBRARY_OPEN_HELPER.strip("\n"),
-        "",
-        READ_HELPER.strip("\n"),
-        "",
-        INSPECT_HELPER.strip("\n"),
-        "",
-        USAGE_HELPER.strip("\n"),
-        "",
-        TIMELINE_HELPER.strip("\n"),
-        "",
-        TRIM_HELPER.strip("\n"),
-        "",
-        EDIT_HELPER.strip("\n"),
-        "",
-        BUILD_HELPER.strip("\n"),
-        "",
-        CREATE_HELPER.strip("\n"),
-        "",
-        EXTRACT_HELPER.strip("\n"),
-        "",
-        CONNECTION_HELPER.strip("\n"),
-        "",
-        DELETE_SEGMENTS_HELPER.strip("\n"),
-        "",
-        MOVE_TRACK_HELPER.strip("\n"),
-        "",
-        SHORTEN_HELPER.strip("\n"),
-        "",
-        COMPARE_HELPER.strip("\n"),
-        "",
-        DELETE_HELPER.strip("\n"),
-        "",
-        PURGE_HELPER.strip("\n"),
-        "",
-        REFORMAT_HELPER.strip("\n"),
-        "",
-        RENDER_CLIP_HELPER.strip("\n"),
-        "",
-        COLOUR_HELPER.strip("\n"),
-        "",
-        TC_HELPER.strip("\n"),
-        "",
-        BATCH_DELETE_HELPER.strip("\n"),
-        "",
-        EXPORT_HELPER.strip("\n"),
-        "",
-        STILL_HELPER.strip("\n"),
-        "",
-        SETUP_EDIT_HELPER.strip("\n"),
-        "",
-    ]
-
-    refs = library_refs(args)
-    open_lines = (
-        [f"__lib_refs = {refs!r}", "__lib_state = {'opened': []}"] if has_refs(refs) else []
-    )
     open_call = ["    _lo_open(__lib_refs, __lib_state)"] if open_lines else []
-    lines += [
+    return [
         "_result = None",
         "_affected = None",
         "_partial = None",
@@ -586,64 +584,65 @@ def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
         "_verify_detail = None",
     ]
 
-    if op.verify is not None:
-        verify_src = op.verify(args)
-        if verify_src is None:
-            raise ValueError(f"'{op.name}': verify(args) returned None instead of code")
-        verify_filename = f"<verify:{op.name}>"
-        lines += [
-            f"__verify_src = {verify_src!r}",
-            "if __op_error is None:",
-            "    try:",
-            f"        exec(compile(__verify_src, {verify_filename!r}, 'exec'), globals())",
-            "    except BaseException:",
-            "        import traceback as __tb_verify",
-            "        _verified = False",
-            "        _verify_detail = __tb_verify.format_exc().strip().splitlines()[-1]",
-        ]
 
+def _verify_lines(op: RegisteredOperation, args: Mapping[str, Any]) -> list[str]:
+    """The script's part that runs the op's verify code, only when the op succeeded."""
+    if op.verify is None:
+        return []
+    verify_src = op.verify(args)
+    if verify_src is None:
+        raise ValueError(f"'{op.name}': verify(args) returned None instead of code")
+    verify_filename = f"<verify:{op.name}>"
+    return [
+        f"__verify_src = {verify_src!r}",
+        "if __op_error is None:",
+        "    try:",
+        f"        exec(compile(__verify_src, {verify_filename!r}, 'exec'), globals())",
+        "    except BaseException:",
+        "        import traceback as __tb_verify",
+        "        _verified = False",
+        "        _verify_detail = __tb_verify.format_exc().strip().splitlines()[-1]",
+    ]
+
+
+def build_exec_code(op: RegisteredOperation, args: Mapping[str, Any]) -> str:
+    """Assembles the full script sent to `transport.exec` for `op`.
+
+    Structure:
+      1. `_v` helper
+      2. op code, run via `exec(compile(...), globals())` inside try/except
+         -> `__op_error` / `__op_traceback`
+      3. verify code (if declared), only on op success -> `_verified` / `_verify_detail`
+      4. rider fields, each in its own try/except -> None on failure
+      5. final `_result = {...}`, which overwrites the op's own `_result`, whose
+         value was already captured into `__op_value` first (never lost).
+
+    The op's (and verify's) own source is never re-indented and spliced into this
+    script as literal text, because that would silently corrupt any multi-line
+    string literal the op's code contains (textwrap.indent has no notion of
+    "inside a triple-quoted string").
+    Instead each is embedded as a `repr()`-escaped string constant and run
+    with its own `compile(..., "<op:NAME>" | "<verify:NAME>", "exec")`, so
+    (a) the source text `op.to_python`/`op.verify` returned is preserved
+    byte-for-byte, and (b) a traceback from the op's own code names that
+    op/verify and its own line number, not this wrapper's.
+    """
+    if op.to_python is None:
+        raise ValueError(f"'{op.name}': thread='{op.thread}' operation has no to_python to run")
+
+    refs = library_refs(args)
+    open_lines = (
+        [f"__lib_refs = {refs!r}", "__lib_state = {'opened': []}"] if has_refs(refs) else []
+    )
+    lines: list[str] = list(_HELPER_LINES)
+    lines += _op_lines(op, args, open_lines)
+    lines += _verify_lines(op, args)
     if open_lines:
         lines += [
             "",
             "__op_value = _lo_finish(__op_value, __lib_state)",
         ]
-
-    lines += [
-        "",
-        "__ctx_project = None",
-        "try:",
-        "    __ctx_project = flame.projects.current_project.name",
-        "except BaseException:",
-        "    __ctx_project = None",
-        "",
-        "__ctx_workspace = None",
-        "try:",
-        "    __ctx_workspace = _v(flame.projects.current_project.current_workspace.name)",
-        "except BaseException:",
-        "    __ctx_workspace = None",
-        "",
-        "__ctx_selected = None",
-        "try:",
-        "    __ctx_selected = len(flame.media_panel.selected_entries)",
-        "except BaseException:",
-        "    __ctx_selected = None",
-        "",
-        "_result = {",
-        "    'value': __op_value,",
-        "    'affected': __op_affected,",
-        "    'partial': __op_partial,",
-        "    'opError': __op_error,",
-        "    'opErrorCode': __op_error_code,",
-        "    'opTraceback': __op_traceback,",
-        "    'verified': _verified,",
-        "    'verifyDetail': _verify_detail,",
-        "    'context': {",
-        "        'project': __ctx_project,",
-        "        'workspace': __ctx_workspace,",
-        "        'selected': __ctx_selected,",
-        "    },",
-        "}",
-    ]
+    lines += _RESULT_LINES
     return "\n".join(lines)
 
 
@@ -680,4 +679,4 @@ def run_op(
         run_dir=run_dir,
         **extra,
     )
-    return envelope_mod.from_bridge_result(op, args, br)
+    return envelope_mod.from_bridge_result(op, br)

@@ -3,16 +3,9 @@
 
 from __future__ import annotations
 
+from conftest import make_registry
 from fake_media_tree import FakeFlame, PyLibrary, build_default_tree
-from flame_mcp.ops import register_all
-from flame_mcp.registry import Registry
 from op_test_helpers import run_op
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def test_list_libraries_returns_the_one_library() -> None:

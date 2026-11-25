@@ -10,7 +10,7 @@
 # for the flame.exit() that step g of that script sends, and cleans up.
 #
 # Usage: run_p1_bridge_e2e.sh [TIMEOUT]
-#   [TIMEOUT]  seconds to wait for Flame to exit by itself after the client returns (default 600)
+#   [TIMEOUT]  seconds to wait for Flame to exit by itself after the client returns (default 120)
 #
 # This script starts Flame itself.
 set -euo pipefail
@@ -20,7 +20,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_lib.sh"
 
 P1_DIR="$APP_SUPPORT/p1"
 E2E_CLIENT="$SCRIPT_DIR/p1_bridge_e2e.py"
-TIMEOUT="${1:-600}"
+TIMEOUT="${1:-$EXIT_WAIT_S}"
 
 e2e_init "$P1_DIR"
 e2e_abort_if_flame_running

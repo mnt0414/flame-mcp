@@ -10,7 +10,6 @@ scripted `transport.exec` over the fake Flame tree (fake_selection_connections.p
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,17 +18,15 @@ import fake_selection_connections as fsc
 from fake_media_tree import PySegment, share_sources
 from journal_test_helpers import Rig
 from p33_helpers import seg_a
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import S1, S1_WT, a_seg, make_timeline_rig, seg_sel, wt
+
+rig = rig_fixture(make_timeline_rig)
 
 CREATE = "segment.create_connection"
 REMOVE = "segment.remove_connection"
 SYNC = "segment.sync_connections"
 CHECK = "journal.check"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def s2_seg(rig: Rig) -> PySegment:

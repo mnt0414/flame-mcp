@@ -22,6 +22,7 @@ from mcp.server.stdio import stdio_server
 from flame_mcp import envelope, transport
 from flame_mcp.compact import ResponseModeConfigError, response_mode_from_env
 from flame_mcp.journal import JOURNAL_DIR_ENV, Journal, default_journal_dir
+from flame_mcp.loop_limits import LoopLimitsConfigError, loop_limits_from_env
 from flame_mcp.ops import register_all
 from flame_mcp.opschema import find_non_ascii
 from flame_mcp.policy import Policy, PolicyConfigError
@@ -78,6 +79,11 @@ def build_server(*, run_dir: Path | None = None, app_root: Path | None = None) -
     except ResponseModeConfigError as exc:
         print(f"flame-mcp: invalid response configuration: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    try:
+        loop_limits = loop_limits_from_env(os.environ)
+    except LoopLimitsConfigError as exc:
+        print(f"flame-mcp: invalid loop configuration: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     permissions = None
     if app_root is not None:
         in_use = [
@@ -115,6 +121,7 @@ def build_server(*, run_dir: Path | None = None, app_root: Path | None = None) -
         hooks=hooks,
         permissions=permissions,
         response_mode=response_mode,
+        loop_limits=loop_limits,
     )
 
 

@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
+from flame_mcp import plan_refs
 from flame_mcp.checkpointed import (
     ASCII_REFUSAL_HINT,
     CheckpointedRun,
@@ -50,7 +51,8 @@ from flame_mcp.checkpoints import (
     read_fingerprint,
 )
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import ATTRIBUTE_FINGERPRINT_KEY
+from flame_mcp.journal import JournalLink
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.types import ServerOpError
 
@@ -86,6 +88,9 @@ class StepLike(Protocol):
     args: dict[str, Any]
     problems: list[str]
     late: bool
+
+    @property
+    def has_refs(self) -> bool: ...
 
 
 def checkpoint_kind_of(op: RegisteredOperation) -> CheckpointKind | None:
@@ -142,6 +147,49 @@ def apply_static_rules(steps: Sequence[StepLike]) -> None:
             )
 
 
+Rebound = Callable[[RegisteredOperation, dict[str, Any], dict[str, Any]], dict[str, Any]]
+"""`(op, args, stable) -> args`: the step's arguments with what names the plan's write target
+pointed at `stable`, the one sequence / clip / Batch group the plan pinned."""
+_SENTINEL_TARGET: Final[dict[str, Any]] = {"kind": "wiretap", "id": "-"}
+
+
+def reject_target_refs(steps: Sequence[StepLike], kind: CheckpointKind, rebound: Rebound) -> None:
+    """A write step of a bundled plan is run against the one target the plan pinned: whatever
+    `rebound` replaces in its arguments is overwritten by it. A reference there would be dropped
+    without a word (the step would write to the pinned target, not to what the reference says),
+    so it is a problem on the step; a reference elsewhere in its selector (a segment's index, a
+    node's name) is fine."""
+    for step in steps:
+        op = step.op
+        if op is None or step.problems or not step.has_refs or not is_bundled_op(op, kind):
+            continue
+        before = len(plan_refs.collect(step.args))
+        try:
+            after = len(plan_refs.collect(rebound(op, dict(step.args), _SENTINEL_TARGET)))
+        except (KeyError, TypeError, AttributeError, IndexError, ValueError):
+            after = -1  # what names the target is not even a selector: it is a reference
+        if after != before:
+            step.problems.append(
+                f"{op.name} in a plan that holds a {kind.subject} write: a reference cannot "
+                f"stand where the write target is named (the {kind.subject} the plan "
+                "checkpoints; the step is written to that one). Name it without a reference; "
+                "a reference in the rest of the selector (a name, an index) is allowed"
+            )
+
+
+def with_late_rows(
+    resolved: list[dict[str, Any]], writes: Sequence[StepLike], **blank: Any
+) -> list[dict[str, Any]]:
+    """`resolved` with a `late` row for every write step that holds references (it is resolved
+    when it is sent, like a step with `late: true`), in step order. `blank` is the row's
+    kind-specific part that nothing was resolved for."""
+    rows = [
+        *resolved,
+        *({"index": s.index, "op": s.op_name, "late": True, **blank} for s in writes if s.has_refs),
+    ]
+    return sorted(rows, key=lambda row: row["index"])
+
+
 @dataclass(frozen=True)
 class BundleTarget:
     """The one sequence / clip / Batch group a bundled plan writes to, as the up-front read found
@@ -182,6 +230,16 @@ def unresolved(issues: list[dict[str, Any]], hint: str) -> ServerOpError:
         + (f" (and {len(issues) - 1} more step(s))" if len(issues) > 1 else ""),
         result={"ran": False, "preResolution": issues},
         hint=hint,
+    )
+
+
+def no_pinned_target(subject: str) -> ServerOpError:
+    return ServerOpError(
+        "INVALID_ARGS",
+        "plan not run (nothing was executed): every write step of this plan holds a reference, "
+        f"so none of them can pin the {subject} the plan checkpoints; put at least one write "
+        "step without a reference in it",
+        result={"ran": False},
     )
 
 
@@ -277,7 +335,10 @@ def run_bundled(
     `ctx.write_lock`."""
     kind = target.kind
     refuse_if_denied(ctx, kind.needed_ops)
-    step_rows = [{"index": s.index, "op": s.op_name, "late": s.late, "args": s.args} for s in steps]
+    step_rows = [
+        {"index": s.index, "op": s.op_name, "late": s.late or s.has_refs, "args": s.args}
+        for s in steps
+    ]
 
     def run(stable: dict[str, Any]) -> dict[str, Any]:
         return execute(make_runner(ctx, target, group))
@@ -294,16 +355,21 @@ def run_bundled(
         s.op_name in BUNDLED_WRITE_OPS[BATCH_KIND.name] for s in steps
     )
 
-    def outcome_extra(env: dict[str, Any], fingerprint_after: str | None) -> dict[str, Any]:
-        extra: dict[str, Any] = {
-            "steps": env.get("steps"),
-            "stoppedAt": env.get("stoppedAt"),
-            "touched": env.get("touched"),
-        }
+    def add_plan_intent(intent: IntentRecord) -> None:
+        intent["plan"] = True
+        intent["resolved"] = target.resolved
+        if watch_attributes:
+            intent["watchAttributes"] = True
+
+    def outcome_extra(
+        outcome: OutcomeRecord, env: dict[str, Any], fingerprint_after: str | None
+    ) -> None:
+        outcome["steps"] = env.get("steps")
+        outcome["stoppedAt"] = env.get("stoppedAt")
+        outcome["touched"] = env.get("touched")
         if watch_attributes:
             after = read_fingerprint(ctx, target.stable, kind, sections=[ATTRIBUTES_SECTION])
-            extra[ATTRIBUTE_FINGERPRINT_KEY] = fingerprint_of(after)
-        return extra
+            outcome["attributeFingerprintAfter"] = fingerprint_of(after)
 
     try:
         return run_checkpointed(
@@ -312,18 +378,14 @@ def run_bundled(
             op_name="plan.run",
             kind="plan",
             args={"label": label, "onError": on_error, "steps": step_rows},
-            intent_extra={
-                "plan": True,
-                "resolved": target.resolved,
-                **({"watchAttributes": True} if watch_attributes else {}),
-            },
+            intent_extra=add_plan_intent,
             expected_fp=None,
             label=f"before plan.run ({label})" if label else "before plan.run",
             run=run,
             judge=judge,
             failed_key="plan.run",
             outcome_extra=outcome_extra,
-            group=group,
+            link=JournalLink(group),
             checkpoint_kind=kind,
         )
     except PreRunRefusal as exc:

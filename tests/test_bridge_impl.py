@@ -34,7 +34,6 @@ import socket
 import stat
 import threading
 import time
-import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -42,6 +41,7 @@ from typing import Any, cast
 import pytest
 
 from flame_mcp_bridge import impl
+from rig_fixtures import scratch_dir_fixture
 
 SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "scratch" / "p12"
 
@@ -172,13 +172,7 @@ def _sock(bridge: impl.Bridge) -> Path:
     return path
 
 
-@pytest.fixture
-def scratch_dir() -> Iterator[Path]:
-    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
-    d = SCRATCH_ROOT / uuid.uuid4().hex[:8]
-    d.mkdir(parents=True, exist_ok=True)
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+scratch_dir = scratch_dir_fixture(SCRATCH_ROOT)
 
 
 @pytest.fixture

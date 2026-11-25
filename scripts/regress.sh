@@ -23,7 +23,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 P3="$HOME/Library/Application Support/flame-mcp/p3"
 FLAME_RUNNING_PATTERN='flame.app/Contents/MacOS/flame'
-TIMEOUT_S=900
 # The route line is "exit route", printed by e2e_lib.sh and by run_flame_with_bridge.sh (the
 # clean-up).
 ROUTE_PATTERN='exit route'
@@ -76,7 +75,7 @@ for n in "${NAMES[@]}"; do
         echo "$n#$i start=$start SKIPPED: Flame is already running" >>"$OUT/summary.txt"
         break
     fi
-    bash scripts/run_e2e.sh "$n" "$TIMEOUT_S" >"$log" 2>&1
+    bash scripts/run_e2e.sh "$n" >"$log" 2>&1
     rc=$?
     route="$(route_of "$log")"
     abn="$(grep -cE 'abnormal termination \(lines after launch\): yes|abnormal termination: [1-9]' "$log")"
@@ -87,7 +86,7 @@ done
 if pgrep -f "$FLAME_RUNNING_PATTERN" >/dev/null; then
     echo "clean SKIPPED: Flame is already running" >>"$OUT/summary.txt"
 else
-    bash scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py "$TIMEOUT_S" -- --mode apply >"$OUT/clean.log" 2>&1
+    bash scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py -- --mode apply >"$OUT/clean.log" 2>&1
     clean_rc=$?
     echo "clean rc=$clean_rc $(route_of "$OUT/clean.log")" >>"$OUT/summary.txt"
 fi

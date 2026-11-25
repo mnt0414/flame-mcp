@@ -40,6 +40,11 @@ POLL_INTERVAL=5
 BIN_WAIT_TIMEOUT=60
 TERM_WAIT=10
 SOCKET_WAIT_S=120
+# Seconds to wait for Flame to exit by itself after the client returns. A healthy Flame exits
+# within a few seconds; one whose main thread hangs never exits, so a longer wait only delays
+# the sample and the kill.
+# shellcheck disable=SC2034 # a library: used by the scripts that source this file
+EXIT_WAIT_S=120
 
 # Directory for launch logs, samples and the client's result files (set by e2e_init).
 RESULTS_DIR=""
@@ -384,6 +389,7 @@ e2e_wait_for_exit() {
         sleep "$POLL_INTERVAL"
         elapsed=$((elapsed + POLL_INTERVAL))
     done
+    echo "Waited ${elapsed}s for the exit (outcome: $outcome)."
 }
 
 #######################################

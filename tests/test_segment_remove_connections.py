@@ -24,6 +24,7 @@ from flame_mcp.ops.segment_connect import MAX_REMOVE_TARGETS
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
 from p33_helpers import seg_a, seg_b, untouched_world
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     S2,
@@ -36,13 +37,10 @@ from timeline_p32a_helpers import (
     wt,
 )
 
+rig = rig_fixture(make_timeline_rig)
+
 REMOVE = "segment.remove_connection"
 CREATE = "segment.create_connection"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def s2_seg(rig: Rig) -> PySegment:
@@ -108,7 +106,7 @@ def test_two_targets_remove_both_connections_in_one_call(rig: Rig) -> None:
     assert alone(seg_a(rig)) and alone(s2_seg(rig)) and alone(seg_b(rig)) and alone(s3_seg(rig))
     assert not alone(seg_c(rig))  # not a target: still connected
     assert env["journal"]["group"] and len(env["journal"]["ids"]) == 2
-    assert env["affected"] == 2 and env["undoSteps"] == 0
+    assert env["affected"] == 2
     assert [c.label for c in rig.exec.calls] == [REMOVE] * 3  # one check, one call per target
     [notice] = result["notices"]
     assert "other sequences" in notice and "journal.revert" in notice

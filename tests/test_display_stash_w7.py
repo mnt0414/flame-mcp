@@ -11,21 +11,16 @@ directly (as the UI does): `PySequence.open()` is what stops the moving in that 
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import ACTIVE_TIMELINE, PySequence
 from journal_test_helpers import Rig
 from media_p31b_helpers import add_seq
 from p32b_helpers import DELETE, PLAN, S1, S2, make_p32b_rig, reel2, shown, uid, wt
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import CHECKPOINT, TRIM, a_seg, checkpoints, seg_sel, trim
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def show_in_ui(rig: Rig, name: str | None) -> None:

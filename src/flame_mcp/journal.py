@@ -149,12 +149,24 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, Final
+from typing import IO, Any, Final, Unpack, cast
 
 from flame_mcp.attribute_prelude import CASE_FOLDED_ATTRIBUTES
+from flame_mcp.journal_records import (
+    CheckpointRecord,
+    CheckRecord,
+    GroupFields,
+    GroupRecord,
+    IntentRecord,
+    OutcomeRecord,
+    PendingRecord,
+    PolledRecord,
+    UnresolvedRecord,
+)
 from flame_mcp.private_fs import default_root, make_private_dirs
 
 JOURNAL_DIR_ENV: Final[str] = "FLAME_MCP_JOURNAL_DIR"
@@ -179,10 +191,11 @@ STATE_PARTIALLY_REVERTED: Final[str] = "partially_reverted"
 
 VERDICT_UNKNOWN: Final[str] = "unknown"
 
-ATTRIBUTE_FINGERPRINT_KEY: Final[str] = "attributeFingerprintAfter"
-"""Outcome key of a bundled Batch plan with value writes: the group's fingerprint over nodes,
-wiring and every node's attribute values, read right after the run (what `journal.revert` compares
-with, so an attribute changed since is not restored over)."""
+LOOP_GROUP_KIND: Final[str] = "plan.for_each"
+"""`kind` of the group record of a `plan.for_each` write loop: the parent, which holds no intent
+itself. A child is a group whose `group` record names it in `parent` (with the item's `key`, the
+`op`, the `step` ids and whether it is `revertible`); the children come in the order the loop
+recorded them."""
 
 KIND_DESKTOP_CREATE: Final[str] = "desktop_create"
 KIND_DESKTOP_COPY: Final[str] = "desktop_copy"
@@ -240,6 +253,25 @@ def new_id(prefix: str) -> str:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+@dataclass(frozen=True)
+class JournalLink:
+    """How a write joins the journal: the `group` it belongs to (None starts a new one) and, when
+    it is a revert, the group it `reverts` (and `reverts_intent`: that group's one intent)."""
+
+    group: str | None = None
+    reverts: str | None = None
+    reverts_intent: str | None = None
+
+    def stamp(self, intent: IntentRecord) -> None:
+        if self.reverts is not None:
+            intent["reverts"] = self.reverts
+        if self.reverts_intent is not None:
+            intent["revertsIntent"] = self.reverts_intent
+
+
+NO_LINK: Final[JournalLink] = JournalLink()
 
 
 def values_equal(a: Any, b: Any) -> bool:
@@ -322,7 +354,7 @@ class Journal:
         self._fh_path = path
         return fh
 
-    def append(self, record: Record) -> None:
+    def append(self, record: Mapping[str, Any]) -> None:
         """Write one record as one line and flush it. Raises OSError when the journal cannot
         be written (the caller decides what that means -- for a write op, refuse it)."""
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -330,6 +362,20 @@ class Journal:
             fh = self._handle()
             fh.write(line + "\n")
             fh.flush()
+
+    def append_group(
+        self, group: str, kind: str | None, **fields: Unpack[GroupFields]
+    ) -> str | None:
+        """Writes a `group` record (of `kind`, when given); the reason it could not be written,
+        else None. Several records of one group add up (`Index.group_meta`)."""
+        head: GroupRecord = {"type": "group", "group": group, "ts": now_iso()}
+        if kind is not None:
+            head["kind"] = kind
+        try:
+            self.append({**head, **fields})
+        except OSError as exc:
+            return str(exc)
+        return None
 
     def close(self) -> None:
         with self._lock:
@@ -447,12 +493,12 @@ def purge_records(records: list[Record]) -> dict[str, Record]:
 
 @dataclass
 class IntentView:
-    intent: Record
-    outcome: Record | None = None
-    unresolved: Record | None = None
-    checks: list[Record] = field(default_factory=list)
-    pending: Record | None = None
-    polled: Record | None = None
+    intent: IntentRecord
+    outcome: OutcomeRecord | None = None
+    unresolved: UnresolvedRecord | None = None
+    checks: list[CheckRecord] = field(default_factory=list)
+    pending: PendingRecord | None = None
+    polled: PolledRecord | None = None
 
     @property
     def pending_handle(self) -> str | None:
@@ -478,7 +524,7 @@ class IntentView:
     def group(self) -> str:
         return str(self.intent["group"])
 
-    def resolving_check(self) -> Record | None:
+    def resolving_check(self) -> CheckRecord | None:
         """The newest check that decided something (an `unknown` verdict decides nothing)."""
         for record in reversed(self.checks):
             if record.get("verdict") != VERDICT_UNKNOWN:
@@ -519,6 +565,17 @@ class IntentView:
         kind = self.intent.get("kind")
         return kind if isinstance(kind, str) and kind in DESKTOP_KINDS else None
 
+    @property
+    def effective_kind(self) -> str | None:
+        """The intent's `kind`; for the revert of a Desktop write, the kind of the write it
+        reverts (so a write and its revert are told apart by the same key)."""
+        kind = self.intent.get("kind")
+        if kind == KIND_DESKTOP_REVERT:
+            reverted = self.intent.get("revertOf")
+            if isinstance(reverted, str) and reverted in DESKTOP_WRITE_KINDS:
+                return reverted
+        return kind if isinstance(kind, str) else None
+
     def created_info(self) -> dict[str, Any] | None:
         """What a desktop write made, from its outcome, or (no outcome) from the check that found
         it had landed. None when nothing is known to have been made."""
@@ -543,7 +600,7 @@ class IntentView:
         (`watchAttributes` plans), when its outcome recorded one."""
         if self.outcome is None:
             return None
-        value = self.outcome.get(ATTRIBUTE_FINGERPRINT_KEY)
+        value = self.outcome.get("attributeFingerprintAfter")
         return value if isinstance(value, str) and value else None
 
     def is_revertible(self) -> bool:
@@ -592,24 +649,26 @@ class Index:
     `Journal.read_all().records`; records for an unknown intent id are ignored."""
 
     def __init__(self, records: list[Record]) -> None:
+        self.records = records
         self.intents: dict[str, IntentView] = {}
         self.groups: dict[str, list[IntentView]] = {}
         self._reverts_of: dict[str, list[str]] = {}
-        self.group_meta: dict[str, Record] = {}
-        self.checkpoints: dict[str, Record] = {}
+        self.group_meta: dict[str, GroupRecord] = {}
+        self.checkpoints: dict[str, CheckpointRecord] = {}
+        self._children: dict[str, list[str]] = {}
         self.purged: dict[str, Record] = purge_records(records)
         for record in records:
             kind = record.get("type")
             if kind == "group":
-                self.group_meta[str(record.get("group"))] = record
+                self._add_group_record(record)
                 continue
             if kind == "purge":
                 continue
             if kind == "checkpoint":
-                self.checkpoints[str(record.get("id"))] = record
+                self.checkpoints[str(record.get("id"))] = cast(CheckpointRecord, record)
                 continue
             if kind == "intent":
-                view = IntentView(intent=record)
+                view = IntentView(intent=cast(IntentRecord, record))
                 self.intents[view.id] = view
                 self.groups.setdefault(view.group, []).append(view)
                 target_group = record.get("reverts")
@@ -622,19 +681,49 @@ class Index:
             if view_of is None:
                 continue
             if kind == "outcome":
-                view_of.outcome = record
+                view_of.outcome = cast(OutcomeRecord, record)
             elif kind == "unresolved":
-                view_of.unresolved = record
+                view_of.unresolved = cast(UnresolvedRecord, record)
             elif kind == "pending":
-                view_of.pending = record
+                view_of.pending = cast(PendingRecord, record)
             elif kind == "polled":
-                view_of.polled = record
+                view_of.polled = cast(PolledRecord, record)
             elif kind == "check":
-                view_of.checks.append(record)
+                view_of.checks.append(cast(CheckRecord, record))
         self._reverted_memo: dict[str, bool] = {}
 
+    def _add_group_record(self, record: Record) -> None:
+        """A later record of the same group adds to (and on the same key, wins over) the earlier
+        ones: a loop names a child before the op it runs writes the group's own record."""
+        group = str(record.get("group"))
+        earlier: Mapping[str, Any] = self.group_meta.get(group) or {}
+        self.group_meta[group] = cast(GroupRecord, {**earlier, **record})
+        parent = record.get("parent")
+        if isinstance(parent, str):
+            children = self._children.setdefault(parent, [])
+            if group not in children:
+                children.append(group)
+
+    def is_loop_parent(self, group: str) -> bool:
+        """`group` is the parent of a `plan.for_each` write loop."""
+        meta = self.group_meta.get(group)
+        return meta is not None and meta.get("kind") == LOOP_GROUP_KIND
+
+    def loop_child_records(self, parent: str) -> list[GroupRecord]:
+        """The `group` records (added up) of a loop's children, in the order they were named."""
+        return [self.group_meta[child] for child in self._children.get(parent, [])]
+
+    def _views_of(self, group: str) -> list[IntentView]:
+        if self.is_loop_parent(group):
+            return [
+                view
+                for row in self.loop_child_records(group)
+                for view in self.groups.get(str(row.get("group")), [])
+            ]
+        return self.groups.get(group, [])
+
     def in_doubt(self, group: str | None = None) -> list[IntentView]:
-        views = self.groups.get(group, []) if group is not None else list(self.intents.values())
+        views = self._views_of(group) if group is not None else list(self.intents.values())
         return [view for view in views if view.is_in_doubt()]
 
     def base_state(self, group: str) -> str:
@@ -721,7 +810,7 @@ class Index:
             "ops": [str(view.intent.get("op")) for view in views],
             "state": self.group_state(group),
             "intents": len(views),
-            "label": self.group_meta.get(group, {}).get("label"),
+            "label": meta.get("label") if (meta := self.group_meta.get(group)) else None,
             "reverts": reverts if isinstance(reverts, str) else None,
             "revertedBy": self.reverted_by(group),
         }

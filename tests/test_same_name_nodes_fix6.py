@@ -13,6 +13,7 @@ from typing import Any, get_args
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import FakeAttr, PyActionNode, PyBatch, PyCoNode, PyNode
 from flame_mcp import errors, execution, selectors
 from flame_mcp.node_prelude import NODE_HELPER
@@ -20,7 +21,7 @@ from flame_mcp.types import ErrorCode, SelectorKind
 from journal_test_helpers import BG1, Rig, make_rig
 from op_test_helpers import run_op
 from test_ops_attributes import call, make_batch_world
-from test_ops_batch_node import make_registry, resolve
+from test_ops_batch_node import resolve
 
 DUP_A = (100, 100)
 DUP_B = (400, 200)

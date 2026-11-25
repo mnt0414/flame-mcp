@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+from flame_mcp.list_fields import fields_param
 from flame_mcp.registry import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -13,13 +14,16 @@ from flame_mcp.registry import (
     Registry,
 )
 from flame_mcp.types import (
+    PHASE_ARG,
     Category,
     Depth,
     Effect,
     JournalSpec,
+    ListFields,
     OperationParam,
     OperationSpec,
     Pacing,
+    PhaseSpec,
     SelectorKind,
     ServerResult,
 )
@@ -78,7 +82,6 @@ def write_op(**overrides: Any) -> OperationSpec:
         description="renames a thing",
         effect="reversible",
         to_python=lambda args: "result = 1",
-        undo_steps=lambda args, target_count: 1,
     )
     defaults.update(overrides)
     return OperationSpec(**defaults)
@@ -306,8 +309,6 @@ def test_undo_default_derivation(effect: Effect, expected_undo: str) -> None:
         effect=effect,
         to_python=lambda a: "x = 1",
     )
-    if effect != "read":
-        kwargs["undo_steps"] = lambda args, target_count: 1
     op = registry.register(OperationSpec(**kwargs))
     assert op.undo == expected_undo
     assert op.sources["undo"] == "global"
@@ -495,7 +496,6 @@ def _make_hidden_loop_op(**overrides: Any) -> OperationSpec:
         accepts=("selection", "wiretap"),
         pacing="none",
         to_python=_loop_only_for_second_accepts_kind,
-        undo_steps=lambda args, affected: affected,
     )
     defaults.update(overrides)
     return OperationSpec(**defaults)
@@ -527,28 +527,6 @@ def test_loop_free_op_using_a_non_first_path_kind_is_still_accepted() -> None:
         )
     )
     assert op.accepts == ("path", "selection", "wiretap")
-
-
-def test_read_op_without_undo_steps_defaults_to_zero() -> None:
-    registry = make_registry()
-    registry.register_category(widget_category())
-    op = registry.register(read_op())
-    assert op.undo_steps({}, 5) == 0
-
-
-def test_non_read_op_without_undo_steps_rejected() -> None:
-    registry = make_registry()
-    registry.register_category(widget_category())
-    with pytest.raises(RegistrationError):
-        registry.register(
-            OperationSpec(
-                name="widget.rename_thing",
-                category="widget",
-                description="d",
-                effect="reversible",
-                to_python=lambda args: "x = 1",
-            )
-        )
 
 
 def test_requires_typo_rejected() -> None:
@@ -649,7 +627,7 @@ def test_journaled_write_op_registered() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        (dict(effect="read", undo=None, undo_steps=None), "read operation is never journaled"),
+        (dict(effect="read", undo=None), "read operation is never journaled"),
         (dict(undo="checkpoint"), "undo='value'"),
         (dict(journal=journal_spec(values=lambda args: {"other": 1})), "keys must equal"),
         (dict(journal=journal_spec(keys=lambda args: "name")), "list of str"),
@@ -677,7 +655,6 @@ def test_journal_on_a_server_thread_op_rejected() -> None:
                 description="d",
                 effect="reversible",
                 undo="value",
-                undo_steps=lambda args, n: 0,
                 server_handler=lambda args, ctx: ServerResult(result=None),
                 journal=journal_spec(),
             )
@@ -766,3 +743,105 @@ def test_every_real_journaled_op_passes_reference_validation() -> None:
         "node.set_attributes",
         "segment.set_attributes",
     ]
+
+
+def _phased_code(loop_phase: str | None) -> Any:
+    def to_python(args: Any) -> str:
+        if loop_phase is not None and args.get(PHASE_ARG) == loop_phase:
+            return _LOOP_CODE
+        return "x = 1\n"
+
+    return to_python
+
+
+def test_phase_with_loop_in_write_op_with_pacing_none_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category(default_pacing="none"))
+    with pytest.raises(RegistrationError, match="phase 'step'"):
+        registry.register(
+            write_op(
+                pacing="none",
+                to_python=_phased_code("step"),
+                phases=(PhaseSpec("check"), PhaseSpec("step")),
+                requires=("flame.projects",),
+            )
+        )
+
+
+def test_phase_without_loop_accepted_and_gets_its_internal_args() -> None:
+    seen: list[Any] = []
+
+    def to_python(args: Any) -> str:
+        seen.append(args.get("_created"))
+        return "x = 1\n"
+
+    registry = make_registry()
+    registry.register_category(widget_category(default_pacing="none"))
+    registry.register(
+        write_op(
+            pacing="none",
+            to_python=to_python,
+            phases=(PhaseSpec("alive", {"_created": {"items": []}}),),
+        )
+    )
+    assert {"items": []} in seen
+
+
+def test_phase_with_invalid_syntax_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category())
+    with pytest.raises(RegistrationError, match="phase 'bad'"):
+        registry.register(
+            read_op(
+                to_python=lambda args: "x = (" if args.get(PHASE_ARG) == "bad" else "x = 1\n",
+                phases=(PhaseSpec("bad"),),
+            )
+        )
+
+
+def test_phase_declared_twice_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category())
+    with pytest.raises(RegistrationError, match="declared twice"):
+        registry.register(
+            read_op(to_python=_phased_code(None), phases=(PhaseSpec("a"), PhaseSpec("a")))
+        )
+
+
+def test_phases_without_to_python_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(server_category())
+    with pytest.raises(RegistrationError, match="phases need to_python"):
+        registry.register(
+            OperationSpec(
+                name="plan.compute",
+                category="plan",
+                description="d",
+                effect="read",
+                server_handler=lambda args, ctx: ServerResult(result=None),
+                phases=(PhaseSpec("a"),),
+            )
+        )
+
+
+def test_list_fields_without_a_fields_param_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category())
+    with pytest.raises(RegistrationError, match="list_fields and a `fields` param"):
+        registry.register(read_op(list_fields=ListFields("items", ("name",))))
+
+
+def test_fields_param_without_list_fields_rejected() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category())
+    with pytest.raises(RegistrationError, match="list_fields and a `fields` param"):
+        registry.register(
+            read_op(params=(OperationParam(name="fields", type="array", description="d"),))
+        )
+
+
+def test_list_fields_with_a_fields_param_registers() -> None:
+    registry = make_registry()
+    registry.register_category(widget_category())
+    spec = ListFields("items", ("name",))
+    registry.register(read_op(list_fields=spec, params=(fields_param(spec),)))

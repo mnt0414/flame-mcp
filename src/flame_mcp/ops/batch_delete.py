@@ -7,12 +7,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp import selectors
-from flame_mcp.batch_delete_run import PHASE_ALIVE, PHASE_SAVE, run_batch_delete
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ, PHASE_WRITE
+from flame_mcp.batch_delete_run import PHASE_SAVE, run_batch_delete
+from flame_mcp.desktop_run import PHASE_ALIVE, PHASE_READ, PHASE_WRITE
 from flame_mcp.ops._common import build_source
 from flame_mcp.registry import Registry
 from flame_mcp.setup_work import work_root
-from flame_mcp.types import OperationParam, OperationSpec
+from flame_mcp.types import PHASE_ARG, OperationParam, OperationSpec, PhaseSpec, PlanKind, PlanUse
 
 DELETE_DIR_NAME = "batch_delete"
 
@@ -73,10 +73,21 @@ def _to_python(args: Mapping[str, Any]) -> str:
     )
 
 
+_PLAN_USE_BATCH_DELETE = PlanUse(
+    PlanKind.NEVER,
+    refusal=(
+        "batch.delete cannot be a plan step: it deletes a Batch group, which journal.revert "
+        "cannot bring back (the saved setup is loaded into a new group by hand), so it has no "
+        "place in a group that journal.revert is meant to put back; call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.delete",
+            plan_use=_PLAN_USE_BATCH_DELETE,
             category="batch",
             description=_DESCRIPTION,
             effect="destructive",
@@ -112,8 +123,12 @@ def register(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_to_python,
+            phases=(
+                PhaseSpec(PHASE_ALIVE),
+                PhaseSpec(PHASE_SAVE),
+                PhaseSpec(PHASE_WRITE),
+            ),
             wrap=run_batch_delete,
-            undo_steps=lambda args, affected: 0,
             sample_args={"target": {"kind": "batch", "uid": "u"}},
             requires=(
                 "flame.delete",

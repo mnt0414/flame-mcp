@@ -23,9 +23,10 @@ flame-mcp はプロジェクトの整理や、日常的に決まった手順で�
 | 整理 | reel・クリップ・シーケンスの作成・複製・移動・改名、クリップとシーケンスの削除 |
 | 編集 | セグメントの trim・slip・replace・削除(詰める／詰めない)、cut・insert・overwrite、映像トラックの移動、シーケンスの短縮、セグメント接続の読み書き、Timeline FX の追加と設定 |
 | Batch | ノードの作成・接続・設定、setup の保存と読み込み、前に保存した setup との比較（手で変えた値を見つける）、render |
-| まとめて実行 | 複数の op を 1 つの手順として実行する (`plan.run`) |
+| まとめて実行 | 複数の op を 1 つの手順として実行する (`plan.run`)。ある手順の結果 (たとえば見つけた uid) を、あとの手順で使えます |
+| 繰り返し | 同じ手順を一覧の項目ごとに実行する (`plan.for_each`)。書き込みを含む繰り返しは、先に一覧を見せ、承認を受けてから実行します。`journal.revert` 1 回で全体を元に戻せます |
 
-op は 13 のカテゴリに分かれており、全部で 111 個あります。一覧は [docs/ops.md](docs/ops.md) を参照してください。
+op の一覧は [docs/ops.md](docs/ops.md) を参照してください。
 
 ## 使い始める前に
 
@@ -200,7 +201,7 @@ flame-mcp がディスクに作成するファイルは、Flame を起動した�
 
 変更を元に戻したいときは、アシスタントに頼んでください (「さっきの変更を元に戻して」)。アシスタントは `journal.revert` を実行し、変更の記録をもとに元の状態に戻します。値を 1 つずつ元に戻せない変更は、取り消し用の setup ファイルや複製を使って元に戻します。変更のあとで対象が変わっていれば、`journal.revert` は上書きせずに止まります。
 
-1 回の `plan.run` で行った変更はまとめて元に戻ります。
+1 回の `plan.run` で行った変更はまとめて元に戻ります。`plan.for_each` の繰り返しには親のグループが 1 つでき、`journal.revert` で項目を新しい順に戻せます。書き出したファイルのような、元に戻せない出力は、そのまま残る点に注意してください。繰り返しの `approve` は 1 回だけ使えます。サーバーを再起動しても、もう一度は通りません。
 
 > [!WARNING]
 > **アシスタントが変更したあとは、Ctrl+Z を押さないでください。** 改名や属性の変更などは、Flame の Undo 履歴に記録されないことがあります。そのため Ctrl+Z を押すと、以前の別の操作が取り消されることがあります。
@@ -232,10 +233,14 @@ flame-mcp がディスクに作成するファイルは、Flame を起動した�
 | `FLAME_MCP_FFMPEG` | PATH を探し、なければ `imageio_ffmpeg` パッケージ | `render.still` が PNG を作るときに使う ffmpeg |
 | `FLAME_MCP_STILLS_DIR` | `~/Library/Application Support/flame-mcp/stills` | `render.still` がファイルを置く場所 |
 | `FLAME_MCP_PRESETS_DIR` | `/opt/Autodesk/presets` | Flame の書き出しプリセットがあるディレクトリ。Flame のバージョンごとにフォルダがある。`render.still` はここからプリセットを読む |
+| `FLAME_MCP_LOOP_MAX_ITEMS` | `50` | 1 回の `plan.for_each` で実行できる項目の最大数。これより長い一覧は、何も実行せずに拒否する |
+| `FLAME_MCP_LOOP_MAX_STEPS` | `200` | 1 回の `plan.for_each` で実行できる手順の最大数 (項目数 × 項目ごとの手順数) |
+| `FLAME_MCP_LOOP_BUDGET_S` | `120` | 1 回の `plan.for_each` に使える秒数。項目と項目の間で確かめ、使い切ったら今の項目の後で止めて、残りの項目を報告する |
+| `FLAME_MCP_LOOP_UNATTENDED` | オフ | `1`: すべての手順を元に戻せる `plan.for_each` を、`dry_run` と `approve` の 2 回に分けず 1 回で実行する。今あるものを書き換える・消す手順と、元に戻せない出力を作る手順は、このモードでも `approve` が必要。[書き込みの繰り返し](docs/safety.md#loops-that-write)を参照 |
 
 - `FLAME_MCP_ALLOW_EFFECTS` には `read` を含めてください。含めないと、読み取りもすべて拒否されます。
 - `FLAME_MCP_ALLOW_CATEGORIES` に `journal` を含めないと、アシスタントは変更の確認も、元に戻すこともできません。
-- 設定が不正な場合 (例 `FLAME_MCP_READONLY=true`、カンマだけの一覧)、サーバーは起動せず、理由を表示します。
+- 設定が不正な場合 (例 `FLAME_MCP_READONLY=true`、カンマだけの一覧、9 桁以内の正の整数でない `FLAME_MCP_LOOP_*` の上限、`0` でも `1` でもない `FLAME_MCP_LOOP_UNATTENDED`)、サーバーは起動せず、理由を表示します。
 
 ### 読み取り専用モード
 
@@ -262,6 +267,7 @@ flame-mcp がディスクに作成するファイルは、Flame を起動した�
 - `result` の中では、値が null の項目と、隣のセレクタと同じ値の `wiretapId` を送りません。
 - 同じ形の辞書が 3 つ以上並ぶ一覧は、表の形 `{columns, rows}` で送ります。
 - アシスタントが元に戻すときや同じ呼び出しを繰り返すときに渡す値 (`revert`、`inverse`、`args`) は、元の形のまま送ります。
+- `flame_catalog(op=...)` は `detail` を省くと `'args'` (引数の形だけ) で答えます。説明の全文は `detail='full'` で読めます。どちらの形で返したかは、結果の `detail` に入ります。
 
 この形はサーバーの instructions と `flame_context` (`responseFormat`) でアシスタントに説明します。
 

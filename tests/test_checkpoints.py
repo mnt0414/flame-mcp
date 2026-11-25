@@ -21,11 +21,9 @@ from flame_mcp import restore as restore_mod
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def names(rig: Rig) -> list[str]:

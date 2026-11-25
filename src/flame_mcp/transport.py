@@ -125,6 +125,13 @@ class BridgeProtocolError(Exception):
     """
 
 
+class UnknownHandleError(BridgeProtocolError):
+    """The bridge has no result under the polled handle (`protocolError: "unknown handle: ..."`)."""
+
+
+UNKNOWN_HANDLE_PREFIX: Final[str] = "unknown handle:"
+
+
 @dataclass(frozen=True)
 class BridgeCandidate:
     path: Path
@@ -196,6 +203,8 @@ def _send_request(path: Path, req: dict[str, Any], timeout_s: float) -> dict[str
         raise BridgeProtocolError("bridge response is not a JSON object")
     protocol_error = data.get("protocolError")
     if protocol_error is not None:
+        if str(protocol_error).startswith(UNKNOWN_HANDLE_PREFIX):
+            raise UnknownHandleError(str(protocol_error))
         raise BridgeProtocolError(str(protocol_error))
     error_code = data.get("errorCode")
     if error_code is not None and error_code not in get_args(ErrorCode):
@@ -608,78 +617,34 @@ def _non_ascii_code_message(code: str, label: str | None) -> str:
     return f"{NOT_SENT_PREFIX}: {subject} holds a non-ASCII character U+{ord(char):04X}"
 
 
-def exec(  # matches the wire protocol's `kind: exec`; shadows the builtin on purpose
-    code: str,
-    thread: Thread,
-    timeout_s: float | None = None,
-    label: str | None = None,
-    *,
-    run_dir: Path | None = None,
-    handle: str | None = None,
-) -> BridgeResult:
-    """Sends `code` to the bridge and returns the classified result.
-
-    `handle`: a caller-chosen handle (32 lowercase hex characters) for a `main-async` call. A
-    bridge that announces `client_handle` files the call's result under it (also when the reply
-    is delivered in-band), so `poll(handle)` can still fetch it if the connection is lost. It is
-    sent only to such a bridge; `BridgeResult.bridge_features` says which one took the call.
-
-    Code that is not ASCII is refused with INVALID_ARGS before any connection is made: nothing
-    was sent, so unlike a lost answer there is nothing in doubt.
-    """
-    if thread == "server":
-        raise ValueError(
-            "thread='server' operations are handled entirely on the server "
-            "and must not be sent to the bridge"
-        )
-    effective_run_dir = run_dir if run_dir is not None else _default_run_dir()
-    effective_timeout = timeout_s if timeout_s is not None else timeout_for(thread)
-    started = time.monotonic()
-
-    if not code.isascii():
-        return _simple_result(
-            started,
-            "INVALID_ARGS",
-            _non_ascii_code_message(code, label),
-            hint=_NON_ASCII_CODE_HINT,
-        )
-
-    candidate = _discover(effective_run_dir)
-    if isinstance(candidate, _DiscoveryFailure):
-        return _simple_result(started, candidate.error_code, candidate.message)
-
-    app_log_window = LogWindow(app_log_path(candidate.flame_version))
-    shell_log_window = LogWindow(shell_log_path(candidate.flame_version))
-    app_mark = app_log_window.mark()
-    shell_mark = shell_log_window.mark()
-
-    sent_handle = (
-        handle if handle is not None and FEATURE_CLIENT_HANDLE in candidate.features else None
-    )
-    request_id = uuid.uuid4().hex
-    inflight_path = _write_inflight(
-        effective_run_dir,
-        request_id,
-        label,
-        thread,
-        effective_timeout,
-        candidate,
-        code,
-        sent_handle,
-    )
-
-    socket_timeout = effective_timeout + CLIENT_TIMEOUT_MARGIN_S
-    req = {
+def _exec_request(
+    request_id: str, code: str, thread: Thread, timeout_s: float, handle: str | None
+) -> dict[str, Any]:
+    req: dict[str, Any] = {
         "v": 1,
         "id": request_id,
         "kind": "exec",
         "code": code,
         "thread": thread,
-        "timeoutS": effective_timeout,
+        "timeoutS": timeout_s,
     }
-    if sent_handle is not None:
-        req["handle"] = sent_handle
+    if handle is not None:
+        req["handle"] = handle
+    return req
 
+
+def _exchange(
+    candidate: BridgeCandidate,
+    req: dict[str, Any],
+    socket_timeout: float,
+    started: float,
+    app_log_window: LogWindow,
+    app_mark: LogMark,
+    shell_mark: LogMark,
+    inflight_path: Path,
+) -> BridgeResult:
+    """Sends `req` and classifies the answer. The in-flight record is removed on every way out
+    except a lost or late answer, since the bridge may still run the call."""
     keep_inflight = False
     try:
         response = _send_request(candidate.path, req, socket_timeout)
@@ -725,6 +690,78 @@ def exec(  # matches the wire protocol's `kind: exec`; shadows the builtin on pu
     return replace(
         _result_from_response(response, started, app_log_window, app_mark, inflight_path=None),
         bridge_features=candidate.features,
+    )
+
+
+def exec(  # matches the wire protocol's `kind: exec`; shadows the builtin on purpose
+    code: str,
+    thread: Thread,
+    timeout_s: float | None = None,
+    label: str | None = None,
+    *,
+    run_dir: Path | None = None,
+    handle: str | None = None,
+) -> BridgeResult:
+    """Sends `code` to the bridge and returns the classified result.
+
+    `handle`: a caller-chosen handle (32 lowercase hex characters) for a `main-async` call. A
+    bridge that announces `client_handle` files the call's result under it (also when the reply
+    is delivered in-band), so `poll(handle)` can still fetch it if the connection is lost. It is
+    sent only to such a bridge; `BridgeResult.bridge_features` says which one took the call.
+
+    Code that is not ASCII is refused with INVALID_ARGS before any connection is made: nothing
+    was sent, so unlike a lost answer there is nothing in doubt.
+    """
+    if thread == "server":
+        raise ValueError(
+            "thread='server' operations are handled entirely on the server "
+            "and must not be sent to the bridge"
+        )
+    effective_run_dir = run_dir if run_dir is not None else _default_run_dir()
+    effective_timeout = timeout_s if timeout_s is not None else timeout_for(thread)
+    started = time.monotonic()
+
+    if not code.isascii():
+        return _simple_result(
+            started,
+            "INVALID_ARGS",
+            _non_ascii_code_message(code, label),
+            hint=_NON_ASCII_CODE_HINT,
+        )
+
+    candidate = _discover(effective_run_dir)
+    if isinstance(candidate, _DiscoveryFailure):
+        return _simple_result(started, candidate.error_code, candidate.message)
+
+    app_log_window = LogWindow(app_log_path(candidate.flame_version))
+    app_mark = app_log_window.mark()
+    shell_mark = LogWindow(shell_log_path(candidate.flame_version)).mark()
+
+    sent_handle = (
+        handle if handle is not None and FEATURE_CLIENT_HANDLE in candidate.features else None
+    )
+    request_id = uuid.uuid4().hex
+    inflight_path = _write_inflight(
+        effective_run_dir,
+        request_id,
+        label,
+        thread,
+        effective_timeout,
+        candidate,
+        code,
+        sent_handle,
+    )
+    req = _exec_request(request_id, code, thread, effective_timeout, sent_handle)
+
+    return _exchange(
+        candidate,
+        req,
+        effective_timeout + CLIENT_TIMEOUT_MARGIN_S,
+        started,
+        app_log_window,
+        app_mark,
+        shell_mark,
+        inflight_path,
     )
 
 

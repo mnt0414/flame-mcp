@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import execution
-from flame_mcp.checkpointed import note_unresolved, refuse_if_denied
+from flame_mcp.checkpointed import refuse_if_denied
 from flame_mcp.checkpoints import batch_target, take_checkpoint
 from flame_mcp.desktop_run import (
     COPY_OP,
@@ -24,7 +24,6 @@ from flame_mcp.desktop_run import (
     CURRENT_NOT_RESTORED_NOTE,
     LAST_REEL_NOTE,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_READ,
     PHASE_REVERT,
     PHASE_REVERT_PLAN,
@@ -45,12 +44,19 @@ from flame_mcp.journal import (
     new_id,
     now_iso,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import CheckRecord, IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import (
+    UNKNOWN_END_CODES,
+    close_outcome,
+    note_unresolved,
+    outcome_not_journaled_note,
+)
 from flame_mcp.library_open import merge_library_reports
 from flame_mcp.timeline_restore import uid_chain
-from flame_mcp.types import ErrorCode, ServerOpError, ServerResult
+from flame_mcp.types import PHASE_ARG, ErrorCode, ServerOpError, ServerResult
 
 if TYPE_CHECKING:
+    from flame_mcp.registry import RegisteredOperation
     from flame_mcp.runtime import ServerContext
 
 
@@ -146,8 +152,8 @@ def _revert_count(view: IntentView, result: Mapping[str, Any]) -> int:
     return int(result.get("deleted") is True)
 
 
-def _revert_no_extra(result: Mapping[str, Any]) -> dict[str, Any]:
-    return {}
+def _revert_no_extra(result: Mapping[str, Any], outcome: OutcomeRecord) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -244,16 +250,16 @@ class RevertProfile:
     args: Callable[[IntentView, dict[str, Any]], dict[str, Any]]
     notes: Callable[[IntentView, Mapping[str, Any]], list[str]]
     count: Callable[[IntentView, Mapping[str, Any]], int]
-    extra: Callable[[Mapping[str, Any]], dict[str, Any]] = _revert_no_extra
-    """Fields added to the revert's outcome record (beside `deleted` / `skipped`)."""
+    extra: Callable[[Mapping[str, Any], OutcomeRecord], None] = _revert_no_extra
+    """Adds the fields of its own to the revert's outcome record (beside `deleted` / `skipped`)."""
     partial: Callable[[Mapping[str, Any]], Mapping[str, int] | None] | None = None
     """The envelope's `partial` of a revert that failed after it had put some things back."""
     pre_revert: (
         Callable[[ServerContext, IntentView, dict[str, Any], str], PreRevert | None] | None
     ) = None
     """Server-side work before the Flame call (`pre_revert_copy`); it may end the revert."""
-    intent_extra: Callable[[IntentView], dict[str, Any]] | None = None
-    """Fields added to the revert's intent record (`forced`: what a `force` overrode)."""
+    intent_extra: Callable[[IntentView, IntentRecord], None] | None = None
+    """Adds fields to the revert's intent record (`forced`: what a `force` overrode)."""
 
 
 DEFAULT_REVERT: Final[RevertProfile] = RevertProfile(
@@ -265,15 +271,11 @@ DEFAULT_REVERT: Final[RevertProfile] = RevertProfile(
 )
 
 
-def revert_flow(
-    ctx: ServerContext,
-    index: Index,
-    group: str,
-    views: list[IntentView],
-    profile: RevertProfile,
-) -> ServerResult:
-    """`journal.revert` of a group whose intent is a desktop write. The caller holds
-    `ctx.write_lock` and has checked that the group is not reverted already."""
+def _revert_operation(
+    ctx: ServerContext, group: str, views: list[IntentView], profile: RevertProfile
+) -> tuple[IntentView, dict[str, Any], RegisteredOperation]:
+    """The one intent a revert can undo, what it created and the op that undoes it; refuses
+    (nothing was reverted) when there is none or the op is denied."""
     if len(views) != 1 or not views[0].is_revertible():
         raise ServerOpError(
             "PRECONDITION_UNMET",
@@ -295,28 +297,38 @@ def revert_flow(
             exc.message.replace("nothing was run", "nothing was reverted"),
             hint=exc.hint,
         ) from exc
+    return view, created, op
 
+
+def _append_revert_intent(
+    ctx: ServerContext,
+    group: str,
+    view: IntentView,
+    created: dict[str, Any],
+    profile: RevertProfile,
+) -> tuple[str, str]:
+    """Journals the revert's own intent (a group of its own): `(new group, intent id)`."""
     new_group = new_id("g")
     intent_id = new_id("i")
+    revert_intent: IntentRecord = {
+        "type": "intent",
+        "id": intent_id,
+        "group": new_group,
+        "ts": now_iso(),
+        "op": "journal.revert",
+        "kind": KIND_DESKTOP_REVERT,
+        "args": {"group": group},
+        "target": view.intent.get("target"),
+        "reverts": group,
+        "revertsIntent": view.id,
+        "revertOf": view.desktop_kind,
+        "createKind": view.intent.get("createKind"),
+        "created": created,
+    }
+    if profile.intent_extra is not None:
+        profile.intent_extra(view, revert_intent)
     try:
-        ctx.journal.append(
-            {
-                "type": "intent",
-                "id": intent_id,
-                "group": new_group,
-                "ts": now_iso(),
-                "op": "journal.revert",
-                "kind": KIND_DESKTOP_REVERT,
-                "args": {"group": group},
-                "target": view.intent.get("target"),
-                "reverts": group,
-                "revertsIntent": view.id,
-                "revertOf": view.desktop_kind,
-                "createKind": view.intent.get("createKind"),
-                "created": created,
-                **(profile.intent_extra(view) if profile.intent_extra is not None else {}),
-            }
-        )
+        ctx.journal.append(revert_intent)
     except OSError as exc:
         raise ServerOpError(
             "POLICY_DENIED",
@@ -324,34 +336,28 @@ def revert_flow(
             "not change the project without an intent on record",
             hint=f"Make {ctx.journal.directory} writable, then retry.",
         ) from exc
+    return new_group, intent_id
 
-    marked = with_chains(ctx, created)
-    pre = (
-        profile.pre_revert(ctx, view, marked, new_group) if profile.pre_revert is not None else None
-    )
-    if pre is not None and pre.failure is not None:
-        env = pre.failure
-    else:
-        env = execution.run_op(
-            op, profile.args(view, marked), run_dir=ctx.run_dir, timeout_s=WRITE_TIMEOUT_S
-        )
+
+def _close_revert(
+    ctx: ServerContext,
+    group: str,
+    view: IntentView,
+    profile: RevertProfile,
+    env: dict[str, Any],
+    pre: PreRevert | None,
+    new_group: str,
+    intent_id: str,
+) -> ServerResult:
+    """After the revert's write answered: journal the outcome and build the result (or raise the
+    failure)."""
     end_code = env.get("errorCode")
     journal_ref = {"group": new_group}
-    if end_code in UNKNOWN_END_CODES:
-        ctx.guard.block(intent_id, new_group, "journal.revert", str(end_code))
-        note_unresolved(ctx, intent_id, new_group, env)
-        raise ServerOpError(
-            as_error_code(str(end_code)),
-            f"the revert ended without an answer ({env.get('error')}): it is not known whether "
-            f"it landed; writes are refused until journal.check (group={new_group!r}) has read "
-            "Flame again",
-            journal=journal_ref,
-        )
     ok = env.get("ok") is True
     raw = env.get("result")
     result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
     touched = profile.count(view, result)
-    outcome: dict[str, Any] = {
+    outcome: OutcomeRecord = {
         "type": "outcome",
         "id": intent_id,
         "group": new_group,
@@ -363,16 +369,11 @@ def revert_flow(
         "readBack": None,
         "deleted": result.get("deleted"),
         "skipped": result.get("skipped"),
-        **profile.extra(result),
     }
-    try:
-        ctx.journal.append(outcome)
-    except OSError as exc:
-        ctx.guard.block(intent_id, new_group, "journal.revert", "JOURNAL_OUTCOME_NOT_WRITTEN")
-        result["degraded"] = [
-            f"the outcome could not be journaled ({exc}); this server now refuses writes until "
-            "journal.check has settled the intent"
-        ]
+    profile.extra(result, outcome)
+    err = close_outcome(ctx, outcome, intent_id, new_group, "journal.revert")
+    if err is not None:
+        result["degraded"] = [outcome_not_journaled_note(err, None)]
     if not ok:
         hint = result.pop("hint", None) or env.get("hint")
         raise ServerOpError(
@@ -391,6 +392,41 @@ def revert_flow(
     if notes:
         result["notes"] = [*(result.get("notes") or []), *notes]
     return ServerResult(result=result, affected=touched, journal=journal_ref)
+
+
+def revert_flow(
+    ctx: ServerContext,
+    index: Index,
+    group: str,
+    views: list[IntentView],
+    profile: RevertProfile,
+) -> ServerResult:
+    """`journal.revert` of a group whose intent is a desktop write. The caller holds
+    `ctx.write_lock` and has checked that the group is not reverted already."""
+    view, created, op = _revert_operation(ctx, group, views, profile)
+    new_group, intent_id = _append_revert_intent(ctx, group, view, created, profile)
+
+    marked = with_chains(ctx, created)
+    pre = (
+        profile.pre_revert(ctx, view, marked, new_group) if profile.pre_revert is not None else None
+    )
+    if pre is not None and pre.failure is not None:
+        env = pre.failure
+    else:
+        env = execution.run_op(
+            op, profile.args(view, marked), run_dir=ctx.run_dir, timeout_s=WRITE_TIMEOUT_S
+        )
+    end_code = env.get("errorCode")
+    if end_code in UNKNOWN_END_CODES:
+        note_unresolved(ctx, intent_id, new_group, env, "journal.revert", str(end_code))
+        raise ServerOpError(
+            as_error_code(str(end_code)),
+            f"the revert ended without an answer ({env.get('error')}): it is not known whether "
+            f"it landed; writes are refused until journal.check (group={new_group!r}) has read "
+            "Flame again",
+            journal={"group": new_group},
+        )
+    return _close_revert(ctx, group, view, profile, env, pre, new_group, intent_id)
 
 
 def failure_code(failures: list[dict[str, Any]]) -> ErrorCode:
@@ -627,7 +663,7 @@ def check_flow(
         return entry
     per_key = {"desktop": finding}
     current = {k: v for k, v in extra.items() if k != "created"}
-    record: dict[str, Any] = {
+    record: CheckRecord = {
         "type": "check",
         "id": view.id,
         "group": view.group,

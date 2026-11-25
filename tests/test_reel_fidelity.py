@@ -23,6 +23,7 @@ from flame_mcp.checkpoints import FINGERPRINT_SECTIONS
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 
 CLIP1_ID = "/projects/p/ws/P1O/R1/clip1"
 CLIP2_ID = "/projects/p/ws/P1O/R1/clip2"
@@ -30,9 +31,7 @@ DEFAULTS = [f"Schematic Reel {n}" for n in range(1, 5)]
 ENABLED = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path, policy=ENABLED)
+rig = rig_fixture(make_rig, policy=ENABLED)
 
 
 def bg(rig: Rig) -> PyBatch:

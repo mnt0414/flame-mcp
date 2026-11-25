@@ -15,6 +15,7 @@ from fake_media_tree import PyTimelineFX
 from flame_mcp import timeline_checkpoints
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     CHECKPOINT,
     CLIPX,
@@ -36,10 +37,7 @@ from timeline_p32a_helpers import (
     uid,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_timeline_rig)
 
 
 def fingerprint(rig: Rig, target: dict[str, Any] = S1) -> dict[str, Any]:
@@ -363,7 +361,6 @@ def _checkpointed_spec(**over: Any) -> Any:
         "params": (OperationParam(name="target", type="selector", description="x", required=True),),
         "accepts": ("segment",),
         "to_python": lambda args: "_result = 1",
-        "undo_steps": lambda args, affected: 0,
         "checkpoint": CheckpointSpec(
             target_kind="timeline",
             group_selector=lambda args: args["target"]["parent"],

@@ -21,10 +21,10 @@ from flame_mcp.desktop_reformat_state import (
 )
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_REVERT_PHASES,
     EXPECTED_ARG,
     MAX_SOURCES,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_READ,
     PHASE_REVERT,
@@ -42,9 +42,19 @@ from flame_mcp.timeline_checkpoints import (
     checkpoint_library_name,
     stash_reel_name,
 )
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
+_ONE_TARGET: Mapping[str, Any] = {"target": {"kind": "wiretap", "id": "sample"}}
 MIN_SIZE: Final[int] = 24
 MAX_SIZE: Final[int] = 16384
 MIN_RATIO: Final[float] = 0.01
@@ -97,15 +107,11 @@ _DESCRIPTION = (
     "change); force=true overrides, journaled. A clip that cannot be put back leaves the others "
     "restored (result.partial); a second revert puts back only the rest. A clip that did not "
     "change has nothing to revert. Stashed copies stay in the checkpoint library until "
-    "journal.purge_checkpoints removes them. Native Ctrl+Z is not used (undoSteps 0). "
+    "journal.purge_checkpoints removes them. Native Ctrl+Z is not used. "
     "Not allowed in plan.run: its journal group holds one intent per clip and is reverted by "
     "restoring stashed copies (or deleting duplicates), which a plan's group (reverted by "
     "putting attribute values back) does not do."
 )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _reformat_to_python(args: Mapping[str, Any]) -> str:
@@ -200,10 +206,22 @@ def _reformat_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+_PLAN_USE_DESKTOP_REFORMAT = PlanUse(
+    PlanKind.REWRITE,
+    refusal=(
+        "desktop.reformat cannot be a plan step: it journals one `desktop_reformat` intent per "
+        "clip that is reverted by restoring the clip's stashed copy (a new uid) or by deleting "
+        "the duplicate it made, and a plan's single group is reverted by putting attribute "
+        "values back -- it would skip such an intent without saying so. Call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=OP_NAME,
+            plan_use=_PLAN_USE_DESKTOP_REFORMAT,
             category="desktop",
             description=_DESCRIPTION,
             effect="destructive",
@@ -327,7 +345,14 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_reformat_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(
+                *CREATED_REVERT_PHASES,
+                PhaseSpec(PHASE_OBSERVE, {CREATED_ARG: {"items": []}}),
+                PhaseSpec(PHASE_PROBE, _ONE_TARGET),
+                PhaseSpec(PHASE_DUP, _ONE_TARGET),
+                PhaseSpec(PHASE_WRITE, {**_ONE_TARGET, SPEC_ARG: {}}),
+                PhaseSpec(PHASE_STASH),
+            ),
             precheck=_reformat_precheck,
             wrap=run_reformat,
             sample_args={

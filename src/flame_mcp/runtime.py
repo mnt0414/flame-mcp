@@ -44,8 +44,10 @@ from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution, list_fields, opschema
 from flame_mcp.callargs import apply_limit_default, apply_param_defaults
 from flame_mcp.checkpointed import run_declared
-from flame_mcp.journal import Index, Journal, new_id
+from flame_mcp.compact import DEFAULT_RESPONSE_MODE, ResponseMode
+from flame_mcp.journal import NO_LINK, Index, Journal, JournalLink, new_id
 from flame_mcp.journaled_write import run_journaled_write
+from flame_mcp.loop_limits import DEFAULT_LOOP_LIMITS, LoopLimits
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import Denial, Policy, deny_operation
 from flame_mcp.registry import RegisteredOperation, Registry
@@ -217,15 +219,15 @@ class ServerContext(Protocol):
     guard: WriteGuard
     write_lock: threading.RLock
     run_dir: Path | None
+    response_mode: ResponseMode
+    loop_limits: LoopLimits
 
     def do(
         self,
         op_name: str,
         args: Mapping[str, Any],
         *,
-        group: str | None = None,
-        reverts: str | None = None,
-        reverts_intent: str | None = None,
+        link: JournalLink = NO_LINK,
         precondition: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
@@ -240,6 +242,8 @@ class Runtime:
     permissions: dict[str, Any] | None = None
     guard: WriteGuard = field(default_factory=WriteGuard)
     write_lock: threading.RLock = field(default_factory=threading.RLock)
+    response_mode: ResponseMode = DEFAULT_RESPONSE_MODE
+    loop_limits: LoopLimits = DEFAULT_LOOP_LIMITS
 
     def __post_init__(self) -> None:
         set_journal_directory(self.journal.directory)
@@ -249,9 +253,7 @@ class Runtime:
         op_name: str,
         raw_args: Any,
         *,
-        group: str | None = None,
-        reverts: str | None = None,
-        reverts_intent: str | None = None,
+        link: JournalLink = NO_LINK,
         precondition: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolves, gates, validates and runs one op, and returns its envelope."""
@@ -281,7 +283,7 @@ class Runtime:
             )
 
         op_args: dict[str, Any] = dict(validation.value or {})
-        unknown_fields = list_fields.unknown_fields_message(op.name, op_args)
+        unknown_fields = list_fields.unknown_fields_message(op.list_fields, op_args)
         if unknown_fields is not None:
             return envelope_mod.from_pre_bridge_error(
                 error=unknown_fields,
@@ -308,12 +310,10 @@ class Runtime:
         env = self.execute(
             op,
             op_args,
-            group=group,
-            reverts=reverts,
-            reverts_intent=reverts_intent,
+            link=link,
             precondition=precondition,
         )
-        list_fields.select_fields(op.name, op_args, env)
+        list_fields.select_fields(op.list_fields, op_args, env)
         if limit_notes:
             env["degraded"] = [*env.get("degraded", []), *limit_notes]
         return env
@@ -325,16 +325,12 @@ class Runtime:
         op: RegisteredOperation,
         op_args: dict[str, Any],
         *,
-        group: str | None = None,
-        reverts: str | None = None,
-        reverts_intent: str | None = None,
+        link: JournalLink = NO_LINK,
         precondition: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         if op.effect == "read":
-            return self._dispatch(
-                op, op_args, started, group, reverts, reverts_intent, precondition
-            )
+            return self._dispatch(op, op_args, started, link, precondition)
         # The guard is read only once `write_lock` is held: a write that waited for the lock
         # while another one ended without an answer must see that block. The lock is re-entrant,
         # so the steps and inner calls of this op take it again without waiting.
@@ -348,34 +344,31 @@ class Runtime:
                     duration_ms=elapsed_ms(started),
                     hint=denial.hint,
                 )
-            return self._dispatch(
-                op, op_args, started, group, reverts, reverts_intent, precondition
-            )
+            return self._dispatch(op, op_args, started, link, precondition)
 
     def _dispatch(
         self,
         op: RegisteredOperation,
         op_args: dict[str, Any],
         started: float,
-        group: str | None,
-        reverts: str | None,
-        reverts_intent: str | None,
+        link: JournalLink,
         precondition: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
+        """The only caller of the write runners (`wrap`, `run_declared`, `run_journaled_write`).
+        They do not look at the guard again: `execute` has done it under `write_lock`, so a new
+        caller of a runner must do the same."""
         if op.thread == "server":
             return self._run_server_op(op, op_args, started)
         if op.wrap is not None:
-            return op.wrap(self, op, op_args, group=group)
+            return op.wrap(self, op, op_args, group=link.group)
         if op.checkpoint is not None:
-            return run_declared(self, op, op_args, group=group)
+            return run_declared(self, op, op_args, group=link.group)
         if op.journal is not None:
             return run_journaled_write(
                 self,
                 op,
                 op_args,
-                group=group,
-                reverts=reverts,
-                reverts_intent=reverts_intent,
+                link=link,
                 precondition=precondition,
             )
         return execution.run_op(op, op_args, run_dir=self.run_dir)
@@ -396,7 +389,6 @@ class Runtime:
                 error=exc.message,
                 error_code=exc.code,
                 affected=exc.affected,
-                undo_steps=exc.undo_steps if exc.undo_steps is not None else 0,
                 partial=exc.partial,
                 journal=exc.journal,
                 execution=meta,
@@ -417,11 +409,6 @@ class Runtime:
             ok=True,
             result=outcome.result,
             affected=outcome.affected,
-            undo_steps=(
-                outcome.undo_steps
-                if outcome.undo_steps is not None
-                else op.undo_steps(op_args, outcome.affected)
-            ),
             partial=outcome.partial,
             journal=outcome.journal,
             execution=meta,

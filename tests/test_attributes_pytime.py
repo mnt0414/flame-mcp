@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import FakeAttr, PyTime, build_default_tree
 from flame_mcp.registry import Registry
 from journal_test_helpers import Rig, make_rig
@@ -21,7 +22,6 @@ from test_ops_attributes import (
     add_attr,
     add_resolution_nodes,
     call,
-    make_registry,
     res_node,
     set_call,
 )

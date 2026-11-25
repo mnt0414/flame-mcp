@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import threading
 import time
-import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -28,6 +26,7 @@ import pytest
 
 from flame_mcp import applog, transport
 from flame_mcp_bridge import impl
+from rig_fixtures import scratch_dir_fixture
 from test_bridge_impl import FakeFlame, FakeMainLoop, FakeTimer
 
 SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "scratch" / "p13"
@@ -36,13 +35,7 @@ SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "
 PRODUCTION_CLIENT_TIMEOUT_MARGIN_S = transport.CLIENT_TIMEOUT_MARGIN_S
 
 
-@pytest.fixture
-def scratch_dir() -> Iterator[Path]:
-    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
-    d = SCRATCH_ROOT / uuid.uuid4().hex[:8]
-    d.mkdir(parents=True, exist_ok=True)
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+scratch_dir = scratch_dir_fixture(SCRATCH_ROOT)
 
 
 @pytest.fixture

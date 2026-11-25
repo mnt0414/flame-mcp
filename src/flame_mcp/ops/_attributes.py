@@ -169,6 +169,7 @@ def register_attribute_ops(
     registry.register(
         OperationSpec(
             name=set_name,
+            brief_paths=("applied",),
             category=category,
             description=(
                 f"Write attributes of a {noun}: `values` maps attribute name -> new value. "
@@ -229,7 +230,6 @@ def register_attribute_ops(
             ),
             accepts=accepts,
             to_python=_set_to_python(set_name, stable_src, group_var),
-            undo_steps=lambda args, affected: 0,
             requires=requires,
             journal=JournalSpec(
                 read_op=get_name,

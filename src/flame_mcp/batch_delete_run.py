@@ -24,8 +24,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
-from flame_mcp.checkpointed import note_unresolved
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ, PHASE_WRITE, pre_read_failure
+from flame_mcp.desktop_run import PHASE_ALIVE, PHASE_READ, PHASE_WRITE, pre_read_failure
 from flame_mcp.journal import (
     STATE_LANDED,
     STATE_NOT_LANDED,
@@ -33,11 +32,12 @@ from flame_mcp.journal import (
     new_id,
     now_iso,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import UNKNOWN_END_CODES, close_outcome, note_unresolved
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_check import _append_check, _unknown_entry
 from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import ErrorCode
+from flame_mcp.types import PHASE_ARG, ErrorCode
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime, ServerContext
@@ -45,7 +45,6 @@ if TYPE_CHECKING:
 DELETE_OP: Final[str] = "batch.delete"
 BATCH_DELETE_KIND: Final[str] = "batch_delete"
 PHASE_SAVE: Final[str] = "save"
-PHASE_ALIVE: Final[str] = "alive"
 UNDO_NOTE: Final[str] = (
     "The group cannot be put back by journal.revert: create a Batch group and batch.load_setup "
     "the file in result.setupPath."
@@ -86,7 +85,7 @@ def _facts_of(env: dict[str, Any]) -> dict[str, Any] | None:
 
 def _intent(
     op: RegisteredOperation, args: dict[str, Any], facts: dict[str, Any], group: str, intent_id: str
-) -> dict[str, Any]:
+) -> IntentRecord:
     return {
         "type": "intent",
         "id": intent_id,
@@ -118,47 +117,33 @@ def run_batch_delete(
 ) -> dict[str, Any]:
     """The `wrap` of `batch.delete`."""
     started = time.monotonic()
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        env = _step(op, rt, op_args, PHASE_READ)
-        facts = _facts_of(env)
-        if facts is None:
-            return pre_read_failure(op, env, "deleted")
-        if facts.get("errorCode"):
-            return _envelope(
-                op, started, result=facts, code=facts["errorCode"], error=facts["error"]
-            )
-        env = _step(op, rt, op_args, PHASE_SAVE)
-        saved = _facts_of(env)
-        if saved is None:
-            return pre_read_failure(op, env, "deleted")
-        if saved.get("errorCode"):
-            return _envelope(
-                op, started, result=saved, code=saved["errorCode"], error=saved["error"]
-            )
-        group_id = group if group is not None else new_id("g")
-        intent_id = new_id("i")
-        try:
-            rt.journal.append(_intent(op, op_args, saved, group_id, intent_id))
-        except OSError as exc:
-            return _envelope(
-                op,
-                started,
-                result=saved,
-                code="POLICY_DENIED",
-                error=f"nothing was deleted: the journal cannot be written ({exc})",
-                hint=f"The setup stays saved at {saved.get('setupPath')}.",
-            )
-        env = _step(op, rt, op_args, PHASE_WRITE, setup_path=saved["setupPath"])
-        return _finish(rt, op, env, saved, group_id, intent_id, started)
+    env = _step(op, rt, op_args, PHASE_READ)
+    facts = _facts_of(env)
+    if facts is None:
+        return pre_read_failure(op, env, "deleted")
+    if facts.get("errorCode"):
+        return _envelope(op, started, result=facts, code=facts["errorCode"], error=facts["error"])
+    env = _step(op, rt, op_args, PHASE_SAVE)
+    saved = _facts_of(env)
+    if saved is None:
+        return pre_read_failure(op, env, "deleted")
+    if saved.get("errorCode"):
+        return _envelope(op, started, result=saved, code=saved["errorCode"], error=saved["error"])
+    group_id = group if group is not None else new_id("g")
+    intent_id = new_id("i")
+    try:
+        rt.journal.append(_intent(op, op_args, saved, group_id, intent_id))
+    except OSError as exc:
+        return _envelope(
+            op,
+            started,
+            result=saved,
+            code="POLICY_DENIED",
+            error=f"nothing was deleted: the journal cannot be written ({exc})",
+            hint=f"The setup stays saved at {saved.get('setupPath')}.",
+        )
+    env = _step(op, rt, op_args, PHASE_WRITE, setup_path=saved["setupPath"])
+    return _finish(rt, op, env, saved, group_id, intent_id, started)
 
 
 def _finish(
@@ -173,8 +158,7 @@ def _finish(
     journal = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
     code = env.get("errorCode")
     if code in UNKNOWN_END_CODES or env.get("pending") is not None:
-        rt.guard.block(intent_id, group_id, op.name, str(code or "TIMEOUT"))
-        note_unresolved(rt, intent_id, group_id, env)
+        note_unresolved(rt, intent_id, group_id, env, op.name, str(code or "TIMEOUT"))
         env["journal"] = journal
         env["result"] = saved
         env["hint"] = (
@@ -192,25 +176,21 @@ def _finish(
     elif flame.get("errorCode"):
         failure = (flame["errorCode"], flame["error"])
     deleted = bool(flame and flame.get("deleted"))
-    try:
-        rt.journal.append(
-            {
-                "type": "outcome",
-                "id": intent_id,
-                "group": group_id,
-                "ts": now_iso(),
-                "ok": failure is None,
-                "applied": [],
-                "failed": {} if failure is None else {DELETE_OP: failure[1]},
-                "errorCode": failure[0] if failure else None,
-                "readBack": None,
-                "verdict": STATE_LANDED if deleted else STATE_NOT_LANDED,
-                "setupPath": saved.get("setupPath"),
-                "warnings": (flame or {}).get("warnings"),
-            }
-        )
-    except OSError:
-        rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
+    outcome: OutcomeRecord = {
+        "type": "outcome",
+        "id": intent_id,
+        "group": group_id,
+        "ts": now_iso(),
+        "ok": failure is None,
+        "applied": [],
+        "failed": {} if failure is None else {DELETE_OP: failure[1]},
+        "errorCode": failure[0] if failure else None,
+        "readBack": None,
+        "verdict": STATE_LANDED if deleted else STATE_NOT_LANDED,
+        "setupPath": saved.get("setupPath"),
+        "warnings": (flame or {}).get("warnings"),
+    }
+    close_outcome(rt, outcome, intent_id, group_id, op.name)
     out = _envelope(
         op,
         started,

@@ -521,7 +521,6 @@ def test_the_call_is_checkpointed_and_journaled(rig: Rig) -> None:
     assert env["ok"] is True, env
     journal = env["journal"]
     assert journal["revert"]["op"] == "journal.revert" and journal["changed"] is True
-    assert env["undoSteps"] == 0
     types = [r["type"] for r in rig.records()]
     assert "checkpoint" in types and "intent" in types and "outcome" in types
 

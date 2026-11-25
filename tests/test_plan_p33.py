@@ -32,6 +32,7 @@ from p33_helpers import (
     seg_row,
     track0,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     TRIM,
     checkpoints,
@@ -42,10 +43,7 @@ from timeline_p32a_helpers import (
     wt,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def at(record_in: int, track: int = 0, parent: dict[str, Any] = S1) -> dict[str, Any]:
@@ -71,7 +69,7 @@ def test_slip_replace_trim_and_effects_in_one_plan_are_one_checkpointed_write(ri
     assert [s["ok"] for s in env["result"]["steps"]] == [True] * 5
     assert len(checkpoints(rig)) == 1 and len(stash_entries(rig)) == 1
     labels = [c.label for c in rig.exec.calls]
-    assert labels.count("timeline.checkpoint") == 1 and env["undoSteps"] == 0
+    assert labels.count("timeline.checkpoint") == 1
     assert env["partial"] == {"done": 5, "failed": 0, "notRun": 0}
     assert seg_row(seg_a(rig))[0:3] == ["clip1", 10, 30]  # trimmed (tail 3) after the slip
     assert seg_row(seg_a(rig))[3] == 3  # slip(2): source_in 5 -> 3

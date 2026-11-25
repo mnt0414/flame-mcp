@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 
 from flame_mcp.effective_effect import deny_destructive_call
-from flame_mcp.ops import register_all
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from journal_test_helpers import BG1, Rig, make_rig
@@ -35,13 +34,6 @@ WITH_DESTRUCTIVE = Policy.from_env(
     {"FLAME_MCP_ALLOW_EFFECTS": "read,reversible,create,destructive"}
 )
 UNRESTRICTED = Policy.from_env({})
-
-
-@pytest.fixture(scope="module")
-def registry() -> Registry:
-    reg = Registry()
-    register_all(reg)
-    return reg
 
 
 def denied(registry: Registry, op: str, args: dict[str, Any], policy: Policy) -> bool:

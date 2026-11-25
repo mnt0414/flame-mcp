@@ -86,7 +86,7 @@ def test_three_trims_take_one_checkpoint_and_run_without_checkpoints_of_their_ow
     assert env["result"]["steps"][0]["result"]["position"]["recordIn"] == 12
     assert len(checkpoints(rig)) == 1 and len(stash_entries(rig)) == 1
     assert [c.label for c in rig.exec.calls].count("timeline.checkpoint") == 1
-    assert env["undoSteps"] == 0 and env["partial"] == {"done": 3, "failed": 0, "notRun": 0}
+    assert env["partial"] == {"done": 3, "failed": 0, "notRun": 0}
     timeline = env["result"]["timeline"]
     assert timeline["fingerprintBefore"] == before
     assert timeline["fingerprintAfter"] == fingerprint_of_target(rig, S1) != before

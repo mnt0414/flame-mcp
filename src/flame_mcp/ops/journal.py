@@ -9,102 +9,54 @@ write.
   check   decides, for every intent that has no outcome, whether its write landed by reading
           Flame again -- and writes nothing to the project (recovery after a crash is never
           automatic). Its finding is appended to the journal as a `check`.
-  revert  puts the previous values back for the keys a group applied or changed, but only
-          while each still holds what the group left; otherwise it refuses and reports the
-          current values.
-          When a group wrote one key of one target several times, only the newest write is
-          compared to Flame's current value; each earlier one is compared to the value the next
-          write found before it (`reason` on that entry), and the writes are put back newest
-          first.
-          A group of a checkpoint intent (an `eval.run` destructive run, a checkpoint restore, a
-          `batch.load_setup`, an op that declares a `CheckpointSpec`: checkpointed.py)
-          is put back by restoring its checkpoint, but only while the Batch group's fingerprint
-          is still the one the run left (`force` overrides, and is journaled). The same for a
-          group whose intent is of a sequence / clip (`targetKind: "timeline"`), with the
-          Timeline fingerprint and `timeline_restore`.
+  revert  puts back what a group wrote, by the kind of the group (`journal_revert`).
 """
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
 from typing import Any, Final
 
-from flame_mcp import transport
-from flame_mcp.batch_delete_run import BATCH_DELETE_KIND, check_batch_delete_intent
+from flame_mcp import journal_revert, transport
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
 from flame_mcp.checkpoints import (
-    ATTRIBUTES_SECTION,
     TIMELINE_KIND,
     fingerprint_of,
     kind_named,
     read_fingerprint,
 )
 from flame_mcp.clip_order import CLIP_ORDER_NOTE
-from flame_mcp.desktop_arrange_revert import revert_arrange_group
-from flame_mcp.desktop_arrange_run import ARRANGE_GROUP_KIND
-from flame_mcp.desktop_delete_run import (
-    check_delete_intent,
-    is_delete_intent,
-    revert_delete_group,
-)
-from flame_mcp.desktop_media_run import check_media_intent, is_media_intent, revert_media_group
-from flame_mcp.desktop_reformat_check import check_reformat_intent, is_reformat_intent
-from flame_mcp.desktop_reformat_revert import revert_reformat_group
-from flame_mcp.desktop_reorder_revert import revert_reorder_group
-from flame_mcp.desktop_reorder_run import REORDER_GROUP_KIND
-from flame_mcp.desktop_revert import check_desktop_intent, revert_desktop_group
+from flame_mcp.desktop_revert import check_desktop_intent
 from flame_mcp.errors import as_error_code
-from flame_mcp.export_check import check_export_intent
-from flame_mcp.export_run import EXPORT_KIND
 from flame_mcp.journal import (
+    LOOP_GROUP_KIND,
     STATE_DIVERGED,
     STATE_LANDED,
     STATE_NOT_LANDED,
-    STATE_REVERTED,
-    STATE_UNKNOWN,
     VERDICT_UNKNOWN,
     Index,
     IntentView,
     attribute_values_equal,
-    new_id,
     now_iso,
 )
-from flame_mcp.newer_groups import NEWER_GROUPS_KEY, newer_groups, newer_groups_sentence
+from flame_mcp.journal_records import CheckRecord
+from flame_mcp.journal_revert import NOT_FOUND_CODE, read_current
 from flame_mcp.ops._common import limit_param, offset_param
 from flame_mcp.registry import Registry
-from flame_mcp.render_check import check_render_intent, poll_handle
-from flame_mcp.render_clip_check import check_render_clip_intent
-from flame_mcp.render_clip_run import RENDER_CLIP_KIND
-from flame_mcp.render_run import RENDER_KIND
-from flame_mcp.restore import restore_checkpoint
+from flame_mcp.render_check import poll_handle
 from flame_mcp.runtime import ServerContext
-from flame_mcp.segment_extract_run import (
-    check_extract_intent,
-    is_extract_intent,
-    revert_extract_group,
-)
-from flame_mcp.segment_remove_run import REMOVE_KIND, check_remove_intent
-from flame_mcp.still_check import check_still_intent
-from flame_mcp.still_run import STILL_KIND
-from flame_mcp.timeline_create_run import (
-    check_sequence_intent,
-    is_sequence_intent,
-    revert_sequence_group,
-)
 from flame_mcp.timeline_purge import settle_unrecorded
 from flame_mcp.timeline_restore import (
     RESTORE_NOTE,
     check_timeline_intent,
-    revert_timeline_group,
 )
 from flame_mcp.types import (
     Category,
-    ErrorCode,
     OperationParam,
     OperationSpec,
+    PlanKind,
+    PlanUse,
     ServerOpError,
     ServerResult,
 )
@@ -122,9 +74,6 @@ CATEGORY = Category(
     allowed_pacing=frozenset({"none"}),
 )
 
-# The one read failure that says something about the target (it is not there); every other
-# failure means Flame was not read, so an intent stays undecided rather than being guessed at.
-_NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
 _HANDLE_FORM: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
 _INFLIGHT_DAYS: Final[int] = int(transport.INFLIGHT_MAX_AGE_S // 86400)
 # Keys of a write that landed vs did not, from the key's current value against the intent.
@@ -132,49 +81,6 @@ _KEY_BEFORE: Final[str] = "before"
 _KEY_AFTER: Final[str] = "after"
 _KEY_BOTH: Final[str] = "both"
 _KEY_OTHER: Final[str] = "other"
-
-
-@dataclass(frozen=True)
-class CurrentRead:
-    """The current values of an intent's keys, read from Flame through the intent's read op."""
-
-    status: str  # "ok" | "not_found" | "unreachable"
-    values: dict[str, Any]
-    target: dict[str, Any] | None
-    code: str | None
-    message: str | None
-
-
-def read_current(ctx: ServerContext, intent: Mapping[str, Any], keys: list[str]) -> CurrentRead:
-    """Read `keys` of the intent's target through its read op. The target is tried at the
-    address recorded before the write and, when the write renames the object itself (a node
-    name), at the address it would have afterwards."""
-    op = ctx.registry.get(str(intent.get("op")))
-    read_op = intent.get("readOp") or (op.journal.read_op if op and op.journal else None)
-    if not isinstance(read_op, str):
-        return CurrentRead("unreachable", {}, None, "INVALID_ARGS", "the intent names no read op")
-    candidates = [
-        t for t in (intent.get("target"), intent.get("targetAfter")) if isinstance(t, dict)
-    ]
-    for target in candidates:
-        env = ctx.do(read_op, {"target": target, "keys": keys})
-        if env.get("ok") is not True:
-            code = str(env.get("errorCode"))
-            if code == _NOT_FOUND_CODE:
-                continue
-            return CurrentRead("unreachable", {}, None, code, str(env.get("error")))
-        attributes = (env.get("result") or {}).get("attributes")
-        values: dict[str, Any] = {}
-        for key in keys:
-            entry = attributes.get(key) if isinstance(attributes, dict) else None
-            if not isinstance(entry, dict) or "error" in entry or "value" not in entry:
-                detail = entry.get("error") if isinstance(entry, dict) else "missing"
-                return CurrentRead(
-                    "unreachable", {}, None, "FLAME_API_ERROR", f"{key!r} unreadable: {detail}"
-                )
-            values[key] = entry["value"]
-        return CurrentRead("ok", values, target, None, None)
-    return CurrentRead("not_found", {}, None, _NOT_FOUND_CODE, "the target was not found")
 
 
 def classify(intent: Mapping[str, Any], current: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
@@ -228,6 +134,8 @@ def _show(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     group = str(args["group"])
     read = ctx.journal.read_all()
     index = Index(read.records)
+    if index.is_loop_parent(group):
+        return _show_loop(index, group, read.skipped_lines)
     if group not in index.groups:
         raise ServerOpError("INVALID_ARGS", f"no journal group {group!r}")
     ids = {view.id for view in index.groups[group]}
@@ -243,6 +151,33 @@ def _show(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
             "records": records,
             "revertGroups": index.revert_groups_of(group),
             "skippedLines": read.skipped_lines,
+        }
+    )
+
+
+def _show_loop(index: Index, parent: str, skipped_lines: int) -> ServerResult:
+    """A plan.for_each parent: its record and the child groups in the order they ran."""
+    children = [
+        {
+            "group": row.get("group"),
+            "key": row.get("key"),
+            "op": row.get("op"),
+            "step": row.get("step"),
+            "revertible": row.get("revertible"),
+            "state": index.group_state(str(row.get("group")))
+            if str(row.get("group")) in index.groups
+            else None,
+        }
+        for row in index.loop_child_records(parent)
+    ]
+    return ServerResult(
+        result={
+            "group": parent,
+            "kind": LOOP_GROUP_KIND,
+            "label": index.group_meta[parent].get("label"),
+            "ts": index.group_meta[parent].get("ts"),
+            "children": children,
+            "skippedLines": skipped_lines,
         }
     )
 
@@ -359,7 +294,7 @@ def _check_fingerprint_one(ctx: ServerContext, view: IntentView) -> dict[str, An
     entry: dict[str, Any] = {"group": view.group, "id": view.id, "op": intent.get("op")}
     env = read_fingerprint(ctx, intent.get("target") or {})
     current = fingerprint_of(env)
-    if current is None and env.get("errorCode") != _NOT_FOUND_CODE:
+    if current is None and env.get("errorCode") != NOT_FOUND_CODE:
         entry.update(
             verdict=VERDICT_UNKNOWN,
             detail=f"Flame could not be read ({env.get('errorCode')}: {env.get('error')})",
@@ -382,52 +317,45 @@ def _check_fingerprint_one(ctx: ServerContext, view: IntentView) -> dict[str, An
         verdict, finding = STATE_DIVERGED, _KEY_OTHER
     per_key = {"fingerprint": finding}
     entry.update(verdict=verdict, perKey=per_key, current={"fingerprint": current})
-    ctx.journal.append(
-        {
-            "type": "check",
-            "id": view.id,
-            "group": view.group,
-            "ts": now_iso(),
-            "verdict": verdict,
-            "perKey": per_key,
-            "current": {"fingerprint": current},
-            "target": intent.get("target"),
-        }
-    )
+    check: CheckRecord = {
+        "type": "check",
+        "id": view.id,
+        "group": view.group,
+        "ts": now_iso(),
+        "verdict": verdict,
+        "perKey": per_key,
+        "current": {"fingerprint": current},
+        "target": intent.get("target"),
+    }
+    ctx.journal.append(check)
     ctx.guard.release(view.id)
     return entry
 
 
-def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
+def _is_timeline_fingerprint(view: IntentView) -> bool:
     intent = view.intent
-    if intent.get("kind") == RENDER_KIND:
-        return check_render_intent(ctx, view)
-    if intent.get("kind") == RENDER_CLIP_KIND:
-        return check_render_clip_intent(ctx, view)
-    if intent.get("kind") == EXPORT_KIND:
-        return check_export_intent(ctx, view)
-    if intent.get("kind") == STILL_KIND:
-        return check_still_intent(ctx, view)
-    if intent.get("kind") == BATCH_DELETE_KIND:
-        return check_batch_delete_intent(ctx, view)
-    if intent.get("kind") == REMOVE_KIND:
-        return check_remove_intent(ctx, view)
+    return intent.get("fingerprintBefore") is not None and (
+        kind_named(intent.get("targetKind")) is TIMELINE_KIND
+    )
+
+
+def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
+    """By kind (`journal_revert.KINDS`); an intent of no listed kind is a Desktop write, then a
+    fingerprint write (a timeline's first), else a value write."""
+    spec = journal_revert.KINDS.get(view.effective_kind) if view.effective_kind else None
+    if spec is not None:
+        return spec.check(ctx, view)
     if view.desktop_kind is not None:
-        if is_delete_intent(view):
-            return check_delete_intent(ctx, view)
-        if is_media_intent(view):
-            return check_media_intent(ctx, view)
-        if is_reformat_intent(view):
-            return check_reformat_intent(ctx, view)
-        if is_extract_intent(view):
-            return check_extract_intent(ctx, view)
-        if is_sequence_intent(view):
-            return check_sequence_intent(ctx, view)
         return check_desktop_intent(ctx, view)
-    if intent.get("fingerprintBefore") is not None:
-        if kind_named(intent.get("targetKind")) is TIMELINE_KIND:
-            return check_timeline_intent(ctx, view)
+    if _is_timeline_fingerprint(view):
+        return check_timeline_intent(ctx, view)
+    if view.intent.get("fingerprintBefore") is not None:
         return _check_fingerprint_one(ctx, view)
+    return _check_values_one(ctx, view)
+
+
+def _check_values_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
+    intent = view.intent
     keys = [str(k) for k in (intent.get("before") or {})]
     current = read_current(ctx, intent, keys)
     entry: dict[str, Any] = {"group": view.group, "id": view.id, "op": intent.get("op")}
@@ -446,18 +374,17 @@ def _check_one(ctx: ServerContext, view: IntentView) -> dict[str, Any]:
         verdict, per_key = classify(intent, current.values)
         values = current.values
     entry.update(verdict=verdict, perKey=per_key, current=values)
-    ctx.journal.append(
-        {
-            "type": "check",
-            "id": view.id,
-            "group": view.group,
-            "ts": now_iso(),
-            "verdict": verdict,
-            "perKey": per_key,
-            "current": values,
-            "target": current.target,
-        }
-    )
+    check: CheckRecord = {
+        "type": "check",
+        "id": view.id,
+        "group": view.group,
+        "ts": now_iso(),
+        "verdict": verdict,
+        "perKey": per_key,
+        "current": values,
+        "target": current.target,
+    }
+    ctx.journal.append(check)
     ctx.guard.release(view.id)
     return entry
 
@@ -466,7 +393,7 @@ def _check(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     group = args.get("group")
     with ctx.write_lock:  # never classify a write that is still on its way
         index = Index(ctx.journal.read_all().records)
-        if group is not None and group not in index.groups:
+        if group is not None and group not in index.groups and not index.is_loop_parent(group):
             raise ServerOpError("INVALID_ARGS", f"no journal group {group!r}")
         pending = index.in_doubt(str(group) if group is not None else None)
         checked = [_check_one(ctx, view) for view in pending]
@@ -484,408 +411,9 @@ def _check(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     )
 
 
-@dataclass(frozen=True)
-class _RevertPlan:
-    view: IntentView
-    keys: list[str]
-    target: dict[str, Any]
-    expected: dict[str, Any]
-
-
-def _nothing_to_revert(index: Index, group: str) -> ServerOpError:
-    if any(view.intent.get("kind") == RENDER_KIND for view in index.groups[group]):
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} is a render: its output (the files on disk, the clips in the shelf "
-            "reel) cannot be undone, so there is nothing to revert",
-        )
-    if any(view.intent.get("kind") == RENDER_CLIP_KIND for view in index.groups[group]):
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} is a render of a clip's Timeline FX: it cannot be undone, so there is "
-            "nothing to revert",
-        )
-    if any(view.intent.get("kind") == EXPORT_KIND for view in index.groups[group]):
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} is an export: the files it wrote cannot be undone, so there is "
-            "nothing to revert",
-        )
-    if any(view.intent.get("kind") == STILL_KIND for view in index.groups[group]):
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} is a still: the frame it wrote cannot be undone, so there is "
-            "nothing to revert",
-        )
-    if any(view.intent.get("kind") == BATCH_DELETE_KIND for view in index.groups[group]):
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} deleted a Batch group: it cannot be put back by a revert; create a "
-            "Batch group and batch.load_setup the file in the intent's setupPath",
-        )
-    state = index.group_state(group)
-    if state == STATE_REVERTED:
-        by = ", ".join(index.reverted_by(group))
-        return ServerOpError(
-            "PRECONDITION_UNMET", f"group {group} is already reverted (by {by}); nothing to do"
-        )
-    if state == STATE_UNKNOWN:
-        return ServerOpError(
-            "PRECONDITION_UNMET",
-            f"group {group} has no outcome yet (state unknown): run journal.check first",
-        )
-    return ServerOpError(
-        "PRECONDITION_UNMET",
-        f"group {group} is in state {state!r}: it applied or changed no key that a revert "
-        "could put back",
-    )
-
-
-def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str)
-
-
-def _plan_revert(ctx: ServerContext, index: Index, group: str) -> list[_RevertPlan]:
-    """Read Flame for every key the group applied or changed (and that no earlier, partial
-    revert already put back) and require each to still hold what the group left. Raises before
-    anything is written. Intents are taken in reverse order of the group.
-
-    A key written more than once on one target is compared to Flame's current value by its
-    newest intent only; each older intent is compared to what the next one recorded as its
-    `before` (the value it found), so the chain must be unbroken (an entry of `keys` says so in
-    its `reason`). The chain is followed per recorded `target`, so writes that moved the target's
-    address (a node renamed twice, a node of a shared name moved) are not linked: they are
-    each compared to the current value, which can end in CONFLICT or SELECTOR_EMPTY."""
-    views = [
-        v
-        for v in reversed(index.groups[group])
-        if v.revertible_keys() and not index.intent_reverted(v)
-    ]
-    if not views:
-        raise _nothing_to_revert(index, group)
-    plans: list[_RevertPlan] = []
-    refused: list[dict[str, Any]] = []
-    reads: dict[str, CurrentRead] = {}
-    newer_writes: dict[tuple[str, str], IntentView] = {}  # (target, key) -> next intent in time
-    for view in views:
-        keys = view.revertible_keys()
-        intent = view.intent
-        read_key = _canonical(
-            [
-                intent.get("readOp"),
-                intent.get("op"),
-                intent.get("target"),
-                intent.get("targetAfter"),
-                keys,
-            ]
-        )
-        current = reads.get(read_key)
-        if current is None:
-            current = reads[read_key] = read_current(ctx, intent, keys)
-        if current.status == "unreachable":
-            raise ServerOpError(
-                as_error_code(current.code),
-                f"nothing was written: Flame could not be read ({current.message})",
-            )
-        if current.status == "not_found" or current.target is None:
-            raise ServerOpError(
-                "SELECTOR_EMPTY",
-                f"nothing was written: the target of {view.id} was not found at its recorded "
-                "address",
-            )
-        expected = {key: view.expected_after(key) for key in keys}
-        target_id = _canonical(intent.get("target"))
-        per_key: dict[str, dict[str, Any]] = {}
-        for key in keys:
-            newer = newer_writes.get((target_id, key))
-            found = (
-                current.values[key] if newer is None else (newer.intent.get("before") or {})[key]
-            )
-            match = attribute_values_equal(key, found, expected[key])
-            per_key[key] = {"expected": expected[key], "current": found, "match": match}
-            if newer is not None:
-                per_key[key]["reason"] = (
-                    f"compared with the next write's before ({newer.id}), not with the current "
-                    "value"
-                    + (
-                        ""
-                        if match
-                        else f": the journal is not continuous (this write left "
-                        f"{expected[key]!r} but the next write found {found!r})"
-                    )
-                )
-            newer_writes[(target_id, key)] = view
-        if not all(entry["match"] for entry in per_key.values()):
-            refused.append({"id": view.id, "op": intent.get("op"), "keys": per_key})
-        plans.append(_RevertPlan(view, keys, current.target, expected))
-    if refused:
-        raise ServerOpError(
-            "CONFLICT",
-            "nothing was written: the current value of "
-            + ", ".join(k for r in refused for k, e in r["keys"].items() if not e["match"])
-            + " is not what the group left, so it was not touched (it is not reverted "
-            "automatically: decide from the current values)",
-            result={"refused": True, "intents": refused},
-        )
-    return plans
-
-
-def _attribute_change_note(ctx: ServerContext, view: IntentView) -> str | None:
-    """For a bundled plan with value writes: why a revert must not go on (an attribute value of
-    the group changed after the run, or the run recorded none to compare), None when they match.
-    Raises `ServerOpError` when the group cannot be read."""
-    env = read_fingerprint(ctx, view.intent.get("target") or {}, sections=[ATTRIBUTES_SECTION])
-    current = fingerprint_of(env)
-    if current is None:
-        raise ServerOpError(
-            as_error_code(str(env.get("errorCode"))),
-            f"nothing was restored: the Batch group's attribute values could not be read "
-            f"({env.get('error')})",
-        )
-    expected = view.attribute_fingerprint_after()
-    if expected is None:
-        return "the run recorded no fingerprint of the group's attribute values"
-    if current != expected:
-        return "the group's attribute values changed after the run"
-    return None
-
-
-def _revert_by_checkpoint(
-    ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
-) -> ServerResult:
-    """Revert a group whose intent is a checkpoint intent (an eval run, a restore): restore
-    the checkpoint it names, but only while the Batch group's fingerprint is the one the run
-    left -- someone changing the group since would be overwritten. `force` skips that
-    comparison; when it really overrides one, the restore's intent records it (`forced`)."""
-    view = views[0]
-    if len(views) != 1 or not view.is_revertible():
-        raise _nothing_to_revert(index, group)
-    newer = _refuse_for_newer_groups(ctx, index, group, force)
-    forced_over_newer = {NEWER_GROUPS_KEY: [row["group"] for row in newer]} if newer else None
-    if kind_named(view.intent.get("targetKind")) is TIMELINE_KIND:
-        return _with_newer_groups(
-            revert_timeline_group(ctx, index, group, view, force, forced_note=forced_over_newer),
-            newer,
-        )
-    checkpoint_id = view.revert_checkpoint()
-    assert checkpoint_id is not None  # views were picked by it
-    if checkpoint_id not in index.checkpoints:
-        raise ServerOpError(
-            "INVALID_ARGS",
-            f"nothing was restored: the journal has no record of checkpoint {checkpoint_id}",
-        )
-    env = read_fingerprint(ctx, view.intent.get("target") or {})
-    current = fingerprint_of(env)
-    if current is None:
-        raise ServerOpError(
-            as_error_code(str(env.get("errorCode"))),
-            f"nothing was restored: the Batch group could not be read ({env.get('error')})",
-        )
-    expected = view.fingerprint_after()
-    matches = expected is not None and current == expected
-    attribute_note: str | None = None
-    if matches and view.intent.get("watchAttributes") is True:
-        attribute_note = _attribute_change_note(ctx, view)
-    forced: dict[str, Any] | None = None
-    if not matches or attribute_note is not None:
-        detail = {
-            "expectedFingerprint": expected,
-            "currentFingerprint": current,
-            "note": (
-                attribute_note
-                if matches and attribute_note is not None
-                else "the run recorded no fingerprint of its result"
-                if expected is None
-                else "the group's nodes or wiring changed after the run"
-            ),
-        }
-        if not force:
-            raise ServerOpError(
-                "CONFLICT",
-                f"nothing was restored: {detail['note']}, so restoring checkpoint "
-                f"{checkpoint_id} would overwrite whatever happened since (pass force=true to "
-                "restore anyway; that is journaled)",
-                result={"refused": True, "group": group, **detail},
-            )
-        forced = {"used": True, **detail}
-    if forced_over_newer is not None:
-        forced = {"used": True, **(forced or {}), **forced_over_newer}
-    # a plan.run that was bundled has the plan's value writes (node.set_attributes ...) in the
-    # same group: the one restore puts them back too, so it covers the whole group
-    covers_group = len(index.groups[group]) > 1
-    outcome = restore_checkpoint(
-        ctx,
-        checkpoint_id,
-        reverts=group,
-        reverts_intent=None if covers_group else view.id,
-        forced=forced,
-    )
-    result = dict(outcome.result) if isinstance(outcome.result, dict) else {}
-    result["reverted"] = group
-    return _with_newer_groups(
-        ServerResult(result=result, affected=outcome.affected, journal=outcome.journal), newer
-    )
-
-
-def _refuse_for_newer_groups(
-    ctx: ServerContext, index: Index, group: str, force: bool
-) -> list[dict[str, Any]]:
-    """The groups written to the same target after the checkpointed `group` that landed and were
-    not reverted, newest first. Without `force` they end the revert in CONFLICT before anything is
-    restored (the restore would overwrite what they wrote, and the fingerprint cannot see all of
-    it); with `force` the list comes back for the result."""
-    rows = newer_groups(ctx.journal.read_all().records, index, group)
-    if rows and not force:
-        raise ServerOpError(
-            "CONFLICT",
-            f"nothing was restored: restoring the checkpoint of {group} would overwrite what "
-            "later group(s) wrote to the same target (pass force=true to restore anyway; that "
-            "is journaled)." + newer_groups_sentence(rows),
-            result={"refused": True, "group": group, NEWER_GROUPS_KEY: rows},
-        )
-    return rows
-
-
-def _with_newer_groups(result: ServerResult, rows: list[dict[str, Any]]) -> ServerResult:
-    """A forced revert's result, with the newer groups it restored over."""
-    if not rows:
-        return result
-    body = dict(result.result) if isinstance(result.result, dict) else {}
-    body[NEWER_GROUPS_KEY] = rows
-    return replace(result, result=body)
-
-
-def _revert_desktop(
-    ctx: ServerContext, index: Index, group: str, desktop_views: list[IntentView], force: bool
-) -> ServerResult:
-    """The revert of a group of Desktop writes, by the kind of the write."""
-    if index.group_meta.get(group, {}).get("kind") == ARRANGE_GROUP_KIND:
-        return revert_arrange_group(ctx, index, group, desktop_views)
-    if index.group_meta.get(group, {}).get("kind") == REORDER_GROUP_KIND:
-        return revert_reorder_group(ctx, index, group, desktop_views)
-    if any(is_delete_intent(v) for v in desktop_views):
-        return revert_delete_group(ctx, index, group, desktop_views)
-    if any(is_media_intent(v) for v in desktop_views):
-        return revert_media_group(ctx, index, group, desktop_views)
-    if any(is_reformat_intent(v) for v in desktop_views):
-        return revert_reformat_group(ctx, index, group, desktop_views, force)
-    if any(is_extract_intent(v) for v in desktop_views):
-        return revert_extract_group(ctx, index, group, desktop_views)
-    if any(is_sequence_intent(v) for v in desktop_views):
-        return revert_sequence_group(ctx, index, group, desktop_views)
-    return revert_desktop_group(ctx, index, group, desktop_views)
-
-
-def _revert(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
-    group = str(args["group"])
-    with ctx.write_lock:
-        index = Index(ctx.journal.read_all().records)
-        if group not in index.groups:
-            raise ServerOpError("INVALID_ARGS", f"no journal group {group!r}")
-        if index.is_reverted(group):
-            raise _nothing_to_revert(index, group)
-        desktop_views = [v for v in index.groups[group] if v.desktop_kind is not None]
-        if desktop_views:
-            force = bool(args.get("force", False))
-            newer = (
-                _refuse_for_newer_groups(ctx, index, group, force)
-                if any(v.is_revertible() for v in desktop_views)
-                else []
-            )
-            return _with_newer_groups(
-                _revert_desktop(ctx, index, group, desktop_views, force), newer
-            )
-        checkpoint_views = [v for v in index.groups[group] if v.revert_checkpoint() is not None]
-        if checkpoint_views:
-            return _revert_by_checkpoint(
-                ctx, index, group, checkpoint_views, bool(args.get("force", False))
-            )
-        plans = _plan_revert(ctx, index, group)
-
-        new_group = new_id("g")
-        journal_ref = {"group": new_group}
-        writes: list[dict[str, Any]] = []
-        reverted: list[dict[str, Any]] = []
-
-        def remaining_from(start: int) -> list[dict[str, Any]]:
-            return [
-                {"intent": p.view.id, "op": p.view.intent.get("op"), "keys": p.keys}
-                for p in plans[start:]
-            ]
-
-        for position, plan in enumerate(plans):
-            op_name = str(plan.view.intent.get("op"))
-            op = ctx.registry.get(op_name)
-            failure: tuple[ErrorCode, str, str | None] | None = None
-            if op is None or op.journal is None:
-                failure = (
-                    "PRECONDITION_UNMET",
-                    f"'{op_name}' is no longer a journaled op",
-                    None,
-                )
-            else:
-                before = plan.view.intent.get("before") or {}
-                env = ctx.do(
-                    op_name,
-                    op.journal.write_args(plan.target, {key: before[key] for key in plan.keys}),
-                    group=new_group,
-                    reverts=group,
-                    reverts_intent=plan.view.id,
-                    precondition=plan.expected,
-                )
-                writes.append(
-                    {
-                        "intent": plan.view.id,
-                        "ok": env.get("ok"),
-                        "errorCode": env.get("errorCode"),
-                        "journal": env.get("journal"),
-                        "result": env.get("result"),
-                    }
-                )
-                if env.get("ok") is True:
-                    reverted.append({"intent": plan.view.id, "op": op_name, "keys": plan.keys})
-                    continue
-                failure = (
-                    as_error_code(str(env.get("errorCode"))),
-                    f"the revert of {plan.view.id} failed: {env.get('error')}",
-                    env.get("hint"),
-                )
-            assert failure is not None  # every path that reaches here set it
-            code, message, hint = failure
-            still = remaining_from(position)
-            raise ServerOpError(
-                code,
-                message
-                + (
-                    f" -- {len(reverted)} intent(s) were put back, {len(still)} remain "
-                    "(the group is now partially_reverted; decide from the current values, "
-                    "nothing is retried automatically)"
-                    if reverted
-                    else ""
-                ),
-                result={
-                    "group": new_group,
-                    "reverts": group,
-                    "writes": writes,
-                    "revertedKeys": reverted,
-                    "remaining": still,
-                },
-                hint=hint,
-                affected=sum(len(r["keys"]) for r in reverted),
-                partial={"done": len(reverted), "failed": 1, "notRun": len(still) - 1},
-                journal=journal_ref,
-            )
-    return ServerResult(
-        result={
-            "reverted": group,
-            "group": new_group,
-            "writes": writes,
-            "revertedKeys": reverted,
-            "remaining": [],
-        },
-        affected=sum(len(p.keys) for p in plans),
-        journal=journal_ref,
-    )
+_PLAN_USE_JOURNAL_REVERT = PlanUse(
+    PlanKind.NEVER,
+)
 
 
 def register(registry: Registry) -> None:
@@ -1045,6 +573,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="journal.revert",
+            plan_use=_PLAN_USE_JOURNAL_REVERT,
             category="journal",
             description=(
                 "Undo the writes of one journal group (`group`: the id an earlier call returned "
@@ -1144,7 +673,15 @@ def register(registry: Registry) -> None:
                 "revert those first, or pass force=true (journaled for a checkpointed group; the "
                 "result still has newerGroups; for the other kinds force skips only this rule). "
                 "Other desktop groups (desktop.delete, copy, import, duplicate, create, "
-                "arrange) have no such rule. What a person changed in the GUI is seen only as far "
+                "arrange) have no such rule. The parent group of a plan.for_each write loop "
+                "(`result.group` of the loop) holds one child group per item or per step, "
+                "and journal.revert(parent) puts the children back newest first, each by its "
+                "own rule above (journal.revert(child) puts back that one only); the first "
+                "child that cannot be put back (CONFLICT ...) stops it, result.children says "
+                "how far it got and result.remaining what is left, and calling again goes on "
+                "from there. A child that made output that cannot be put back (a render) is "
+                "not touched and is listed in result.kept. "
+                "What a person changed in the GUI is seen only as far "
                 "as the fingerprint reaches (nodes and wiring, or segments and effects), so a "
                 "change of that kind is not caught. "
                 "Refused while a write is unsettled "
@@ -1172,7 +709,6 @@ def register(registry: Registry) -> None:
                     default=False,
                 ),
             ),
-            server_handler=_revert,
-            undo_steps=lambda args, affected: 0,
+            server_handler=journal_revert.revert,
         )
     )

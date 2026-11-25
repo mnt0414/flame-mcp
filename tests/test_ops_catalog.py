@@ -1,6 +1,6 @@
 """Completion check of the op catalog.
 
-The 111 real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
+The real ops (via `ops.register_all`, the real `api_symbols_2025.2.4.json`) show up through
 the actual MCP tool surface, and READONLY hides/rejects exactly the write ops (`desktop.rename`
 and every `*.set_attributes`) in all 3 policy checkpoints. No bridge/socket is needed here:
 `flame_catalog`/`flame_do`'s POLICY_DENIED path and `tools/list` never touch the bridge.
@@ -17,16 +17,19 @@ import pytest
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 
+from flame_mcp import catalog as catalog_mod
+from flame_mcp import compact as compact_mod
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import selectors
+from flame_mcp import opschema, selectors
+from flame_mcp import server as server_mod
 from flame_mcp.ops import register_all
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry, sample_selector_for
 from flame_mcp.server import create_server
-from flame_mcp.types import SelectorKind
+from flame_mcp.types import NO_DEFAULT, SelectorKind
 
-PROJECTED_OP_COUNT = 111
-"""The number of real ops the listing is projected for; the whole listing must still fit."""
+REGISTERED_OP_COUNT = 112
+"""The number of registered ops: the one place that counts them. Other tests import it."""
 PROJECTED_BUDGET_SHARE = 0.8
 LISTING_KEYS = {"name", "category", "effect", "undo", "summary", "params", "accepts"}
 DETAIL_KEYS = {
@@ -35,13 +38,9 @@ DETAIL_KEYS = {
     "description",
     "params",
     "effect",
-    "effectLabel",
     "undo",
-    "undoLabel",
     "thread",
-    "threadSource",
     "pacing",
-    "pacingSource",
     "accepts",
     "defaultLimit",
     "maxLimit",
@@ -89,6 +88,7 @@ EXPECTED_OP_NAMES = {
     "journal.poll",
     "journal.inflight",
     "plan.run",
+    "plan.for_each",
     "batch.checkpoint",
     "batch.fingerprint",
     "batch.compare_setup",
@@ -267,13 +267,13 @@ def _structured(result: Any) -> dict[str, Any]:
     return sc
 
 
-def test_registered_op_count_is_103() -> None:
+def test_registered_op_count() -> None:
     registry = make_full_registry()
-    assert len(registry.list_ops()) == 111
+    assert len(registry.list_ops()) == REGISTERED_OP_COUNT
     assert {op.name for op in registry.list_ops()} == EXPECTED_OP_NAMES
 
 
-def test_flame_catalog_lists_all_103_ops(run_dir: Path) -> None:
+def test_flame_catalog_lists_all_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
@@ -290,7 +290,7 @@ def test_flame_catalog_lists_all_103_ops(run_dir: Path) -> None:
     anyio.run(main)
 
 
-def test_flame_do_tool_enum_lists_all_103_ops(run_dir: Path) -> None:
+def test_flame_do_tool_enum_lists_all_ops(run_dir: Path) -> None:
     async def main() -> None:
         registry = make_full_registry()
         policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
@@ -413,11 +413,11 @@ def test_the_full_listing_is_compact_and_a_2_5x_larger_catalog_would_still_fit(
                 assert len(operations) == len(registry.list_ops())
                 size = _listing_size(env)
                 per_op = size / len(operations)
-                projected = per_op * PROJECTED_OP_COUNT
+                projected = per_op * REGISTERED_OP_COUNT
                 limit = envelope_mod.MAX_RESPONSE_BYTES * PROJECTED_BUDGET_SHARE
                 print(f"listing: {size} B for {len(operations)} ops, {per_op:.0f} B/op")
                 print(
-                    f"projected for {PROJECTED_OP_COUNT} ops: {projected:.0f} B, limit {limit:.0f}"
+                    f"projected for {REGISTERED_OP_COUNT} ops: {projected:.0f} B, limit {limit:.0f}"
                 )
                 assert projected <= limit, (size, per_op, projected, limit)
                 for entry in operations:
@@ -503,8 +503,8 @@ def test_the_render_category_is_listed_with_its_three_ops(run_dir: Path) -> None
 def test_the_listing_leaves_the_detail_fields_to_the_one_op_description(run_dir: Path) -> None:
     """`flame_catalog(op=...)` answers with all the detail the listing leaves out.
 
-    That is the full description, typed params, the effect / undo labels, thread / pacing with
-    their sources, limits, and each accepted selector kind's fields and example.
+    That is the full description, typed params, thread / pacing, limits, and each accepted
+    selector kind's field names, types and example.
     """
 
     async def main() -> None:
@@ -526,9 +526,6 @@ def test_the_listing_leaves_the_detail_fields_to_the_one_op_description(run_dir:
                     assert set(detail) == DETAIL_KEYS
                     assert detail["description"] == op.description, op.name
                     assert detail["thread"] == op.thread and detail["pacing"] == op.pacing
-                    assert detail["threadSource"] == op.sources.get("thread"), op.name
-                    assert detail["pacingSource"] == op.sources.get("pacing"), op.name
-                    assert detail["effectLabel"] and detail["undoLabel"], op.name
                     assert [d["name"] for d in detail["params"]["details"]] == [
                         p.name for p in op.params
                     ]
@@ -538,7 +535,10 @@ def test_the_listing_leaves_the_detail_fields_to_the_one_op_description(run_dir:
                         assert d["type"] and d["description"], (op.name, d["name"])
                     assert [a["kind"] for a in detail["accepts"]] == listed[op.name]["accepts"]
                     for accept in detail["accepts"]:
-                        assert {"fields", "example"} <= set(accept), (op.name, accept["kind"])
+                        assert set(accept) == {"kind", "fields", "example"}, (op.name, accept)
+                        for field in accept["fields"].values():
+                            assert set(field) == {"type", "required"}, (op.name, accept["kind"])
+                    assert described["result"]["note"] == catalog_mod.CATALOG_DETAIL_NOTE
                     assert detail["defaultLimit"] == op.default_limit
                     assert detail["maxLimit"] == op.max_limit
                     entry = listed[op.name]
@@ -552,6 +552,11 @@ def test_the_listing_leaves_the_detail_fields_to_the_one_op_description(run_dir:
                 ctx_env = _structured(await session.call_tool("flame_context", {}))
                 vocab = {v["kind"]: v for v in ctx_env["result"]["selectorVocabulary"]}
                 assert "fields" in vocab["batch"] and "example" in vocab["batch"]
+                assert vocab["batch"]["label"]
+                assert all(
+                    "description" in f and "type" in f and "required" in f
+                    for f in vocab["segment"]["fields"].values()
+                )
 
     anyio.run(main)
 
@@ -637,3 +642,218 @@ def test_no_op_text_states_a_default_that_differs_between_flame_versions() -> No
     assert "omitted = Flame's default" in flat and "result.reels" in flat
     (reels,) = [p for p in create.params if p.name == "reels"]
     assert "Flame's default" in reels.description and "result.reels" in reels.description
+
+
+def _sync(registry: Registry, op: Any = None, detail: Any = None, category: Any = None) -> Any:
+    policy = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
+    return server_mod._flame_catalog_sync(registry, policy, category, op, detail)
+
+
+def _bytes(value: Any) -> int:
+    return len(json.dumps(value).encode("utf-8"))
+
+
+def test_describe_kind_brief_drops_labels_and_descriptions() -> None:
+    for kind in get_args(SelectorKind):
+        full = selectors.describe_kind(kind)
+        brief = selectors.describe_kind_brief(kind)
+        assert set(brief) == {"kind", "fields", "example"}
+        assert brief["example"] == full["example"]
+        assert set(brief["fields"]) == set(full["fields"])
+        for name, field in brief["fields"].items():
+            assert field == {
+                "type": full["fields"][name]["type"],
+                "required": full["fields"][name]["required"],
+            }
+
+
+def test_args_detail_is_a_small_fraction_of_full_for_all_ops() -> None:
+    registry = make_full_registry()
+    full_total = args_total = 0
+    for op in registry.list_ops():
+        full = _sync(registry, op.name)["result"]["operation"]
+        args = _sync(registry, op.name, "args")["result"]["operation"]
+        assert _bytes(args) < _bytes(full), op.name
+        full_total += _bytes(full)
+        args_total += _bytes(args)
+        assert set(args) == {"name", "effect", "undo", "summary", "params", "accepts"}
+        assert args["summary"] == opschema.first_sentence(op.description)
+        assert [a["kind"] for a in args["accepts"]] == list(op.accepts)
+        assert [p["name"] for p in args["params"]] == [p.name for p in op.params]
+        for item, param in zip(args["params"], op.params, strict=True):
+            assert {"name", "type", "required", "summary"} <= set(item)
+            assert set(item) <= {
+                "name",
+                "type",
+                "required",
+                "summary",
+                "default",
+                "enum",
+                "minimum",
+                "itemType",
+            }
+            assert item["required"] is param.required
+            assert len(item["summary"]) <= len(param.description), (op.name, param.name)
+            assert ("default" in item) is (param.default is not NO_DEFAULT)
+            assert ("enum" in item) is (param.enum is not None)
+            assert ("minimum" in item) is (param.minimum is not None)
+            assert ("itemType" in item) is (param.item_type is not None)
+    assert args_total < full_total * 0.4
+
+
+def test_args_detail_has_no_full_description() -> None:
+    registry = make_full_registry()
+    text = json.dumps(_sync(registry, "segment.replace", "args"))
+    op = registry.get("segment.replace")
+    assert op is not None
+    assert op.description not in text
+    env = _sync(registry, "desktop.list_children", "args")
+    params = {p["name"]: p for p in env["result"]["operation"]["params"]}
+    assert params["offset"]["default"] == 0 and params["offset"]["minimum"] == 0
+    assert params["types"]["itemType"] == "string"
+
+
+def test_detail_errors() -> None:
+    registry = make_full_registry()
+    bad = _sync(registry, "segment.info", "brief")
+    assert bad["ok"] is False and bad["errorCode"] == "INVALID_ARGS"
+    no_op = _sync(registry, None, "args")
+    assert no_op["ok"] is False and no_op["errorCode"] == "INVALID_ARGS"
+    assert "op" in no_op["error"]
+    assert _sync(registry, None, "full")["ok"] is True
+    assert _sync(registry)["ok"] is True
+
+
+@pytest.mark.parametrize("bad_op", [[], ["a.b"] * 11, [1], ["segment.info", 2], 5, {}])
+def test_op_list_input_errors(bad_op: Any) -> None:
+    env = _sync(make_full_registry(), bad_op)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS"
+
+
+def test_op_list_returns_entries_in_order_without_duplicates() -> None:
+    registry = make_full_registry()
+    names = ["segment.info", "project.info", "segment.info", "desktop.list_children"]
+    env = _sync(registry, names)
+    assert env["ok"] is True
+    result = env["result"]
+    assert "operation" not in result and "unavailable" not in result and "omitted" not in result
+    assert [e["name"] for e in result["operations"]] == [
+        "segment.info",
+        "project.info",
+        "desktop.list_children",
+    ]
+    assert set(result) == {"categories", "detail", "note", "operations"}
+    assert result["note"] == catalog_mod.CATALOG_DETAIL_NOTE
+    assert result["operations"][0] == _sync(registry, "segment.info")["result"]["operation"]
+    args = _sync(registry, names, "args")["result"]["operations"]
+    assert set(args[0]) == {"name", "effect", "undo", "summary", "params", "accepts"}
+
+
+def test_op_list_reports_unavailable_names_and_returns_the_rest() -> None:
+    registry = make_full_registry()
+    policy = Policy.from_env({"FLAME_MCP_READONLY": "1"})
+    env = server_mod._flame_catalog_sync(
+        registry, policy, None, ["segment.infoo", "project.info", "desktop.rename"]
+    )
+    assert env["ok"] is True
+    result = env["result"]
+    assert [e["name"] for e in result["operations"]] == ["project.info"]
+    by_name = {u["name"]: u for u in result["unavailable"]}
+    assert by_name["segment.infoo"]["errorCode"] == "UNKNOWN_OPERATION"
+    assert by_name["segment.infoo"]["suggestion"] == "segment.info"
+    assert by_name["desktop.rename"]["errorCode"] == "POLICY_DENIED"
+    assert by_name["desktop.rename"]["error"]
+    assert "suggestion" not in by_name["desktop.rename"]
+
+
+def test_op_list_of_only_unavailable_names_is_invalid_args() -> None:
+    env = _sync(make_full_registry(), ["segment.infoo", "zzz.nothing"])
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS"
+    assert "segment.infoo" in env["error"] and "zzz.nothing" in env["error"]
+    assert "segment.info" in env["error"]
+
+
+def test_op_list_omits_entries_past_the_size_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = make_full_registry()
+    names = ["segment.replace", "plan.run", "segment.info", "project.info"]
+    first = _sync(registry, names[:1])["result"]
+    monkeypatch.setattr(server_mod, "CATALOG_RESULT_BUDGET_BYTES", _bytes(first) + 200)
+    result = _sync(registry, names)["result"]
+    assert [e["name"] for e in result["operations"]] == ["segment.replace"]
+    assert result["omitted"] == names[1:]
+    assert "detail" in result["omittedNote"]
+    monkeypatch.setattr(server_mod, "CATALOG_RESULT_BUDGET_BYTES", 10)
+    result = _sync(registry, names)["result"]
+    assert [e["name"] for e in result["operations"]] == ["segment.replace"]
+    assert result["omitted"] == names[1:]
+
+
+def test_flame_catalog_tool_schema_accepts_op_arrays_and_detail(run_dir: Path) -> None:
+    async def main() -> None:
+        server = create_server(
+            make_full_registry(), Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"}), run_dir=run_dir
+        )
+        async with InMemoryTransport(server, raise_exceptions=True) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = {t.name: t for t in (await session.list_tools()).tools}
+                props = tools["flame_catalog"].input_schema["properties"]
+                assert props["detail"]["enum"] == ["full", "args"]
+                variants = props["op"]["anyOf"]
+                assert {v["type"] for v in variants} == {"string", "array"}
+                (array,) = [v for v in variants if v["type"] == "array"]
+                assert array["maxItems"] == catalog_mod.MAX_CATALOG_OPS
+                env = _structured(
+                    await session.call_tool(
+                        "flame_catalog",
+                        {"op": ["segment.info", "project.info"], "detail": "args"},
+                    )
+                )
+                assert env["ok"] is True
+                assert [e["name"] for e in env["result"]["operations"]] == [
+                    "segment.info",
+                    "project.info",
+                ]
+
+    anyio.run(main)
+
+
+def test_op_list_of_only_denied_names_is_policy_denied_with_hint() -> None:
+    registry = make_full_registry()
+    policy = Policy.from_env({"FLAME_MCP_READONLY": "1"})
+    env = server_mod._flame_catalog_sync(
+        registry, policy, None, ["desktop.rename", "desktop.rename"]
+    )
+    assert env["ok"] is False and env["errorCode"] == "POLICY_DENIED"
+    assert "desktop.rename" in env["error"]
+    assert env["hint"]
+    mixed = server_mod._flame_catalog_sync(
+        registry, policy, None, ["desktop.rename", "zzz.nothing"]
+    )
+    assert mixed["ok"] is False and mixed["errorCode"] == "INVALID_ARGS"
+
+
+def test_op_list_puts_a_policy_denied_eval_run_in_unavailable() -> None:
+    registry = make_full_registry()
+    assert registry.get("eval.run") is not None
+    policy = Policy.from_env({})
+    env = server_mod._flame_catalog_sync(registry, policy, None, ["eval.run", "project.info"])
+    assert env["ok"] is True
+    result = env["result"]
+    assert [e["name"] for e in result["operations"]] == ["project.info"]
+    assert [(u["name"], u["errorCode"]) for u in result["unavailable"]] == [
+        ("eval.run", "POLICY_DENIED")
+    ]
+
+
+def test_op_list_stays_a_list_through_the_compact_response() -> None:
+    registry = make_full_registry()
+    env = _sync(registry, ["segment.info", "project.info", "desktop.list_children"], "args")
+    compacted = compact_mod.compact_envelope(env)
+    operations = compacted["result"]["operations"]
+    assert isinstance(operations, list)
+    assert [e["name"] for e in operations] == [
+        "segment.info",
+        "project.info",
+        "desktop.list_children",
+    ]

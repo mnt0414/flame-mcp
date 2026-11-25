@@ -82,9 +82,11 @@ OUTPUT_DIR: Final[Path] = Path.home() / "Library" / "Application Support" / "fla
 BLUR_NODES: Final[int] = 7  # a: 0-2, b: 3-4, c: 3-4 (again, after b), e: 5, f and g: 6
 PLAN_LABEL_A: Final[str] = "p2_2b stage a"
 SUMMARY_WRITES: Final[int] = 11  # one more than the writes a plan may hold before 'auto' summarises
-SUMMARY_STEP_KEYS: Final[frozenset[str]] = frozenset({"index", "op", "ok", "errorCode", "brief"})
+SUMMARY_STEP_KEYS: Final[frozenset[str]] = frozenset(
+    {"index", "id", "op", "ok", "errorCode", "brief"}
+)
 FULL_STEP_KEYS: Final[frozenset[str]] = frozenset(
-    {"index", "op", "ok", "errorCode", "error", "result", "journal"}
+    {"index", "id", "op", "ok", "errorCode", "error", "result", "journal"}
 )
 
 Results = dict[str, Any]

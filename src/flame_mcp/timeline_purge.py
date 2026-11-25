@@ -31,8 +31,10 @@ from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import execution
 from flame_mcp.checkpoints import CHECKPOINT_TIMEOUT_S, TIMELINE_KIND, kind_named
-from flame_mcp.errors import as_error_code
+from flame_mcp.errors import PARTIAL_PREFIX, as_error_code
+from flame_mcp.execution import raise_on_error_src
 from flame_mcp.journal import VERDICT_UNKNOWN, Index, new_id, now_iso
+from flame_mcp.journal_records import CheckpointRecord, PurgeRecord
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.timeline_checkpoints import (
@@ -40,12 +42,19 @@ from flame_mcp.timeline_checkpoints import (
     REEL_PREFIX,
     checkpoint_library_name,
 )
-from flame_mcp.types import Category, OperationSpec, Refusal, ServerOpError, ServerResult
+from flame_mcp.types import (
+    PHASE_ARG,
+    Category,
+    OperationSpec,
+    PhaseSpec,
+    Refusal,
+    ServerOpError,
+    ServerResult,
+)
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
 
-PHASE_ARG: Final[str] = "_phase"
 PHASE_SCAN: Final[str] = "scan"
 PHASE_PURGE: Final[str] = "purge"
 CANDIDATES_ARG: Final[str] = "_candidates"
@@ -66,11 +75,6 @@ MAX_GROUPS: Final[int] = 50
 TOKEN_LENGTH: Final[int] = 32
 
 
-_RAISE_ON_ERROR: Final[str] = (
-    "if _result['error'] is not None:\n    raise _OpError(_result['errorCode'], _result['error'])"
-)
-
-
 def _source(*blocks: str) -> str:
     return "\n\n".join(blocks)
 
@@ -81,7 +85,7 @@ def _purge_to_python(args: Mapping[str, Any]) -> str:
         return _source(
             f"_result = _tp_purge({library!r}, {list(args.get(ITEMS_ARG) or [])!r}, "
             f"{REEL_PREFIX!r})",
-            _RAISE_ON_ERROR,
+            raise_on_error_src(),
             "_affected = len(_result['deleted'])",
         )
     return _source(
@@ -89,10 +93,6 @@ def _purge_to_python(args: Mapping[str, Any]) -> str:
         f"{list(args.get(KNOWN_ARG) or [])!r})",
         "_affected = 0",
     )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 @cache
@@ -115,7 +115,7 @@ def purge_op() -> RegisteredOperation:
             description="internal: the Flame side of journal.purge_checkpoints",
             effect="destructive",
             to_python=_purge_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(PhaseSpec(PHASE_PURGE, {LIBRARY_ARG: "lib", ITEMS_ARG: [["u", "r"]]}),),
             requires=(
                 "flame.delete",
                 "PyWorkspace.libraries",
@@ -156,7 +156,7 @@ def _parse_ts(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-def recorded_timeline_checkpoints(index: Index) -> list[dict[str, Any]]:
+def recorded_timeline_checkpoints(index: Index) -> list[CheckpointRecord]:
     return [r for r in index.checkpoints.values() if kind_named(r.get("kind")) is TIMELINE_KIND]
 
 
@@ -227,7 +227,7 @@ def check_groups(index: Index, groups: list[str]) -> list[str]:
 
 def _candidates(
     index: Index, cutoff: datetime | None, groups: list[str] | None
-) -> list[dict[str, Any]]:
+) -> list[CheckpointRecord]:
     """The recorded, not yet purged timeline checkpoints that were recorded before `cutoff`, or
     (when `groups` is given, and the date is not looked at) that belong to one of `groups`,
     oldest first."""
@@ -415,9 +415,9 @@ def _not_deleted_error(result: dict[str, Any], purged: int, failed: int) -> Serv
         )
     return ServerOpError(
         "FLAME_API_ERROR",
-        f"partial: {purged} stashed copy(ies) were deleted and {failed} are still there after "
-        f"flame.delete (result.notDeleted: {still}); the deleted ones are recorded as purged, "
-        "a purge again retries the rest",
+        f"{PARTIAL_PREFIX} {purged} stashed copy(ies) were deleted and {failed} are still there "
+        f"after flame.delete (result.notDeleted: {still}); the deleted ones are recorded as "
+        "purged, a purge again retries the rest",
         result=result,
         partial={"purged": purged, "notDeleted": failed},
         affected=purged,
@@ -475,7 +475,7 @@ def purge_checkpoints(args: Mapping[str, Any], ctx: ServerContext) -> ServerResu
             ctx.guard.block_unrecorded(None, PURGE_OP_NAME, failure.code)
         purged = [d["id"] for d in done["deleted"]]
         record_id = new_id("p")
-        record = {
+        record: PurgeRecord = {
             "type": "purge",
             "id": record_id,
             "ts": now_iso(),

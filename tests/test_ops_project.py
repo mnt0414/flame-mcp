@@ -9,18 +9,11 @@ from typing import Any
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import build_default_tree
-from flame_mcp.ops import register_all
 from flame_mcp.policy import Policy
-from flame_mcp.registry import Registry
 from journal_test_helpers import Rig, make_rig
 from op_test_helpers import run_op
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def test_project_info_reports_name_workspace_library_count_and_desktop() -> None:
@@ -59,7 +52,6 @@ def test_project_info_is_read_effect_zero_undo() -> None:
     assert op is not None
     assert op.effect == "read"
     assert op.undo == "none"
-    assert op.undo_steps({}, 5) == 0
 
 
 def workspace_of(rig: Rig) -> Any:
@@ -88,7 +80,6 @@ def test_project_save_commits_once_and_reports_what_it_did(
     assert result["readBackDecisive"] is False
     assert isinstance(result["elapsedS"], float) and result["elapsedS"] >= 0
     assert round(result["elapsedS"], 3) == result["elapsedS"]
-    assert env["undoSteps"] == 0
 
 
 def test_project_save_leaves_no_journal_record_like_batch_save_setup(
@@ -150,5 +141,4 @@ def test_project_save_is_a_create_effect_with_unsupported_undo() -> None:
     assert op.undo == "unsupported"
     assert op.thread == "main-async"
     assert op.params == ()
-    assert op.undo_steps({}, 5) == 0
     assert "readBackDecisive" in op.description

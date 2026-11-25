@@ -34,12 +34,13 @@ from flame_mcp.desktop_revert import (
     unresolved_hint,
     unresolved_of,
 )
-from flame_mcp.desktop_run import CREATED_ARG, PHASE_ARG, PHASE_REVERT
+from flame_mcp.desktop_run import CREATED_ARG, PHASE_REVERT
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import KIND_DESKTOP_REFORMAT, Index, IntentView
+from flame_mcp.journal import KIND_DESKTOP_REFORMAT, Index, IntentView, JournalLink
+from flame_mcp.journal_records import IntentRecord
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.timeline_restore import restore_timeline_checkpoint
-from flame_mcp.types import ServerOpError, ServerResult
+from flame_mcp.types import PHASE_ARG, ServerOpError, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -139,8 +140,7 @@ def _revert_in_place(
         check_current=True,
         expected_current=expected,
         force=force,
-        reverts=group,
-        reverts_intent=view.id,
+        link=JournalLink(reverts=group, reverts_intent=view.id),
         forced_note=overridden,
     )
     body = dict(done.result) if isinstance(done.result, dict) else {}
@@ -181,11 +181,13 @@ def _revert_duplicate(
     ctx: ServerContext, index: Index, group: str, view: IntentView, force: bool
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     overridden = _format_override(ctx, view, view.created_info() or {}, force)
-    profile = (
-        DUPLICATE_REVERT
-        if overridden is None
-        else replace(DUPLICATE_REVERT, intent_extra=lambda _view: {"forced": overridden})
-    )
+    profile = DUPLICATE_REVERT
+    if overridden is not None:
+
+        def add_forced(_view: IntentView, intent: IntentRecord) -> None:
+            intent["forced"] = overridden
+
+        profile = replace(DUPLICATE_REVERT, intent_extra=add_forced)
     done = revert_flow(ctx, index, group, [view], profile)
     body = dict(done.result) if isinstance(done.result, dict) else {}
     item = {

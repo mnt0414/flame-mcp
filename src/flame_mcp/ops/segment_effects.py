@@ -18,11 +18,11 @@ from flame_mcp import selectors
 from flame_mcp.effective_effect import deny_destructive_call
 from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.ops._segment_edit import (
+    CHECK_PHASES,
     CHECKPOINTED_SEGMENT_NOTE,
     SEGMENT_REQUIRES,
     checkpoint_spec,
     edit_source,
-    no_undo_steps,
     seg_args,
     segment_target_param,
 )
@@ -349,8 +349,8 @@ def register(registry: Registry) -> None:
                 undo="checkpoint",
                 params=(target, type_param, *params),
                 accepts=("segment",),
-                undo_steps=no_undo_steps,
                 checkpoint=checkpoint_spec(name, _label(name)),
+                phases=CHECK_PHASES,
                 **kwargs,
             )
         )
@@ -361,6 +361,7 @@ def register(registry: Registry) -> None:
         _CREATE_DESCRIPTION,
         (),
         to_python=_create_to_python,
+        brief_paths=("position",),
         requires=("PySegment.create_effect", *EFFECT_REQUIRES),
     )
     checkpointed(
@@ -369,6 +370,7 @@ def register(registry: Registry) -> None:
         _DELETE_DESCRIPTION,
         (),
         to_python=_delete_to_python,
+        brief_paths=("position",),
         requires=("flame.delete", *EFFECT_REQUIRES),
     )
     checkpointed(
@@ -384,6 +386,7 @@ def register(registry: Registry) -> None:
             ),
         ),
         to_python=_set_to_python,
+        brief_paths=("position",),
         precheck=_set_precheck,
         requires=("PyAttribute.values", "PyAttribute.set_value", *EFFECT_REQUIRES),
     )
@@ -393,6 +396,7 @@ def register(registry: Registry) -> None:
         _LOAD_DESCRIPTION,
         (_path_param("Absolute path of an existing effect setup file (with its extension)."),),
         to_python=_load_to_python,
+        brief_paths=("position",),
         precheck=_load_precheck,
         requires=("PyTimelineFX.load_setup", *EFFECT_REQUIRES),
     )
@@ -402,12 +406,14 @@ def register(registry: Registry) -> None:
         _EDIT_DESCRIPTION,
         (values_param("effect"), keep_files_param()),
         to_python=_edit_to_python,
+        brief_paths=("position",),
         precheck=values_precheck,
         requires=("PyTimelineFX.save_setup", "PyTimelineFX.load_setup", *EFFECT_REQUIRES),
     )
     registry.register(
         OperationSpec(
             name=SAVE_OP,
+            brief_paths=("files",),
             category="segment",
             description=_SAVE_DESCRIPTION,
             effect="create",
@@ -435,7 +441,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment",),
             to_python=_save_to_python,
-            undo_steps=no_undo_steps,
             precheck=_save_precheck,
             requires=("PyTimelineFX.save_setup", *EFFECT_REQUIRES),
         )

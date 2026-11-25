@@ -15,7 +15,7 @@ from flame_mcp.desktop_reorder_run import (
 )
 from flame_mcp.ops._common import build_source
 from flame_mcp.registry import Registry
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import OperationParam, OperationSpec, PlanKind, PlanUse, Refusal, SelectorKind
 
 _DESTINATION_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path")
 
@@ -46,7 +46,7 @@ _DESCRIPTION = (
     "Undo: journal.revert(group) puts the old order back with the same kind of move: the entries "
     "that must move (they can include ones the reorder left alone) get new uids again. It is "
     "CONFLICT, with nothing moved, when the reel no longer holds the entries the reorder left. "
-    "Native Ctrl+Z is not used (undoSteps 0). Not allowed in plan.run."
+    "Native Ctrl+Z is not used. Not allowed in plan.run."
 )
 
 
@@ -100,14 +100,22 @@ def _reorder_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
+_PLAN_USE_DESKTOP_REORDER = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "desktop.reorder cannot be a plan step: it journals a `desktop_move` intent that is "
+        "reverted by moving the entries back (they get new uids), and a plan's single group is "
+        "reverted by putting attribute values back -- it would skip such an intent without "
+        "saying so. Call it on its own"
+    ),
+)
 
 
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=REORDER_OP,
+            plan_use=_PLAN_USE_DESKTOP_REORDER,
             category="desktop",
             description=_DESCRIPTION,
             effect="create",
@@ -136,7 +144,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=_DESTINATION_KINDS,
             to_python=_reorder_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_reorder_precheck,
             wrap=run_reorder,
             sample_args={

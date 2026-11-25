@@ -18,9 +18,8 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
+import re
 import time
-import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,26 +30,25 @@ import pytest
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 
-from flame_mcp import applog, errors, selectors, transport
+from conftest import shared_registry
+from flame_mcp import agent_context, applog, errors, selectors, transport
 from flame_mcp import server as server_mod
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from flame_mcp.server import create_server
-from flame_mcp.types import Category, OperationParam, OperationSpec, SelectorKind
+from flame_mcp.types import Category, OperationParam, OperationSpec, SelectorKind, Undo
 from flame_mcp_bridge import impl
+from rig_fixtures import scratch_dir_fixture
 from test_bridge_impl import FakeFlame, FakeMainLoop, FakeTimer
 from test_transport import FakeRawBridge, _close_and_write_crash_handler
 
 SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "scratch" / "srv"
+UNDO_CONTRACT_MAX_CHARS = 3500
+"""The undoContract is read in every session: per-op facts belong in the op descriptions, so this
+text must stay short enough to be read once."""
 
 
-@pytest.fixture
-def scratch_dir() -> Iterator[Path]:
-    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
-    d = SCRATCH_ROOT / uuid.uuid4().hex[:8]
-    d.mkdir(parents=True, exist_ok=True)
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+scratch_dir = scratch_dir_fixture(SCRATCH_ROOT)
 
 
 @pytest.fixture
@@ -171,7 +169,6 @@ def make_test_registry() -> Registry:
             ),
             to_python=_write_to_python,
             verify=_write_verify,
-            undo_steps=lambda args, affected: affected,
         )
     )
     registry.register(
@@ -534,7 +531,7 @@ def test_flame_do_read_op_success(bridge: impl.Bridge, loop: FakeMainLoop, run_d
     anyio.run(main)
 
 
-def test_flame_do_write_op_success_and_undo_steps(
+def test_flame_do_write_op_success_without_undo_steps(
     bridge: impl.Bridge, loop: FakeMainLoop, run_dir: Path
 ) -> None:
     async def main() -> None:
@@ -547,7 +544,7 @@ def test_flame_do_write_op_success_and_undo_steps(
             env = _structured(result)
             assert env["ok"] is True
             assert env["affected"] == 1
-            assert env["undoSteps"] == 1
+            assert "undoSteps" not in env
             # FakeFlame has no .projects/.media_panel: every rider field must
             # fail independently (None), never raise out of the wrapper.
             assert env["context"] == {"project": None, "workspace": None, "selected": None}
@@ -667,20 +664,20 @@ def test_flame_do_limit_note_precedes_and_survives_spill(
 
 def test_static_context_undo_contract_warns_about_set_value() -> None:
     # Writes through set_value() (desktop.rename and others) are not covered by Ctrl+Z.
-    # Check that the static context warns about this, explains what undoSteps==0 means,
-    # and says how to undo with revert (`_static_context` needs no bridge).
+    # Check that the static context warns about this, says the server does not use
+    # Flame's Undo, and says how to undo with revert (`static_context` needs no bridge).
     registry = make_test_registry()
-    ctx = server_mod._static_context(registry)
+    ctx = agent_context.static_context(registry)
     assert "set_value" in ctx["undoContract"]
     assert "revert" in ctx["undoContract"]
-    assert "undoSteps" in ctx["undoContract"]
+    assert "undoSteps" not in ctx["undoContract"]
 
 
 def test_static_context_undo_contract_claims_only_what_was_measured() -> None:
     # Measured: Ctrl+Z after a set_value write removed an earlier, unrelated operation, on a
     # reel's name on the Desktop and on a Batch node attribute -- nothing wider. The instruction
     # to the AI (no Ctrl+Z, journal.revert only) stays whole.
-    ctx = server_mod._static_context(make_test_registry())
+    ctx = agent_context.static_context(make_test_registry())
     contract = ctx["undoContract"]
     assert "Do not press Ctrl+Z" in contract
     assert "journal.revert" in contract
@@ -691,7 +688,7 @@ def test_static_context_undo_contract_claims_only_what_was_measured() -> None:
 
 
 def test_static_context_set_value_pitfall_claims_only_what_was_measured() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "set_value" in t]
     assert "may not" in text and "reel" in text and "Batch node attribute" in text
     assert "Ctrl+Z" in text and "journal.revert" in text
@@ -699,7 +696,7 @@ def test_static_context_set_value_pitfall_claims_only_what_was_measured() -> Non
 
 
 def test_static_context_has_a_pitfall_about_the_bit_depth_resize() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "bit depth" in t and "timeline.create_sequence" in t]
     assert "Resize" in text and "automatically" in text
     assert "cannot be deleted" not in text
@@ -709,14 +706,14 @@ def test_static_context_has_a_pitfall_about_the_bit_depth_resize() -> None:
 
 
 def test_static_context_smart_replace_pitfall_says_the_automatic_resize_stays() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "smart_replace (segment.replace" in t]
     assert "drops the segment's effects" in text and "mode=media" in text
     assert "Resize" in text and "stays" in text and "Flame 2026.2.3" in text
 
 
 def test_static_context_has_the_measured_audio_pitfalls() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (reach,) = [t for t in pitfalls if "audio_tracks[].channels[].segments" in t]
     assert "PyAudioTrack has no .segments" in reach and "video tracks only" in reach
     assert "timeline.list_segments with media='audio'" in reach
@@ -733,7 +730,7 @@ def test_static_context_has_the_measured_audio_pitfalls() -> None:
 
 
 def test_static_context_has_a_pitfall_about_moving_tracks() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "reorders a track" in t]
     assert "timeline.move_track" in text and "rebuilds" in text and "2025.2.4" in text
     assert "measured by listing them" in text
@@ -742,7 +739,7 @@ def test_static_context_has_a_pitfall_about_moving_tracks() -> None:
 
 
 def test_static_context_has_the_pitfall_about_the_length_an_extract_leaves() -> None:
-    pitfalls = [p["text"] for p in server_mod._static_context(make_test_registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(make_test_registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "extract_selection_to_media_panel" in t]
     assert "timeline.delete_segments" in text and "timeline.shorten" in text
     assert "longest content of ANY video track or audio channel" in text
@@ -751,24 +748,65 @@ def test_static_context_has_the_pitfall_about_the_length_an_extract_leaves() -> 
     assert "keeps its length" not in text and "(Flame 2025.2.4). Deleting the last content" in text
 
 
-def test_the_checkpoint_sentence_lists_the_ops_without_a_doubled_and() -> None:
-    contract = server_mod._static_context(make_test_registry())["undoContract"]
-    assert (
-        "effect_load_setup, edit_effect_setup, timeline.delete_segments, timeline.move_track "
-        "and timeline.shorten)" in contract
-    )
-    assert "effect_load_setup and timeline.delete_segments and" not in contract
+def test_undo_contract_lists_every_op_by_its_declared_undo() -> None:
+    registry = shared_registry()
+    contract = agent_context.static_context(registry)["undoContract"]
+    for undo in get_args(Undo):
+        names = sorted(
+            op.name
+            for op in registry.list_ops()
+            if op.undo == undo and not (op.undo == "none" and op.effect == "read")
+        )
+        assert names, undo
+        assert f"undo={undo} (" in contract
+        assert f"): {', '.join(names)}." in contract, undo
+    listing = contract[contract.index("undo=value") : contract.index("Ops with effect=read")]
+    read_ops = {op.name for op in registry.list_ops() if op.effect == "read"}
+    assert read_ops.isdisjoint(re.findall(r"[a-z_]+\.[a-z_]+", listing))
+
+
+def test_undo_contract_is_short_and_leaves_per_op_facts_to_the_descriptions() -> None:
+    contract = agent_context.static_context(shared_registry())["undoContract"]
+    assert len(contract) < UNDO_CONTRACT_MAX_CHARS
+    for per_op_fact in ("savedSetups", "reelsRestored", "result.restored", "newest first"):
+        assert per_op_fact not in contract
+
+
+def test_per_op_undo_facts_live_in_the_op_descriptions() -> None:
+    registry = shared_registry()
+    expected = {
+        "segment.replace": ("connected segments", "journal.revert"),
+        "desktop.copy": ("savedSetups", "librariesOpened"),
+        "desktop.move": ("library contents are not moved",),
+        "desktop.delete": ("library contents are never deleted",),
+        "desktop.arrange": ("newest first",),
+        "desktop.reorder": ("old order",),
+        "journal.purge_checkpoints": ("can no longer be undone",),
+        "segment.effect_save_setup": ("delete it by hand",),
+        "segment.create_connection": ("PRESUMED inverse", "journal.check"),
+        "batch.create_shelf_reel": ("outside a setup",),
+        "batch.load_setup": ("GMask Tracer", "new uids"),
+        "eval.run": ("GMask Tracer", "target group only"),
+        "timeline.shorten": ("new uid", "end of its reel"),
+    }
+    ops = {name: registry.get(name) for name in expected}
+    assert all(op is not None for op in ops.values())
+    missing = {
+        name: [t for t in texts if t not in ops[name].description]  # type: ignore[union-attr]
+        for name, texts in expected.items()
+    }
+    assert {name: m for name, m in missing.items() if m} == {}
 
 
 def test_static_context_has_no_depth_ladder() -> None:
     # No op declares a default depth and none takes a depth argument.
-    assert "depthLadder" not in server_mod._static_context(make_test_registry())
+    assert "depthLadder" not in agent_context.static_context(make_test_registry())
 
 
 def test_static_context_selector_vocabulary_publishes_fields_and_examples() -> None:
     # Each kind's shape and a minimal valid example are published, so the fields the segment
     # selector takes (parent/version/track/index) are discoverable without an error message.
-    ctx = server_mod._static_context(make_test_registry())
+    ctx = agent_context.static_context(make_test_registry())
     vocab = {entry["kind"]: entry for entry in ctx["selectorVocabulary"]}
     assert set(vocab) == set(get_args(SelectorKind))
     segment = vocab["segment"]
@@ -798,6 +836,52 @@ def test_instructions_stay_within_2_kib_and_name_the_core_rules() -> None:
         assert needle in server_mod.INSTRUCTIONS
 
 
+_OP_NAME_PATTERN = re.compile(r"\b[a-z_]+\.[a-z_]+\b")
+RESPONSE_FIELD_NAMES = {"journal.changed", "journal.group", "batch.resolved", "timeline.clip"}
+"""`<category>.<name>` tokens in the agent-facing text that are fields of a response, not ops."""
+
+
+def _op_like_names(text: str, registry: Registry) -> set[str]:
+    categories = set(registry.list_categories())
+    return {token for token in _OP_NAME_PATTERN.findall(text) if token.split(".")[0] in categories}
+
+
+def test_every_op_the_instructions_name_is_registered() -> None:
+    registry = shared_registry()
+    named = _op_like_names(server_mod.INSTRUCTIONS, registry)
+    assert {"journal.revert", "journal.check", "plan.for_each", "eval.run"} <= named
+    assert sorted(name for name in named if registry.get(name) is None) == []
+
+
+def test_every_op_the_undo_contract_and_pitfalls_name_is_registered() -> None:
+    registry = shared_registry()
+    context = agent_context.static_context(registry)
+    pitfalls = " ".join(pitfall["text"] for pitfall in context["pitfalls"])
+    for source, text in (("undoContract", context["undoContract"]), ("pitfalls", pitfalls)):
+        named = _op_like_names(text, registry)
+        unknown = sorted(n for n in named if registry.get(n) is None)
+        assert [n for n in unknown if n not in RESPONSE_FIELD_NAMES] == [], source
+
+
+def test_every_op_the_op_and_argument_descriptions_name_is_registered() -> None:
+    registry = shared_registry()
+    unknown: dict[str, list[str]] = {}
+    for op in registry.list_ops():
+        texts = [(op.name, op.description)]
+        texts += [(f"{op.name}({param.name})", param.description) for param in op.params]
+        for where, text in texts:
+            for name in _op_like_names(text, registry):
+                if registry.get(name) is None and name not in RESPONSE_FIELD_NAMES:
+                    unknown.setdefault(name, []).append(where)
+    assert unknown == {}
+
+
+def test_the_op_name_check_catches_an_unregistered_name() -> None:
+    registry = shared_registry()
+    named = _op_like_names("use journal.revert then journal.nonexistent_op", registry)
+    assert [n for n in named if registry.get(n) is None] == ["journal.nonexistent_op"]
+
+
 def test_instructions_tell_the_model_to_ask_the_user_before_irreversible_operations() -> None:
     text = server_mod.INSTRUCTIONS
     for needle in (
@@ -825,7 +909,7 @@ def test_instructions_reach_the_client_on_initialize(run_dir: Path) -> None:
 
 
 def test_static_context_pitfalls_each_carry_only_text() -> None:
-    pitfalls = server_mod._static_context(make_test_registry())["pitfalls"]
+    pitfalls = agent_context.static_context(make_test_registry())["pitfalls"]
     assert len(pitfalls) >= 8
     for pitfall in pitfalls:
         assert set(pitfall) == {"text"}

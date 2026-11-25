@@ -19,11 +19,13 @@ from typing import Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ, pre_read_failure
-from flame_mcp.journal import new_id, now_iso
+from flame_mcp.desktop_run import PHASE_READ, pre_read_failure
+from flame_mcp.errors import PARTIAL_PREFIX
+from flame_mcp.journal import JournalLink, new_id
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.tc_rules import STATUS_SKIPPED, STATUS_SYNC, judge
 from flame_mcp.transport import elapsed_ms
+from flame_mcp.types import PHASE_ARG
 
 SYNC_OP: Final[str] = "desktop.sync_record_tc"
 SET_OP: Final[str] = "desktop.set_record_tc"
@@ -82,7 +84,7 @@ def _write_row(rt: Any, group: str, row: dict[str, Any]) -> tuple[dict[str, Any]
     """Write one `sync` row; the child's envelope and, when it failed, why."""
     if not isinstance(row["selector"], dict):
         return {}, "the clip has no wiretap id, so it cannot be found again for the write"
-    env = rt.call(SET_OP, _set_args(row), group=group)
+    env = rt.call(SET_OP, _set_args(row), link=JournalLink(group))
     result = env.get("result") if isinstance(env.get("result"), dict) else {}
     row["intent"] = (env.get("journal") or {}).get("id")
     if env.get("ok") is not True:
@@ -111,84 +113,64 @@ def run_sync(
 ) -> dict[str, Any]:
     started = time.monotonic()
     meta = envelope_mod.execution_meta(op)
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        pre = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        raw = pre.get("result")
-        facts = raw.get("rows") if isinstance(raw, dict) else None
-        if pre.get("ok") is not True or not isinstance(facts, list):
-            return pre_read_failure(op, pre, "written")
-        wanted = len(op_args["targets"])
-        if len(facts) != wanted:
-            return pre_read_failure(
-                op,
-                {
-                    **pre,
-                    "ok": False,
-                    "errorCode": "FLAME_API_ERROR",
-                    "error": f"the read answered for {len(facts)} of {wanted} targets",
-                },
-                "written",
-            )
-        rows = build_rows(facts, bool(op_args.get("include_risky", False)))
-        todo = [r for r in rows if r["status"] == STATUS_SYNC]
-        body: dict[str, Any] = {"dryRun": bool(op_args.get("dry_run", False)), "rows": rows}
-        if body["dryRun"] or not todo:
-            body["counts"] = _tally(rows)
-            return _answer(op, body, meta, started, None, written=0)
-        group_id = group if group is not None else new_id("g")
-        try:
-            rt.journal.append(
-                {
-                    "type": "group",
-                    "group": group_id,
-                    "ts": now_iso(),
-                    "kind": GROUP_KIND,
-                    "label": None,
-                    "steps": [SET_OP] * len(todo),
-                }
-            )
-        except OSError as exc:
-            return _answer(
-                op,
-                {**body, "counts": _tally(rows)},
-                meta,
-                started,
-                None,
-                written=0,
-                refusal=(
-                    "POLICY_DENIED",
-                    f"nothing was written: the journal cannot be written ({exc})",
-                ),
-            )
-        failure: str | None = None
-        written = 0
-        for row in todo:
-            _env, why = _write_row(rt, group_id, row)
-            if why is not None:
-                failure = f"{row['name']!r}: {why}"
-                row["status"] = "failed"
-                row["note"] = why
-                break
-            written += 1
-        for row in todo:
-            if row["status"] == STATUS_SYNC:
-                row["status"] = "not_run"
+    pre = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
+    raw = pre.get("result")
+    facts = raw.get("rows") if isinstance(raw, dict) else None
+    if pre.get("ok") is not True or not isinstance(facts, list):
+        return pre_read_failure(op, pre, "written")
+    wanted = len(op_args["targets"])
+    if len(facts) != wanted:
+        return pre_read_failure(
+            op,
+            {
+                **pre,
+                "ok": False,
+                "errorCode": "FLAME_API_ERROR",
+                "error": f"the read answered for {len(facts)} of {wanted} targets",
+            },
+            "written",
+        )
+    rows = build_rows(facts, bool(op_args.get("include_risky", False)))
+    todo = [r for r in rows if r["status"] == STATUS_SYNC]
+    body: dict[str, Any] = {"dryRun": bool(op_args.get("dry_run", False)), "rows": rows}
+    if body["dryRun"] or not todo:
         body["counts"] = _tally(rows)
-        journal = {
-            "group": group_id,
-            "id": next((r["intent"] for r in todo if r.get("intent")), None),
-            "revert": {"op": "journal.revert", "args": {"group": group_id}} if written else None,
-        }
-        return _answer(op, body, meta, started, journal, written=written, failure=failure)
+        return _answer(op, body, meta, started, None, written=0)
+    group_id = group if group is not None else new_id("g")
+    why = rt.journal.append_group(group_id, GROUP_KIND, label=None, steps=[SET_OP] * len(todo))
+    if why is not None:
+        return _answer(
+            op,
+            {**body, "counts": _tally(rows)},
+            meta,
+            started,
+            None,
+            written=0,
+            refusal=(
+                "POLICY_DENIED",
+                f"nothing was written: the journal cannot be written ({why})",
+            ),
+        )
+    failure: str | None = None
+    written = 0
+    for row in todo:
+        _env, why = _write_row(rt, group_id, row)
+        if why is not None:
+            failure = f"{row['name']!r}: {why}"
+            row["status"] = "failed"
+            row["note"] = why
+            break
+        written += 1
+    for row in todo:
+        if row["status"] == STATUS_SYNC:
+            row["status"] = "not_run"
+    body["counts"] = _tally(rows)
+    journal = {
+        "group": group_id,
+        "id": next((r["intent"] for r in todo if r.get("intent")), None),
+        "revert": {"op": "journal.revert", "args": {"group": group_id}} if written else None,
+    }
+    return _answer(op, body, meta, started, journal, written=written, failure=failure)
 
 
 def _answer(
@@ -208,7 +190,7 @@ def _answer(
     if refusal is not None:
         code, error = refusal
     elif failure is not None:
-        code, error = "FLAME_API_ERROR", ("partial: " if written else "") + failure
+        code, error = "FLAME_API_ERROR", (f"{PARTIAL_PREFIX} " if written else "") + failure
         if written:
             partial = {"synced": written, "notSynced": len(body["rows"]) - written}
     env = envelope_mod.build_envelope(

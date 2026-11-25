@@ -34,14 +34,13 @@ from media_p31b_helpers import (
     states,
     wt,
 )
+from rig_fixtures import rig_fixture
 
 REORDER = "desktop.reorder"
 MOVE = "desktop.move"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 def reel2(rig: Rig) -> Any:
@@ -86,7 +85,7 @@ def test_one_entry_that_goes_last_is_the_only_one_moved_and_the_others_keep_thei
     (mapped,) = result["uidMap"]
     assert mapped["name"] == "a" and mapped["from"] == before["a"] and mapped["to"] == after["a"]
     assert mapped["selector"]["kind"] == "wiretap"
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert env["execution"]["effect"] == "create"
     assert any("uid" in note for note in result["notes"])
     assert len(rig.flame.media_panel.move_calls) == 1
@@ -323,7 +322,6 @@ def test_declaration_of_reorder() -> None:
     op = registry.get(REORDER)
     assert op is not None
     assert (op.effect, op.thread, op.undo, op.category) == ("create", "main", "value", "desktop")
-    assert op.undo_steps({}, 1) == 0
     assert op.precheck is not None and op.wrap is not None and op.to_python is not None
     assert {p.name for p in op.params} == {"destination", "order"}
     for word in ("journal.revert", "plan.run", "uid", "NEW uid", "SILENT_NOOP"):

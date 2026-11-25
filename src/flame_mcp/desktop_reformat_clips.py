@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from flame_mcp import execution
-from flame_mcp.checkpointed import note_unresolved
 from flame_mcp.desktop_reformat_state import (
     DUPLICATE,
     IN_PLACE,
@@ -26,16 +25,22 @@ from flame_mcp.desktop_reformat_state import (
 )
 from flame_mcp.desktop_run import (
     EXPECTED_ARG,
-    PHASE_ARG,
     PHASE_WRITE,
     WRITE_TIMEOUT_S,
     partial_verdict,
 )
 from flame_mcp.journal import KIND_DESKTOP_REFORMAT, new_id, now_iso
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import (
+    UNKNOWN_END_CODES,
+    close_outcome,
+    note_unresolved,
+    outcome_not_journaled_note,
+)
+from flame_mcp.types import PHASE_ARG
 
 
-def _intent_record(run: Run, index: int, row: dict[str, Any], intent_id: str) -> dict[str, Any]:
+def _intent_record(run: Run, index: int, row: dict[str, Any], intent_id: str) -> IntentRecord:
     stash = run.stashed.get(index)
     parent = row.get("parent") or {}
     return {
@@ -77,12 +82,11 @@ def _unknown_end(run: Run, env: dict[str, Any], intent_id: str, index: int) -> b
     if code not in UNKNOWN_END_CODES and not (env.get("ok") is True and pending):
         return False
     shut = str(code) if code in UNKNOWN_END_CODES else "TIMEOUT"
-    run.rt.guard.block(intent_id, run.group, OP_NAME, shut)
     noted = dict(env)
     if code not in UNKNOWN_END_CODES:
         noted["errorCode"] = shut
         noted["error"] = "the call was still running when the wait ended (a pending handle)"
-    note_unresolved(run.rt, intent_id, run.group, noted)
+    note_unresolved(run.rt, intent_id, run.group, noted, OP_NAME, shut)
     name = run.rows[index].get("name")
     run.stop = {
         "code": shut,
@@ -97,28 +101,34 @@ def _unknown_end(run: Run, env: dict[str, Any], intent_id: str, index: int) -> b
     return True
 
 
-def _append(run: Run, record: dict[str, Any], index: int, what: str) -> bool:
-    """Append a journal record; False when the journal cannot be written (the run then stops)."""
+def _append(run: Run, record: IntentRecord, index: int, what: str) -> bool:
+    """Append an intent record; False when the journal cannot be written (the run then stops)."""
     try:
         run.rt.journal.append(record)
     except OSError as exc:
-        if record.get("type") == "outcome":
-            run.rt.guard.block(
-                str(record.get("id")), run.group, OP_NAME, "JOURNAL_OUTCOME_NOT_WRITTEN"
-            )
-            run.degraded.append(
-                f"the outcome of targets[{index}] could not be journaled ({exc}); the answer "
-                "stands but this server now refuses writes until journal.check has settled the "
-                "intent"
-            )
-        run.stop = {
-            "code": "POLICY_DENIED",
-            "message": f"targets[{index}]: the journal cannot be written ({exc}), and this "
-            f"server does not {what} without it",
-            "index": index,
-        }
-        return False
+        return _journal_refused(run, exc, index, what)
     return True
+
+
+def _append_outcome(run: Run, record: OutcomeRecord, index: int, what: str) -> bool:
+    """Close an intent with its outcome; False when it cannot be written (the run then stops)."""
+    exc = close_outcome(run.rt, record, record["id"], run.group, OP_NAME)
+    if exc is None:
+        return True
+    run.degraded.append(
+        outcome_not_journaled_note(exc, "the answer", f"the outcome of targets[{index}]")
+    )
+    return _journal_refused(run, exc, index, what)
+
+
+def _journal_refused(run: Run, exc: OSError, index: int, what: str) -> bool:
+    run.stop = {
+        "code": "POLICY_DENIED",
+        "message": f"targets[{index}]: the journal cannot be written ({exc}), and this "
+        f"server does not {what} without it",
+        "index": index,
+    }
+    return False
 
 
 def _ident_after(
@@ -134,13 +144,13 @@ def _ident_after(
     return after
 
 
-def _uid_link(old_uid: Any, result: Mapping[str, Any]) -> dict[str, str]:
+def _uid_link(old_uid: Any, result: Mapping[str, Any]) -> tuple[str, str] | None:
     """`replacedUid` -> `targetUid` for the outcome when the write gave the clip another uid, so a
     later revert finds the clip through `timeline_restore.uid_chain` even after more writes."""
     new_uid = (_ident_after(result, None) or {}).get("uid")
     if isinstance(old_uid, str) and isinstance(new_uid, str) and new_uid != old_uid:
-        return {"replacedUid": old_uid, "targetUid": new_uid}
-    return {}
+        return old_uid, new_uid
+    return None
 
 
 def _created_in_place(
@@ -246,10 +256,9 @@ def _outcome_record(
     result: Mapping[str, Any],
     created: dict[str, Any] | None,
     old_uid: Any = None,
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     ok = env.get("ok") is True
-    return {
-        **_uid_link(old_uid, result),
+    record: OutcomeRecord = {
         "type": "outcome",
         "id": intent_id,
         "group": run.group,
@@ -261,8 +270,15 @@ def _outcome_record(
         "readBack": {"before": result.get("before"), "after": result.get("after")},
         "created": created,
         "fingerprintAfter": result.get("fingerprintAfter"),
-        **partial_verdict(ok, created),
     }
+    verdict = partial_verdict(ok, created)
+    if verdict is not None:
+        record["verdict"] = verdict
+    link = _uid_link(old_uid, result)
+    if link is None:
+        return record
+    # the journal line has always started with the uid link
+    return cast(OutcomeRecord, {"replacedUid": link[0], "targetUid": link[1], **record})
 
 
 def _write_args(target: Mapping[str, Any], spec: dict[str, Any], expected: Any) -> dict[str, Any]:
@@ -311,7 +327,7 @@ def clip_in_place(run: Run, index: int, row: dict[str, Any]) -> bool:
     run.created_any = run.created_any or created is not None
     _file_result(run, index, row, env, result, made=None, seconds=seconds)
     outcome = _outcome_record(run, intent_id, env, result, created, row.get("uid"))
-    return _append(run, outcome, index, "go on")
+    return _append_outcome(run, outcome, index, "go on")
 
 
 def _expected_siblings(run: Run, row: dict[str, Any]) -> list[Any]:
@@ -349,7 +365,7 @@ def clip_duplicate(run: Run, index: int, row: dict[str, Any]) -> bool:
         _file_result(
             run, index, row, failed_env, result, made=None, seconds=time.monotonic() - began
         )
-        return _append(
+        return _append_outcome(
             run, _outcome_record(run, intent_id, failed_env, result, None), index, "go on"
         )
     write_env = execution.run_op(
@@ -372,4 +388,4 @@ def clip_duplicate(run: Run, index: int, row: dict[str, Any]) -> bool:
     result["changed"] = bool(result.get("changed"))
     _file_result(run, index, row, write_env, result, made=made, seconds=seconds)
     outcome = _outcome_record(run, intent_id, write_env, result, created, made.get("uid"))
-    return _append(run, outcome, index, "go on")
+    return _append_outcome(run, outcome, index, "go on")

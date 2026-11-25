@@ -23,17 +23,15 @@ from flame_mcp import server as server_mod
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig, bridge_result, make_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import CLIPX, S1, make_timeline_rig, media, wt
+
+rig = rig_fixture(make_timeline_rig)
 
 OP = "render.export"
 HEX32 = "0123456789abcdef"
 IMAGE_PRESET = "<preset version='14'><type>image</type></preset>"
 MOVIE_PRESET = "<preset version='14'><type>movie</type></preset>"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 @pytest.fixture
@@ -146,7 +144,7 @@ def test_an_image_sequence_is_exported_and_the_new_files_are_listed(
     assert result["betweenMarks"] is False and "unsupported" in result["undo"]
     assert result["target"]["name"] == "CLIPX" and result["target"]["uid"] == uid_of(clip)
     assert result["target"]["selector"] == CLIPX and result["elapsedS"] is not None
-    assert env["affected"] == 24 and env["undoSteps"] == 0 and env["degraded"] == []
+    assert env["affected"] == 24 and env["degraded"] == []
     assert env["partial"] is None and env["journal"]["undo"] == "unsupported"
     assert env["journal"]["revert"] is None
     (call,) = rig.flame.export.calls
@@ -1015,20 +1013,23 @@ def preset_file(tmp_path: Path, text: str, name: str = "p.xml") -> str:
 
 
 def test_preset_type_reads_the_type_element(tmp_path: Path) -> None:
-    assert export_run.preset_type(preset_file(tmp_path, IMAGE_PRESET)) == "image"
-    assert export_run.preset_type(preset_file(tmp_path, MOVIE_PRESET, "m.XML")) == "movie"
+    assert export_run.preset_facts(preset_file(tmp_path, IMAGE_PRESET)).type == "image"
+    assert export_run.preset_facts(preset_file(tmp_path, MOVIE_PRESET, "m.XML")).type == "movie"
 
 
 def test_preset_type_is_none_for_a_file_that_says_nothing(tmp_path: Path) -> None:
-    assert export_run.preset_type(preset_file(tmp_path, "this is not xml")) is None
+    assert export_run.preset_facts(preset_file(tmp_path, "this is not xml")).type is None
     assert (
-        export_run.preset_type(preset_file(tmp_path, "<preset><comment>x</comment></preset>"))
+        export_run.preset_facts(preset_file(tmp_path, "<preset><comment>x</comment></preset>")).type
         is None
     )
-    assert export_run.preset_type(preset_file(tmp_path, "<preset><type> </type></preset>")) is None
-    assert export_run.preset_type(str(tmp_path / "missing.xml")) is None
+    assert (
+        export_run.preset_facts(preset_file(tmp_path, "<preset><type> </type></preset>")).type
+        is None
+    )
+    assert export_run.preset_facts(str(tmp_path / "missing.xml")).type is None
     big = "<preset><type>image</type><!--" + "x" * export_run.PRESET_MAX_BYTES + "--></preset>"
-    assert export_run.preset_type(preset_file(tmp_path, big, "big.xml")) is None
+    assert export_run.preset_facts(preset_file(tmp_path, big, "big.xml")).type is None
 
 
 def test_expected_frames_is_the_duration_for_an_image_sequence_only(tmp_path: Path) -> None:
@@ -1339,4 +1340,3 @@ def test_the_declarations(rig: Rig) -> None:
         "skip_colour_check",
     ]
     assert "allow_overwrite" not in {p.name for p in op.params}
-    assert op.undo_steps is not None and op.undo_steps({}, 5) == 0

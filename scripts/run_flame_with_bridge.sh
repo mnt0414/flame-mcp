@@ -21,7 +21,7 @@
 #
 # Usage: run_flame_with_bridge.sh <client.py> [TIMEOUT] [-- client args...]
 #   <client.py>   client script to run with the .venv Python (required)
-#   [TIMEOUT]     seconds to wait for Flame to exit by itself (default 600)
+#   [TIMEOUT]     seconds to wait for Flame to exit by itself (default 120)
 #   [-- args...]  everything after `--` is passed to the client unchanged
 #
 # This script starts Flame itself.
@@ -38,7 +38,7 @@ fi
 CLIENT_PY="$1"
 shift
 
-TIMEOUT=600
+TIMEOUT=120
 if [ $# -gt 0 ] && [ "$1" != "--" ]; then
     case "$1" in
         ''|*[!0-9]*) : ;;  # Not all digits, so this is not a TIMEOUT: keep the default and do not shift.
@@ -217,6 +217,7 @@ if [ -n "$flame_pid" ]; then
             sleep "$POLL_INTERVAL"
             elapsed=$((elapsed + POLL_INTERVAL))
         done
+        echo "Waited ${elapsed}s for the exit (outcome: $outcome)."
     fi
 fi
 

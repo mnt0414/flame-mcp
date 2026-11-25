@@ -19,9 +19,11 @@ from flame_mcp.journal import (
     IntentView,
     now_iso,
 )
+from flame_mcp.journal_records import CheckRecord, PolledRecord
 from flame_mcp.render_files import OutputSpec, Stat, list_directory, spec_frames_present
-from flame_mcp.render_run import BRIDGE_BUSY_CODES, BRIDGE_BUSY_NOTE, frames_verdict, judge_render
-from flame_mcp.transport import BridgeProtocolError, BridgeResult
+from flame_mcp.render_run import frames_verdict, judge_render
+from flame_mcp.transport import BridgeProtocolError, BridgeResult, UnknownHandleError
+from flame_mcp.write_run import BRIDGE_BUSY_CODES, BRIDGE_BUSY_NOTE
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -52,9 +54,9 @@ def poll_handle(ctx: ServerContext, handle: str) -> Polled:
     (`_send_request`); a BridgeResult with an error code is a transport failure."""
     try:
         br = transport.poll(handle, run_dir=ctx.run_dir)
+    except UnknownHandleError as exc:
+        return Polled("unknown_handle", message=str(exc))
     except BridgeProtocolError as exc:
-        if "unknown handle" in str(exc):
-            return Polled("unknown_handle", message=str(exc))
         return Polled("unreachable", code="PROTOCOL_ERROR", message=str(exc))
     if br.error_code in _POLL_TRANSPORT_CODES:
         return Polled("unreachable", br, br.error_code, br.error)
@@ -65,10 +67,9 @@ def poll_handle(ctx: ServerContext, handle: str) -> Polled:
 
 def _polled_record(
     ctx: ServerContext, view: IntentView, handle: str, br: BridgeResult, op_name: str
-) -> dict[str, Any]:
+) -> PolledRecord:
     op = ctx.registry.get(op_name)
-    args = view.intent.get("args") or {}
-    env = envelope_mod.from_bridge_result(op, args, br) if op is not None else {}
+    env = envelope_mod.from_bridge_result(op, br) if op is not None else {}
     flame = env.get("result")
     return {
         "type": "polled",
@@ -152,22 +153,47 @@ def _append_check(
     verdict: str,
     per_key: Mapping[str, Any],
     current: Mapping[str, Any],
-    **extra: Any,
+    *,
+    basis: str | None = None,
+    render_outcome: dict[str, Any] | None = None,
+    export_outcome: dict[str, Any] | None = None,
+    still_outcome: dict[str, Any] | None = None,
+    flame: dict[str, Any] | None = None,
 ) -> None:
-    ctx.journal.append(
-        {
-            "type": "check",
-            "id": view.id,
-            "group": view.group,
-            "ts": now_iso(),
-            "verdict": verdict,
-            "perKey": dict(per_key),
-            "current": dict(current),
-            "target": view.intent.get("target"),
-            **extra,
-        }
-    )
+    check: CheckRecord = {
+        "type": "check",
+        "id": view.id,
+        "group": view.group,
+        "ts": now_iso(),
+        "verdict": verdict,
+        "perKey": dict(per_key),
+        "current": dict(current),
+        "target": view.intent.get("target"),
+    }
+    if basis is not None:
+        check["basis"] = basis
+    if render_outcome is not None:
+        check["renderOutcome"] = render_outcome
+    if export_outcome is not None:
+        check["exportOutcome"] = export_outcome
+    if still_outcome is not None:
+        check["stillOutcome"] = still_outcome
+    if flame is not None:
+        check["flame"] = flame
+    ctx.journal.append(check)
     ctx.guard.release(view.id)
+
+
+def verdict_after_run(*, ok: bool, code: str | None, wrote_part: bool) -> str:
+    """The verdict of an ended run that is judged by what it wrote: landed (all is well), partial
+    (`wrote_part`: some of it is there), not_landed (SILENT_NOOP), failed (anything else)."""
+    if ok:
+        return STATE_LANDED
+    if wrote_part:
+        return STATE_PARTIAL
+    if code == "SILENT_NOOP":
+        return STATE_NOT_LANDED
+    return STATE_FAILED
 
 
 def _check_with_result(
@@ -190,14 +216,7 @@ def _check_with_result(
         expected=expected,
         checked=bool(rows),
     )
-    if judged.ok:
-        verdict = STATE_LANDED
-    elif 0 < written < expected:
-        verdict = STATE_PARTIAL
-    elif judged.code == "SILENT_NOOP":
-        verdict = STATE_NOT_LANDED
-    else:
-        verdict = STATE_FAILED
+    verdict = verdict_after_run(ok=judged.ok, code=judged.code, wrote_part=0 < written < expected)
     per_key = {
         str(r["node"]): (
             STATE_LANDED
@@ -242,7 +261,7 @@ def _check_with_result(
         per_key,
         current,
         basis="handle",
-        renderOutcome=outcome,
+        render_outcome=outcome,
         flame=flame_saved,
     )
     return entry

@@ -53,10 +53,9 @@ from flame_mcp.desktop_reformat_state import (
     STASH_BATCH,
     Run,
     build_spec,
-    elapsed_ms,
     requested_of,
 )
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ, pre_read_failure
+from flame_mcp.desktop_run import PHASE_READ, pre_read_failure
 from flame_mcp.journal import new_id
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.library_open import merge_into_envelope
@@ -67,29 +66,9 @@ from flame_mcp.timeline_checkpoints import (
     checkpoint_library_name,
     stash_reel_name,
 )
-from flame_mcp.types import ErrorCode
+from flame_mcp.types import PHASE_ARG
 
 __all__ = ["OP_NAME", "run_reformat"]
-
-
-def _refuse(
-    op: RegisteredOperation,
-    code: ErrorCode,
-    message: str,
-    started: float,
-    *,
-    result: Any = None,
-    hint: str | None = None,
-) -> dict[str, Any]:
-    return envelope_mod.build_envelope(
-        ok=False,
-        result=result,
-        error=message,
-        error_code=code,
-        execution=envelope_mod.execution_meta(op),
-        duration_ms=elapsed_ms(started),
-        hint_override=hint,
-    )
 
 
 def aspect_rows(rows: list[dict[str, Any]], width: int, height: int) -> list[dict[str, Any]]:
@@ -128,7 +107,7 @@ def _aspect_refusal(
     listed = ", ".join(
         f"targets[{r['index']}] {r['name']!r} has ratio {r['clipRatio']}" for r in wrong
     )
-    return _refuse(
+    return envelope_mod.refusal(
         op,
         "PRECONDITION_UNMET",
         f"nothing was written: the requested {width}x{height} has ratio "
@@ -243,52 +222,42 @@ def run_reformat(
 ) -> dict[str, Any]:
     """The `wrap` of `desktop.reformat`."""
     started = time.monotonic()
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        if pre_env.get("ok") is not True or not isinstance(pre_env.get("result"), dict):
-            return _fail_pre_read(op, pre_env)
-        pre: dict[str, Any] = pre_env["result"]
-        rows = [r for r in pre.get("sources") or [] if isinstance(r, dict)]
-        wanted = len(op_args["targets"])
-        if len(rows) != wanted:
-            answer = f"the read answered for {len(rows)} of {wanted} targets"
-            return _fail_pre_read(
-                op, {**pre_env, "ok": False, "errorCode": "FLAME_API_ERROR", "error": answer}
-            )
-        refused = _aspect_refusal(op, op_args, rows, started)
-        if refused is not None:
-            merge_into_envelope(refused, pre)
-            return refused
-        spec = build_spec(op_args)
-        run = Run(
-            rt=rt,
-            op=op,
-            op_args=op_args,
-            group=group if group is not None else new_id("g"),
-            rows=rows,
-            spec=spec,
-            requested=requested_of(spec),
-            duplicate=bool(op_args.get("duplicate", False)),
+    pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
+    if pre_env.get("ok") is not True or not isinstance(pre_env.get("result"), dict):
+        return _fail_pre_read(op, pre_env)
+    pre: dict[str, Any] = pre_env["result"]
+    rows = [r for r in pre.get("sources") or [] if isinstance(r, dict)]
+    wanted = len(op_args["targets"])
+    if len(rows) != wanted:
+        answer = f"the read answered for {len(rows)} of {wanted} targets"
+        return _fail_pre_read(
+            op, {**pre_env, "ok": False, "errorCode": "FLAME_API_ERROR", "error": answer}
         )
-        if not run.duplicate:
-            stashed = _stash_all(run)
-            if stashed is not None:
-                merge_into_envelope(stashed, pre)
-                return stashed
-        for index, row in enumerate(rows):
-            run.next_index = index
-            clip = clip_duplicate if run.duplicate else clip_in_place
-            if not clip(run, index, row):
-                break
-        env = finish(run, started)
-        merge_into_envelope(env, pre)
-        return env
+    refused = _aspect_refusal(op, op_args, rows, started)
+    if refused is not None:
+        merge_into_envelope(refused, pre)
+        return refused
+    spec = build_spec(op_args)
+    run = Run(
+        rt=rt,
+        op=op,
+        op_args=op_args,
+        group=group if group is not None else new_id("g"),
+        rows=rows,
+        spec=spec,
+        requested=requested_of(spec),
+        duplicate=bool(op_args.get("duplicate", False)),
+    )
+    if not run.duplicate:
+        stashed = _stash_all(run)
+        if stashed is not None:
+            merge_into_envelope(stashed, pre)
+            return stashed
+    for index, row in enumerate(rows):
+        run.next_index = index
+        clip = clip_duplicate if run.duplicate else clip_in_place
+        if not clip(run, index, row):
+            break
+    env = finish(run, started)
+    merge_into_envelope(env, pre)
+    return env

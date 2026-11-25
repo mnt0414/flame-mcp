@@ -35,22 +35,19 @@ import re
 import secrets
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import execution
-from flame_mcp.checkpointed import ASCII_REFUSAL_HINT, _first_non_ascii
 from flame_mcp.desktop_run import (
     EXPECTED_ARG,
-    PHASE_ARG,
-    PHASE_READ,
     PHASE_WRITE,
-    pre_read_failure,
 )
 from flame_mcp.export_run import (
     EXISTING_CAP,
     NOTHING_WRITTEN,
+    Written,
     before_stats_of,
     count_written,
     directory_before,
@@ -59,7 +56,8 @@ from flame_mcp.export_run import (
     unsure_reason,
 )
 from flame_mcp.journal import new_id, now_iso
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import close_outcome, outcome_not_journaled_note
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_clip_run import _stable_selector, target_info
 from flame_mcp.render_files import (
@@ -69,15 +67,6 @@ from flame_mcp.render_files import (
     Tree,
     scan_tree,
     visible_entries,
-)
-from flame_mcp.render_run import (
-    HANDLE_SOURCE_CLIENT,
-    RenderJudgement,
-    _fail_env,
-    _new_client_handle,
-    _refusal,
-    _remove_result_file,
-    _unknown_end,
 )
 from flame_mcp.still_proxy import (
     PROXY_MIME,
@@ -92,6 +81,18 @@ from flame_mcp.still_proxy import (
     stills_root,
 )
 from flame_mcp.transport import elapsed_ms
+from flame_mcp.types import PHASE_ARG
+from flame_mcp.write_run import (
+    HANDLE_SOURCE_CLIENT,
+    Refused,
+    RenderJudgement,
+    append_intent,
+    check_ascii,
+    fail_env,
+    new_client_handle,
+    read_facts,
+    run_and_close,
+)
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -190,7 +191,7 @@ def _intent_record(
     group_id: str,
     timeout_s: float,
     handle: str | None,
-) -> dict[str, Any]:
+) -> IntentRecord:
     before_files, hidden_count = directory_before(before)
     return {
         "type": "intent",
@@ -229,7 +230,7 @@ def _outcome_record(
     flame: Mapping[str, Any],
     written: int,
     unsure: str | None,
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     return {
         "type": "outcome",
         "id": intent_id,
@@ -252,7 +253,7 @@ def _outcome_record(
 
 
 def _ffmpeg_refusal(op: RegisteredOperation, started: float, result: Any = None) -> dict[str, Any]:
-    return _refusal(
+    return envelope_mod.refusal(
         op,
         "PRECONDITION_UNMET",
         "nothing was made: ffmpeg was not found",
@@ -310,7 +311,7 @@ def _run_path(
     try:
         directory = make_run_dir()
     except OSError as exc:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             f"nothing was made: the stills directory {stills_root()} cannot be written ({exc})",
@@ -321,7 +322,7 @@ def _run_path(
         parts, attachments, notes = _proxy_parts(op_args, ffmpeg, source, directory)
     except (ProxyError, OSError) as exc:
         _drop_empty_dir(directory)
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             f"the proxy could not be made: {exc}",
@@ -350,38 +351,14 @@ def _run_path(
     return env
 
 
-def run_still(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
-) -> dict[str, Any]:
-    """The `wrap` of `render.still`."""
-    started = time.monotonic()
-    source = op_args["source"]
-    if "path" in source:
-        return _run_path(op, op_args, started)
-    frame = int(source["frame"])
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        raw = pre_env.get("result")
-        if pre_env.get("ok") is not True or not isinstance(raw, dict):
-            return pre_read_failure(op, pre_env, "made")
-        facts: dict[str, Any] = raw
-        stable = _stable_selector(facts, source["target"])
-        refusal = _refuse_facts(op, facts, stable, frame, started)
-        if refusal is not None:
-            return refusal
-        marks = still_marks(frame)
-        preset = preset_path(str(facts.get("version") or ""))
-        if preset is None:
-            return _refusal(
+def _preset_for(
+    op: RegisteredOperation, facts: Mapping[str, Any], stable: Any, started: float
+) -> str:
+    """The export preset file for this Flame's version; `Refused` when there is none."""
+    preset = preset_path(str(facts.get("version") or ""))
+    if preset is None:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 f"nothing was made: no export preset file for Flame {facts.get('version')!r} "
@@ -391,7 +368,30 @@ def run_still(
                 hint=f"Set {PRESETS_DIR_ENV} to the directory that holds Flame's presets "
                 "(it has a folder per Flame version).",
             )
-        return _still(rt, op, op_args, facts, stable, frame, marks, preset, group, started)
+        )
+    return preset
+
+
+def run_still(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` of `render.still`."""
+    started = time.monotonic()
+    source = op_args["source"]
+    if "path" in source:
+        return _run_path(op, op_args, started)
+    frame = int(source["frame"])
+    try:
+        facts = read_facts(rt, op, op_args, "made")
+        stable = _stable_selector(facts, source["target"])
+        refusal = _refuse_facts(op, facts, stable, frame, started)
+        if refusal is not None:
+            raise Refused(refusal)
+        preset = _preset_for(op, facts, stable, started)
+        prepared = _prepare_still(rt, op, op_args, facts, stable, frame, preset, group, started)
+    except Refused as stop:
+        return stop.env
+    return _run_still(rt, op, op_args, prepared, started)
 
 
 def _refuse_facts(
@@ -405,7 +405,7 @@ def _refuse_facts(
     kind = facts.get("type")
     info = {"ran": False, "target": target_info(facts, stable)}
     if kind != "PyClip":
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "SELECTOR_TYPE",
             f"nothing was made: the target is a {kind}, not a PyClip; this op takes clips only",
@@ -413,7 +413,7 @@ def _refuse_facts(
             result=info,
         )
     if stable is None:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             "nothing was made: the target has no wiretap id, so it could not be found again "
@@ -424,7 +424,7 @@ def _refuse_facts(
         )
     duration = facts.get("duration")
     if not isinstance(duration, int) or not 1 <= frame <= duration:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "INVALID_ARGS",
             f"nothing was made: frame must be 1 to {duration} for this clip, got {frame}",
@@ -432,7 +432,7 @@ def _refuse_facts(
             result=info,
         )
     if not facts.get("groupFound"):
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             "nothing was made: the Desktop has no reel group to hold the temporary copy",
@@ -450,7 +450,7 @@ def _directory_refusal(
     started: float,
 ) -> dict[str, Any] | None:
     if "" in before.unreadable:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             "nothing was made: the output directory could not be read, so it cannot be told "
@@ -460,7 +460,7 @@ def _directory_refusal(
             hint="Check the permissions of the directory, or use another one.",
         )
     if before.truncated:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             "nothing was made: the output directory holds too many entries to tell afterwards "
@@ -471,7 +471,7 @@ def _directory_refusal(
         )
     existing = visible_entries(before)
     if existing:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             f"nothing was made: the output directory is not empty (it holds {len(existing)} "
@@ -487,72 +487,121 @@ def _directory_refusal(
     return None
 
 
-def _still(
+def _prepare_output(
+    op: RegisteredOperation,
+    op_args: Mapping[str, Any],
+    info: dict[str, Any],
+    started: float,
+) -> tuple[Ffmpeg, Path, str, Tree]:
+    """ffmpeg, the run directory, the directory the export writes into and what it holds now;
+    `Refused` when the chosen directory is not usable, there is no ffmpeg or the stills directory
+    cannot be written."""
+    user_dir = op_args.get("output_dir")
+    if user_dir:
+        before = scan_tree(user_dir, limit=EXPORT_SCAN_LIMIT)
+        refused = _directory_refusal(op, user_dir, before, info, started)
+        if refused is not None:
+            raise Refused(refused)
+    ffmpeg = resolve_ffmpeg()
+    if ffmpeg is None:
+        raise Refused(_ffmpeg_refusal(op, started, info))
+    try:
+        run_dir = make_run_dir()
+    except OSError as exc:
+        raise Refused(
+            envelope_mod.refusal(
+                op,
+                "PRECONDITION_UNMET",
+                f"nothing was made: the stills directory {stills_root()} cannot be written ({exc})",
+                started,
+                result=info,
+                hint=f"Make it writable, or set {STILLS_DIR_ENV} to another directory.",
+            )
+        ) from exc
+    output_dir = str(user_dir or run_dir)
+    if not user_dir:
+        before = scan_tree(output_dir, limit=EXPORT_SCAN_LIMIT)
+    return ffmpeg, run_dir, output_dir, before
+
+
+def _run_plan(frame: int, preset: str, output_dir: str, run_dir: Path) -> dict[str, Any]:
+    return {
+        "frame": frame,
+        "marks": still_marks(frame),
+        "tempName": new_temp_name(),
+        "preset": preset,
+        "outputDir": output_dir,
+        "runDir": str(run_dir),
+    }
+
+
+def _run_args(
+    op_args: Mapping[str, Any], facts: Mapping[str, Any], stable: Any, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        **op_args,
+        "source": {"target": stable, "frame": plan["frame"]},
+        PHASE_ARG: PHASE_WRITE,
+        EXPECTED_ARG: facts.get("uid"),
+        STILL_ARG: {
+            "reel": TEMP_REEL,
+            "tempName": plan["tempName"],
+            "marks": list(plan["marks"]),
+            "preset": plan["preset"],
+            "outputDir": plan["outputDir"],
+        },
+    }
+
+
+@dataclass(frozen=True)
+class _PreparedStill:
+    """What is known once the intent is journaled: everything the Flame call and its judgement
+    need."""
+
+    facts: dict[str, Any]
+    stable: Any
+    ffmpeg: Ffmpeg
+    before: Tree
+    plan: dict[str, Any]
+    intent_id: str
+    group_id: str
+    client_handle: str | None
+    timeout_s: float
+
+
+def _prepare_still(
     rt: Runtime,
     op: RegisteredOperation,
     op_args: dict[str, Any],
     facts: dict[str, Any],
     stable: Any,
     frame: int,
-    marks: tuple[int, int],
     preset: str,
     group: str | None,
     started: float,
-) -> dict[str, Any]:
+) -> _PreparedStill:
+    """The checks, the plan and the intent; `Refused` for anything found before the Flame call."""
     timeout_s = float(op_args["timeout_s"])
-    info = {"ran": False, "target": target_info(facts, stable)}
-    user_dir = op_args.get("output_dir")
-    issue = _first_non_ascii(
+    check_ascii(
+        op,
+        started,
+        "made",
         target=stable,
         uid=facts.get("uid"),
         wiretapId=facts.get("wiretapId"),
-        outputDir=user_dir or str(stills_root()),
+        outputDir=op_args.get("output_dir") or str(stills_root()),
         preset=preset,
     )
-    if issue is not None:
-        return _refusal(
-            op,
-            "INVALID_ARGS",
-            f"nothing was made: {issue.path}: {issue.message}",
-            started,
-            result={"ran": False},
-            hint=ASCII_REFUSAL_HINT,
-        )
-    if user_dir:
-        before = scan_tree(user_dir, limit=EXPORT_SCAN_LIMIT)
-        refused = _directory_refusal(op, user_dir, before, info, started)
-        if refused is not None:
-            return refused
-    ffmpeg = resolve_ffmpeg()
-    if ffmpeg is None:
-        return _ffmpeg_refusal(op, started, info)
-    try:
-        run_dir = make_run_dir()
-    except OSError as exc:
-        return _refusal(
-            op,
-            "PRECONDITION_UNMET",
-            f"nothing was made: the stills directory {stills_root()} cannot be written ({exc})",
-            started,
-            result=info,
-            hint=f"Make it writable, or set {STILLS_DIR_ENV} to another directory.",
-        )
-    output_dir = str(user_dir or run_dir)
-    if not user_dir:
-        before = scan_tree(output_dir, limit=EXPORT_SCAN_LIMIT)
-    plan = {
-        "frame": frame,
-        "marks": marks,
-        "tempName": new_temp_name(),
-        "preset": preset,
-        "outputDir": output_dir,
-        "runDir": str(run_dir),
-    }
+    info = {"ran": False, "target": target_info(facts, stable)}
+    ffmpeg, run_dir, output_dir, before = _prepare_output(op, op_args, info, started)
+    plan = _run_plan(frame, preset, output_dir, run_dir)
     group_id = group if group is not None else new_id("g")
     intent_id = new_id("i")
-    client_handle = _new_client_handle(rt)
+    client_handle = new_client_handle(rt)
     try:
-        rt.journal.append(
+        append_intent(
+            rt,
+            op,
             _intent_record(
                 op,
                 op_args,
@@ -564,55 +613,52 @@ def _still(
                 group_id=group_id,
                 timeout_s=timeout_s,
                 handle=client_handle,
-            )
-        )
-    except OSError as exc:
-        _drop_empty_dir(run_dir)
-        return _refusal(
-            op,
-            "POLICY_DENIED",
-            f"nothing was made: the journal cannot be written ({exc}), and this server does not "
-            "make a still without an intent on record",
+            ),
             started,
-            result={"ran": False},
-            hint=f"Make {rt.journal.directory} writable, then retry.",
+            done="made",
+            action="make a still",
         )
-    run_args = {
-        **op_args,
-        "source": {"target": stable, "frame": frame},
-        PHASE_ARG: PHASE_WRITE,
-        EXPECTED_ARG: facts.get("uid"),
-        STILL_ARG: {
-            "reel": TEMP_REEL,
-            "tempName": plan["tempName"],
-            "marks": list(marks),
-            "preset": preset,
-            "outputDir": output_dir,
-        },
-    }
-    env = execution.run_op(
-        op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s, handle=client_handle
+    except Refused:
+        _drop_empty_dir(run_dir)
+        raise
+    return _PreparedStill(
+        facts, stable, ffmpeg, before, plan, intent_id, group_id, client_handle, timeout_s
     )
-    end_code = env.get("errorCode")
-    if end_code in UNKNOWN_END_CODES or env.get("pending") is not None:
-        return _unknown_end(
+
+
+def _run_still(
+    rt: Runtime,
+    op: RegisteredOperation,
+    op_args: dict[str, Any],
+    prepared: _PreparedStill,
+    started: float,
+) -> dict[str, Any]:
+    p = prepared
+    return run_and_close(
+        rt,
+        op,
+        _run_args(op_args, p.facts, p.stable, p.plan),
+        timeout_s=p.timeout_s,
+        handle=p.client_handle,
+        intent_id=p.intent_id,
+        group_id=p.group_id,
+        finish=lambda env: _finish(
             rt,
-            env,
             op,
-            intent_id,
-            group_id,
-            str(end_code or "TIMEOUT"),
-            timeout_s,
-            client_handle,
-            reads="the output directory and the reel flame_mcp_still on the Desktop",
-            noun="still",
-        )
-    finished = _finish(
-        rt, op, env, op_args, facts, stable, ffmpeg, before, plan, intent_id, group_id, started
+            env,
+            op_args,
+            p.facts,
+            p.stable,
+            p.ffmpeg,
+            p.before,
+            p.plan,
+            p.intent_id,
+            p.group_id,
+            started,
+        ),
+        reads="the output directory and the reel flame_mcp_still on the Desktop",
+        noun="still",
     )
-    if client_handle is not None and end_code != "BRIDGE_AMBIGUOUS":
-        _remove_result_file(rt, finished, client_handle)
-    return finished
 
 
 def _drop_empty_dir(directory: Path | str) -> None:
@@ -670,6 +716,33 @@ def _leftover_notes(flame: Mapping[str, Any]) -> list[str]:
     return notes
 
 
+def _still_result(
+    facts: Mapping[str, Any],
+    stable: Any,
+    ffmpeg: Ffmpeg,
+    plan: Mapping[str, Any],
+    flame: Mapping[str, Any],
+    found: Written,
+) -> dict[str, Any]:
+    return {
+        "ran": True,
+        "source": {"target": target_info(facts, stable), "frame": plan["frame"]},
+        "frame": plan["frame"],
+        "original": None,
+        "proxy": None,
+        "ffmpeg": {"path": ffmpeg.path},
+        "outputDir": str(plan["outputDir"]),
+        "writtenCount": found.count,
+        "countComplete": found.complete,
+        "returned": flame.get("returned"),
+        "exportElapsedS": flame.get("elapsedS"),
+        "tempRemoved": flame.get("tempRemoved"),
+        "tempReelCreated": flame.get("tempReelCreated"),
+        "copy": _copy_info(flame),
+        "undo": UNDO_NOTE,
+    }
+
+
 def _finish(
     rt: Runtime,
     op: RegisteredOperation,
@@ -686,13 +759,12 @@ def _finish(
 ) -> dict[str, Any]:
     flame_raw = env.get("result")
     flame: dict[str, Any] = flame_raw if isinstance(flame_raw, dict) else {}
-    output_dir = str(plan["outputDir"])
     conflict = env.get("errorCode") == "CONFLICT"  # raised before anything was copied
     found = (
         NOTHING_WRITTEN
         if conflict
         else count_written(
-            output_dir, before_stats_of(before), EXPORT_COUNT_DEPTH, EXPORT_COUNT_LIMIT
+            str(plan["outputDir"]), before_stats_of(before), EXPORT_COUNT_DEPTH, EXPORT_COUNT_LIMIT
         )
     )
     written = found.count
@@ -705,39 +777,23 @@ def _finish(
         written=written,
         unsure=unsure,
     )
-    result: dict[str, Any] = {
-        "ran": True,
-        "source": {"target": target_info(facts, stable), "frame": plan["frame"]},
-        "frame": plan["frame"],
-        "original": None,
-        "proxy": None,
-        "ffmpeg": {"path": ffmpeg.path},
-        "outputDir": output_dir,
-        "writtenCount": written,
-        "countComplete": found.complete,
-        "returned": flame.get("returned"),
-        "exportElapsedS": flame.get("elapsedS"),
-        "tempRemoved": flame.get("tempRemoved"),
-        "tempReelCreated": flame.get("tempReelCreated"),
-        "copy": _copy_info(flame),
-        "undo": UNDO_NOTE,
-    }
+    result = _still_result(facts, stable, ffmpeg, plan, flame, found)
     degraded: list[str] = [*env.get("degraded", []), *_leftover_notes(flame), *judged.degraded]
     if not judged.ok and judged.code is not None:
-        _fail_env(env, judged.code, judged.message or "")
+        fail_env(env, judged.code, judged.message or "")
     env["result"] = result
     env["affected"] = written
-    env["undoSteps"] = 0
     env["partial"] = None
     env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    try:
-        rt.journal.append(_outcome_record(intent_id, group_id, judged, flame, written, unsure))
-    except OSError as exc:
-        rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-        degraded.append(
-            f"the outcome could not be journaled ({exc}); the run's answer stands but this "
-            "server now refuses writes until journal.check has settled the intent"
-        )
+    exc = close_outcome(
+        rt,
+        _outcome_record(intent_id, group_id, judged, flame, written, unsure),
+        intent_id,
+        group_id,
+        op.name,
+    )
+    if exc is not None:
+        degraded.append(outcome_not_journaled_note(exc, "the run's answer"))
     env["degraded"] = degraded
     if judged.ok and written == 1:
         _add_proxy(env, op_args, ffmpeg, plan, found.files[0])

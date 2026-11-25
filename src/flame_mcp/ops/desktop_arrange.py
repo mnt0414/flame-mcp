@@ -16,7 +16,7 @@ from flame_mcp.desktop_arrange_run import (
 )
 from flame_mcp.ops._common import build_source
 from flame_mcp.registry import Registry
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import OperationParam, OperationSpec, PlanKind, PlanUse, Refusal, SelectorKind
 
 _DESTINATION_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path")
 _SOURCE_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
@@ -96,7 +96,7 @@ _DESCRIPTION = (
     "the end of the same reel. A step "
     "that cannot be "
     "put back (CONFLICT) leaves the others reverted, result.notReverted names it, and a "
-    "second journal.revert does the rest. Native Ctrl+Z is not used (undoSteps 0). Not "
+    "second journal.revert does the rest. Native Ctrl+Z is not used. Not "
     "allowed in plan.run."
 )
 
@@ -172,14 +172,23 @@ def _arrange_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
+_PLAN_USE_DESKTOP_ARRANGE = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "desktop.arrange cannot be a plan step: it journals one `desktop_copy` or `desktop_move` "
+        "intent per item in a group of its own, which are reverted by deleting the copies and "
+        "moving the things back (they get new uids), and a plan's single group is reverted by "
+        "putting attribute values back -- it would skip such an intent without saying so. Call "
+        "it on its own"
+    ),
+)
 
 
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=ARRANGE_OP,
+            plan_use=_PLAN_USE_DESKTOP_ARRANGE,
             category="desktop",
             description=_DESCRIPTION,
             effect="create",
@@ -222,7 +231,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=_DESTINATION_KINDS,
             to_python=_arrange_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_arrange_precheck,
             wrap=run_arrange,
             sample_args={

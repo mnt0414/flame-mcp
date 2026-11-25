@@ -50,17 +50,26 @@ def _parse_csv_set(name: str, raw: str | None) -> frozenset[str] | None:
     return values
 
 
+def parse_flag(raw: str | None, *, empty_is_off: bool) -> bool | None:
+    """An env flag: unset or "0" is off, "1" is on, "" is off when `empty_is_off`; None for
+    anything else (the caller names the variable in its own error)."""
+    if raw is None or raw == "0" or (raw == "" and empty_is_off):
+        return False
+    if raw == "1":
+        return True
+    return None
+
+
 def _parse_bool_flag(name: str, raw: str | None) -> bool:
     """Parses a boolean env flag strictly: unset, "", "0" -> False; "1" -> True.
 
     Anything else (e.g. "true", "yes") is a misconfiguration, not a synonym; it fails
     closed with PolicyConfigError rather than being silently treated as off.
     """
-    if raw is None or raw == "" or raw == "0":
-        return False
-    if raw == "1":
-        return True
-    raise PolicyConfigError(f"{name} must be unset, '', '0', or '1', got {raw!r}")
+    flag = parse_flag(raw, empty_is_off=True)
+    if flag is None:
+        raise PolicyConfigError(f"{name} must be unset, '', '0', or '1', got {raw!r}")
+    return flag
 
 
 @dataclass(frozen=True)

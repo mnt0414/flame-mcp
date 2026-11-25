@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from conftest import make_registry
 from fake_media_tree import (
     EFFECT_TYPES,
     FakeAttr,
@@ -18,16 +19,8 @@ from fake_media_tree import (
     build_default_tree,
     share_sources,
 )
-from flame_mcp.ops import register_all
 from flame_mcp.opschema import validate_op_args
-from flame_mcp.registry import Registry
 from op_test_helpers import run_op
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def _seq_target(h: dict[str, object]) -> dict[str, object]:

@@ -21,13 +21,9 @@ from flame_mcp.export_run import (
 )
 from flame_mcp.journal import (
     STATE_DIVERGED,
-    STATE_FAILED,
-    STATE_LANDED,
-    STATE_NOT_LANDED,
-    STATE_PARTIAL,
     IntentView,
 )
-from flame_mcp.render_check import _append_check, _unknown_entry, fetch_answer
+from flame_mcp.render_check import _append_check, _unknown_entry, fetch_answer, verdict_after_run
 from flame_mcp.render_files import EXPORT_COUNT_DEPTH, EXPORT_COUNT_LIMIT
 
 if TYPE_CHECKING:
@@ -99,16 +95,11 @@ def _check_with_result(
         expected=expected,
         unsure=unsure,
     )
-    if gone:
-        verdict = STATE_DIVERGED
-    elif judged.ok:
-        verdict = STATE_LANDED
-    elif found.count > 0:
-        verdict = STATE_PARTIAL
-    elif judged.code == "SILENT_NOOP":
-        verdict = STATE_NOT_LANDED
-    else:
-        verdict = STATE_FAILED
+    verdict = (
+        STATE_DIVERGED
+        if gone
+        else verdict_after_run(ok=judged.ok, code=judged.code, wrote_part=found.count > 0)
+    )
     per_key = {"files": verdict}
     current = _current(found, expected)
     outcome = {
@@ -129,7 +120,7 @@ def _check_with_result(
     if notes:
         entry["detail"] = ". ".join(notes)
     _append_check(
-        ctx, view, verdict, per_key, current, basis="handle", exportOutcome=outcome, flame=outcome
+        ctx, view, verdict, per_key, current, basis="handle", export_outcome=outcome, flame=outcome
     )
     return entry
 

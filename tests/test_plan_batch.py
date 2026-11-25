@@ -19,6 +19,7 @@ from flame_mcp.policy import Policy
 from flame_mcp.types import CheckpointSpec, OperationParam, OperationSpec, Refusal
 from journal_test_helpers import BG1, Rig, make_rig
 from p32b_helpers import make_p32b_rig
+from rig_fixtures import rig_fixture
 from test_timeline_fx_loss import give_fx, make_group
 from timeline_p32a_helpers import S1, TRIM, seg_sel
 
@@ -28,9 +29,7 @@ CREATE = "node.create"
 SET = "node.set_attributes"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def node(name: str, batch: dict[str, Any] = BG1, **extra: Any) -> dict[str, Any]:
@@ -123,7 +122,7 @@ def test_five_node_edits_take_one_checkpoint_and_run_without_checkpoints_of_thei
     assert rig.handles["bg1"].nodes[3].pos_x.get_value() == 40.0
     assert len(checkpoints(rig)) == 1
     assert [c.label for c in rig.exec.calls].count("batch.checkpoint") == 1
-    assert env["undoSteps"] == 0 and env["partial"] == {"done": 5, "failed": 0, "notRun": 0}
+    assert env["partial"] == {"done": 5, "failed": 0, "notRun": 0}
     info = env["result"]["batch"]
     assert "timeline" not in env["result"]
     assert info["fingerprintBefore"] == before
@@ -753,7 +752,6 @@ def test_a_param_default_reaches_the_check_and_the_code_of_a_bundled_step(rig: R
             ),
             accepts=("batch",),
             to_python=lambda args: f"_result = {{'mode': {args['mode']!r}}}",
-            undo_steps=lambda args, affected: 0,
             checkpoint=CheckpointSpec(check=check),
             sample_args={"target": {"kind": "batch", "name": "s"}, "mode": "fast"},
         )

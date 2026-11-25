@@ -152,6 +152,144 @@ def _make_private_dirs(directory: Path) -> None:
 _CHMOD_NOFOLLOW: Final[bool] = os.chmod in os.supports_follow_symlinks
 
 
+class _AppDirHardener:
+    """The state of one `_harden_app_dir` walk: the counts, the budget and the device it stays
+    on."""
+
+    def __init__(
+        self, root: Path, logger: logging.Logger, max_entries: int, budget_s: float
+    ) -> None:
+        self.logger = logger
+        self.max_entries = max_entries
+        self.report: dict[str, Any] = {
+            "root": str(root),
+            "checked": 0,
+            "fixed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "truncated": False,
+        }
+        self.uid = os.getuid()
+        self.deadline = time.monotonic() + budget_s
+        self.changes = 0
+        self.logged_failures = 0
+        self.device: int | None = None
+
+    def out_of_budget(self) -> bool:
+        if self.changes >= self.max_entries:
+            reason = f"{self.max_entries} entries changed"
+        elif time.monotonic() > self.deadline:
+            reason = "out of time"
+        else:
+            return False
+        if not self.report["truncated"]:
+            self.report["truncated"] = True
+            self.logger.warning(
+                "permissions: stopped after changing %d entries (%s); the rest is checked at the "
+                "next start",
+                self.changes,
+                reason,
+            )
+        return True
+
+    def _chmod(self, path: str, want: int) -> None:
+        self.changes += 1
+        try:
+            if _CHMOD_NOFOLLOW:
+                os.chmod(path, want, follow_symlinks=False)
+            else:
+                os.chmod(path, want)
+        except OSError as exc:
+            self.report["failed"] += 1
+            if self.logged_failures < MAX_LOGGED_FAILURES:
+                self.logged_failures += 1
+                self.logger.warning("permissions: could not chmod %s to %04o: %s", path, want, exc)
+        else:
+            self.report["fixed"] += 1
+
+    def tighten(self, path: str, st: os.stat_result) -> bool:
+        """True if `path` is a directory to descend into."""
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != self.uid:
+            self.report["skipped"] += 1
+            return False
+        if stat.S_ISDIR(st.st_mode):
+            want = RUN_DIR_MODE
+        elif stat.S_ISREG(st.st_mode):
+            want = HARDEN_FILE_MODE
+        else:
+            return False
+        if self.device is None:
+            self.device = st.st_dev
+        elif st.st_dev != self.device:
+            self.report["skipped"] += 1
+            return False
+        self.report["checked"] += 1
+        if stat.S_IMODE(st.st_mode) != want:
+            self._chmod(path, want)
+        return want == RUN_DIR_MODE
+
+    def _walk(self, top: Path) -> None:
+        stack = [str(top)]
+        while stack:
+            directory = stack.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    children = list(entries)
+            except OSError as exc:
+                self.logger.warning("permissions: could not list %s: %s", directory, exc)
+                continue
+            for child in children:
+                if self.out_of_budget():
+                    return
+                try:
+                    child_st = child.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if self.tighten(child.path, child_st) and stat.S_ISDIR(child_st.st_mode):
+                    stack.append(child.path)
+
+    def enter(self, top: Path, recurse: bool) -> bool:
+        if self.out_of_budget():
+            return False
+        try:
+            st = os.lstat(top)
+        except OSError:
+            return False
+        descend = self.tighten(str(top), st)
+        if descend and recurse:
+            self._walk(top)
+        return descend
+
+    def log_summary(self) -> None:
+        report = self.report
+        if report["fixed"] or report["failed"]:
+            self.logger.info(
+                "permissions: fixed %d, failed %d, skipped %d, checked %d under %s",
+                report["fixed"],
+                report["failed"],
+                report["skipped"],
+                report["checked"],
+                report["root"],
+            )
+
+
+def _harden_tops(root: Path, extra_dirs: Sequence[Path]) -> list[Path]:
+    """`APP_TREES` under `root`, and the `extra_dirs` that lie inside `root` but not in one of
+    those trees."""
+    root_abs = os.path.abspath(root)
+    tops = [root / name for name in APP_TREES]
+    for extra in extra_dirs:
+        extra_abs = os.path.abspath(extra)
+        if extra_abs == root_abs or os.path.commonpath([root_abs, extra_abs]) != root_abs:
+            continue
+        if any(
+            os.path.commonpath([os.path.abspath(t), extra_abs]) == os.path.abspath(t) for t in tops
+        ):
+            continue
+        tops.append(extra)
+    return tops
+
+
 def _harden_app_dir(
     root: Path,
     logger: logging.Logger,
@@ -172,125 +310,12 @@ def _harden_app_dir(
     the next start gets past what an earlier one fixed) or after `budget_s` seconds, and says so.
     Returns the counts.
     """
-    report: dict[str, Any] = {
-        "root": str(root),
-        "checked": 0,
-        "fixed": 0,
-        "failed": 0,
-        "skipped": 0,
-        "truncated": False,
-    }
-    uid = os.getuid()
-    deadline = time.monotonic() + budget_s
-    changes = 0
-    logged_failures = 0
-    device: int | None = None
-
-    def out_of_budget() -> bool:
-        if changes >= max_entries:
-            reason = f"{max_entries} entries changed"
-        elif time.monotonic() > deadline:
-            reason = "out of time"
-        else:
-            return False
-        if not report["truncated"]:
-            report["truncated"] = True
-            logger.warning(
-                "permissions: stopped after changing %d entries (%s); the rest is checked at the "
-                "next start",
-                changes,
-                reason,
-            )
-        return True
-
-    def tighten(path: str, st: os.stat_result) -> bool:
-        # True if `path` is a directory to descend into
-        nonlocal device, logged_failures, changes
-        if stat.S_ISLNK(st.st_mode) or st.st_uid != uid:
-            report["skipped"] += 1
-            return False
-        if stat.S_ISDIR(st.st_mode):
-            want = RUN_DIR_MODE
-        elif stat.S_ISREG(st.st_mode):
-            want = HARDEN_FILE_MODE
-        else:
-            return False
-        if device is None:
-            device = st.st_dev
-        elif st.st_dev != device:
-            report["skipped"] += 1
-            return False
-        report["checked"] += 1
-        if stat.S_IMODE(st.st_mode) != want:
-            changes += 1
-            try:
-                if _CHMOD_NOFOLLOW:
-                    os.chmod(path, want, follow_symlinks=False)
-                else:
-                    os.chmod(path, want)
-            except OSError as exc:
-                report["failed"] += 1
-                if logged_failures < MAX_LOGGED_FAILURES:
-                    logged_failures += 1
-                    logger.warning("permissions: could not chmod %s to %04o: %s", path, want, exc)
-            else:
-                report["fixed"] += 1
-        return want == RUN_DIR_MODE
-
-    def enter(top: Path, recurse: bool) -> bool:
-        if out_of_budget():
-            return False
-        try:
-            st = os.lstat(top)
-        except OSError:
-            return False
-        descend = tighten(str(top), st)
-        if descend and recurse:
-            stack = [str(top)]
-            while stack:
-                directory = stack.pop()
-                try:
-                    with os.scandir(directory) as entries:
-                        children = list(entries)
-                except OSError as exc:
-                    logger.warning("permissions: could not list %s: %s", directory, exc)
-                    continue
-                for child in children:
-                    if out_of_budget():
-                        return descend
-                    try:
-                        child_st = child.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if tighten(child.path, child_st) and stat.S_ISDIR(child_st.st_mode):
-                        stack.append(child.path)
-        return descend
-
-    if enter(root, False):
-        root_abs = os.path.abspath(root)
-        tops = [root / name for name in APP_TREES]
-        for extra in extra_dirs:
-            extra_abs = os.path.abspath(extra)
-            if extra_abs == root_abs or os.path.commonpath([root_abs, extra_abs]) != root_abs:
-                continue
-            if any(
-                os.path.commonpath([os.path.abspath(t), extra_abs]) == os.path.abspath(t)
-                for t in tops
-            ):
-                continue
-            tops.append(extra)
-        for top in tops:
-            enter(top, True)
-    if report["fixed"] or report["failed"]:
-        logger.info(
-            "permissions: fixed %d, failed %d, skipped %d, checked %d under %s",
-            report["fixed"],
-            report["failed"],
-            report["skipped"],
-            report["checked"],
-            report["root"],
-        )
-    return report
+    walker = _AppDirHardener(root, logger, max_entries, budget_s)
+    if walker.enter(root, False):
+        for top in _harden_tops(root, extra_dirs):
+            walker.enter(top, True)
+    walker.log_summary()
+    return walker.report
 
 
 def _make_logger(log_path: Path) -> logging.Logger:

@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp import selectors
-from flame_mcp.desktop_run import EXPECTED_ARG, PHASE_ARG, PHASE_READ
+from flame_mcp.desktop_run import EXPECTED_ARG, PHASE_READ
 from flame_mcp.export_run import OP_NAME, run_export
 from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.registry import Registry
@@ -20,7 +20,16 @@ from flame_mcp.render_files import (
     is_default_output_dir,
 )
 from flame_mcp.render_run import DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
@@ -78,10 +87,6 @@ _DESCRIPTION = (
 )
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 def _to_python(args: Mapping[str, Any]) -> str:
     resolve = selectors.resolve_code(args["target"], "target")
     if args.get(PHASE_ARG) == PHASE_READ:
@@ -133,10 +138,22 @@ def _precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+_PLAN_USE_RENDER_EXPORT = PlanUse(
+    PlanKind.KEEPS_OUTPUT,
+    refusal=(
+        "render.export cannot be a plan step: a Foreground export occupies Flame for as long as "
+        "it runs (no MCP call gets through meanwhile) and the files it writes cannot be undone, "
+        "so it has no place in a group that journal.revert is meant to put back; call it on its "
+        "own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=OP_NAME,
+            plan_use=_PLAN_USE_RENDER_EXPORT,
             category="render",
             description=_DESCRIPTION,
             effect="create",
@@ -212,7 +229,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(PhaseSpec(PHASE_READ),),
             precheck=_precheck,
             wrap=run_export,
             requires=(

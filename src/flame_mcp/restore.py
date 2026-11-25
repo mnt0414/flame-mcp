@@ -70,9 +70,12 @@ from flame_mcp import clip_order, execution, reel_fidelity, timeline_fx_loss, tr
 from flame_mcp import envelope as envelope_mod
 from flame_mcp.checkpointed import (
     ASCII_REFUSAL_HINT,
+    CheckpointedRun,
+    IntentExtra,
     Judgement,
     PreRunRefusal,
     ascii_refusal_text,
+    no_intent_extra,
     run_checkpointed,
 )
 from flame_mcp.checkpoints import (
@@ -86,7 +89,9 @@ from flame_mcp.checkpoints import (
     read_fingerprint,
 )
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import Index
+from flame_mcp.journal import NO_LINK, Index, JournalLink
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import outcome_not_journaled_note
 from flame_mcp.policy import deny_operation
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.runtime import ServerContext
@@ -182,12 +187,10 @@ def run_load_setup(
             args={"target": op_args["target"], "path": path},
             expected_fp=None,
             label=f"before load_setup of {os.path.basename(path)}",
-            extra_intent={},
+            extra_intent=no_intent_extra,
             extra_result={},
-            reverts=None,
-            reverts_intent=None,
+            link=JournalLink(group),
             forced=None,
-            group=group,
             reel_record=None,
             reel_skip_reason=reel_fidelity.NOT_A_CHECKPOINT_REASON,
         )
@@ -197,7 +200,6 @@ def run_load_setup(
         ok=True,
         result=outcome.result,
         affected=outcome.affected,
-        undo_steps=0,
         journal=outcome.journal,
         execution=meta,
         duration_ms=int((time.monotonic() - started) * 1000),
@@ -337,8 +339,7 @@ def restore_checkpoint(
     ctx: ServerContext,
     checkpoint_id: str,
     *,
-    reverts: str | None = None,
-    reverts_intent: str | None = None,
+    link: JournalLink = NO_LINK,
     forced: Mapping[str, Any] | None = None,
 ) -> ServerResult:
     """Restore the group of `checkpoint_id` from its saved setup, as described above (a timeline
@@ -354,6 +355,10 @@ def restore_checkpoint(
     step = _prepare_clip_order(ctx, path, reel_record, reel_skip_reason)
     progress = LoadProgress()
     result: Any = None
+
+    def add_checkpoint(intent: IntentRecord) -> None:
+        intent["checkpoint"] = checkpoint_id
+
     try:
         outcome = replace_group(
             ctx,
@@ -364,12 +369,10 @@ def restore_checkpoint(
             args={"checkpoint": checkpoint_id},
             expected_fp=expected_fp,
             label=f"before restoring {checkpoint_id}",
-            extra_intent={"checkpoint": checkpoint_id},
+            extra_intent=add_checkpoint,
             extra_result={"checkpoint": checkpoint_id, "clipOrder": step.report},
-            reverts=reverts,
-            reverts_intent=reverts_intent,
+            link=link,
             forced=forced,
-            group=None,
             reel_record=reel_record,
             reel_skip_reason=reel_skip_reason,
             fx=fx,
@@ -385,6 +388,48 @@ def restore_checkpoint(
         _settle_clip_order(step, progress, result)
 
 
+@dataclass(frozen=True)
+class _ReplaceJudge:
+    """What the checkpointed engine asks of a replace: how a load's answer is judged and what the
+    journal records beside it."""
+
+    path: str
+    expected_fp: str | None
+    extra_intent: IntentExtra
+    reel_record: reel_fidelity.ReelRecord | None
+    reel_skip_reason: str | None
+
+    def tidy(self, load_env: Mapping[str, Any]) -> dict[str, Any]:
+        raw = load_env.get("result") if load_env.get("ok") is True else None
+        return reel_fidelity.report(self.reel_record, self.reel_skip_reason, raw)
+
+    def matched(self, load_env: Mapping[str, Any], after_fp: str | None) -> bool:
+        if self.expected_fp is None:
+            return load_env.get("ok") is True and after_fp is not None
+        return load_env.get("ok") is True and after_fp == self.expected_fp
+
+    def judge(self, load_env: dict[str, Any], after_fp: str | None) -> Judgement:
+        if self.matched(load_env, after_fp):
+            return Judgement(ok=True)
+        return Judgement(
+            ok=False,
+            failed=_failure_text(load_env, after_fp, self.expected_fp),
+            error_code=_failure_code(load_env),
+        )
+
+    def add_path(self, intent: IntentRecord) -> None:
+        intent["path"] = self.path
+        self.extra_intent(intent)
+
+    def outcome_extra(
+        self, outcome: OutcomeRecord, load_env: dict[str, Any], after_fp: str | None
+    ) -> None:
+        load_result = load_env.get("result") if isinstance(load_env.get("result"), dict) else {}
+        outcome["loadReturned"] = (load_result or {}).get("returned")
+        outcome["matched"] = self.matched(load_env, after_fp)
+        outcome["reelsRestored"] = self.tidy(load_env)["reelsRestored"]
+
+
 def replace_group(
     ctx: ServerContext,
     *,
@@ -395,12 +440,10 @@ def replace_group(
     args: Mapping[str, Any],
     expected_fp: str | None,
     label: str,
-    extra_intent: Mapping[str, Any],
+    extra_intent: IntentExtra,
     extra_result: Mapping[str, Any],
-    reverts: str | None,
-    reverts_intent: str | None,
+    link: JournalLink,
     forced: Mapping[str, Any] | None,
-    group: str | None,
     reel_record: reel_fidelity.ReelRecord | None = None,
     reel_skip_reason: str | None = None,
     fx: timeline_fx_loss.FxRecord | None = None,
@@ -433,88 +476,90 @@ def replace_group(
             read_clip_fx=fx is not None and fx.rows is not None,
         )
 
-    def tidy_of(load_env: Mapping[str, Any]) -> dict[str, Any]:
-        raw = load_env.get("result") if load_env.get("ok") is True else None
-        return reel_fidelity.report(reel_record, reel_skip_reason, raw)
-
-    def matched_of(load_env: Mapping[str, Any], after_fp: str | None) -> bool:
-        if expected_fp is None:
-            return load_env.get("ok") is True and after_fp is not None
-        return load_env.get("ok") is True and after_fp == expected_fp
-
-    def judge(load_env: dict[str, Any], after_fp: str | None) -> Judgement:
-        if matched_of(load_env, after_fp):
-            return Judgement(ok=True)
-        return Judgement(
-            ok=False,
-            failed=_failure_text(load_env, after_fp, expected_fp),
-            error_code=_failure_code(load_env),
+    judged = _ReplaceJudge(path, expected_fp, extra_intent, reel_record, reel_skip_reason)
+    try:
+        facts = run_checkpointed(
+            ctx,
+            selector=target,
+            op_name=op_name,
+            kind=kind,
+            args=args,
+            intent_extra=judged.add_path,
+            expected_fp=expected_fp,
+            label=label,
+            run=run,
+            judge=judged.judge,
+            failed_key="restore",
+            outcome_extra=judged.outcome_extra,
+            link=link,
+            forced=forced,
         )
+    except PreRunRefusal as exc:
+        raise _pre_run_error(ctx, exc, extra_result) from exc
 
-    def outcome_extra(load_env: dict[str, Any], after_fp: str | None) -> dict[str, Any]:
-        load_result = load_env.get("result") if isinstance(load_env.get("result"), dict) else {}
-        return {
-            "loadReturned": (load_result or {}).get("returned"),
-            "matched": matched_of(load_env, after_fp),
-            "reelsRestored": tidy_of(load_env)["reelsRestored"],
-        }
-
-    with ctx.write_lock:
-        try:
-            facts = run_checkpointed(
-                ctx,
-                selector=target,
-                op_name=op_name,
-                kind=kind,
-                args=args,
-                intent_extra={"path": path, **extra_intent},
-                expected_fp=expected_fp,
-                label=label,
-                run=run,
-                judge=judge,
-                failed_key="restore",
-                outcome_extra=outcome_extra,
-                group=group,
-                reverts=reverts,
-                reverts_intent=reverts_intent,
-                forced=forced,
-            )
-        except PreRunRefusal as exc:
-            raise _pre_run_error(ctx, exc, extra_result) from exc
-
-    pre_summary = facts.pre_summary()
-    load_env = facts.env
     if facts.unknown_end:
         if progress is not None:
             progress.unanswered = True
-        load_code = load_env.get("errorCode")
-        raise ServerOpError(
-            as_error_code(str(load_code)),
-            f"load_setup ended without an answer ({load_code}); it is not known whether the "
-            f"group was replaced. The state before it is saved in checkpoint {facts.pre_id} "
-            f"({pre_summary['path']}). This server now refuses writes until journal.check "
-            f"(group={facts.group!r}) has read Flame again.",
-            result={**extra_result, "group": facts.group, "preCheckpoint": pre_summary},
-            hint=load_env.get("hint"),
-            journal={"group": facts.group, "id": facts.intent_id},
-        )
+        raise _unknown_end_error(facts, extra_result)
+    result = _replace_result(facts, judged, extra_result, fx, forced)
+    journal_ref = {"group": facts.group, "id": facts.intent_id}
+    if facts.ok:
+        return ServerResult(result=result, affected=1, journal=journal_ref)
+    raise ServerOpError(
+        as_error_code(_failure_code(facts.env)),
+        _failure_message(
+            facts.env, facts.fingerprint_after, expected_fp, facts.pre_id, facts.pre_summary()
+        ),
+        result=result,
+        hint=(
+            f"The state before this change is saved: journal.restore_checkpoint "
+            f"(checkpoint={facts.pre_id!r}) puts it back."
+        ),
+        journal=journal_ref,
+    )
+
+
+def _unknown_end_error(facts: CheckpointedRun, extra_result: Mapping[str, Any]) -> ServerOpError:
+    """The error of a replace whose load ended without an answer."""
+    pre_summary = facts.pre_summary()
+    load_env = facts.env
+    load_code = load_env.get("errorCode")
+    return ServerOpError(
+        as_error_code(str(load_code)),
+        f"load_setup ended without an answer ({load_code}); it is not known whether the "
+        f"group was replaced. The state before it is saved in checkpoint {facts.pre_id} "
+        f"({pre_summary['path']}). This server now refuses writes until journal.check "
+        f"(group={facts.group!r}) has read Flame again.",
+        result={**extra_result, "group": facts.group, "preCheckpoint": pre_summary},
+        hint=load_env.get("hint"),
+        journal={"group": facts.group, "id": facts.intent_id},
+    )
+
+
+def _replace_result(
+    facts: CheckpointedRun,
+    judged: _ReplaceJudge,
+    extra_result: Mapping[str, Any],
+    fx: timeline_fx_loss.FxRecord | None,
+    forced: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """The result of a replace that got an answer from the load (matched or not)."""
+    load_env = facts.env
+    tidy = judged.tidy(load_env)
     raw_load = load_env.get("result") if isinstance(load_env.get("result"), dict) else {}
     load_result = {k: v for k, v in (raw_load or {}).items() if k not in ("reelTidy", "clipFx")}
-    tidy = tidy_of(load_env)
-    after_fp = facts.fingerprint_after
-    matched = facts.ok
     result: dict[str, Any] = {
         **extra_result,
         "group": facts.group,
-        "path": path,
-        "matched": matched,
-        "expectedFingerprint": expected_fp,
+        "path": judged.path,
+        "matched": facts.ok,
+        "expectedFingerprint": judged.expected_fp,
         "fingerprintBefore": facts.fingerprint_before,
-        "fingerprintAfter": after_fp,
+        "fingerprintAfter": facts.fingerprint_after,
         "load": load_result,
         "reelsRestored": tidy["reelsRestored"],
         "reelTidy": tidy,
-        "preCheckpoint": pre_summary,
+        "preCheckpoint": facts.pre_summary(),
         "undo": {"op": OP_NAME, "args": {"checkpoint": facts.pre_id}},
     }
     if fx is not None:
@@ -526,23 +571,8 @@ def replace_group(
     if forced is not None:
         result["forced"] = dict(forced)
     if facts.journal_error is not None:
-        result["journalError"] = (
-            f"the outcome could not be journaled ({facts.journal_error}); this server now refuses "
-            "writes until journal.check has settled the intent"
-        )
-    journal_ref = {"group": facts.group, "id": facts.intent_id}
-    if matched:
-        return ServerResult(result=result, affected=1, journal=journal_ref)
-    raise ServerOpError(
-        as_error_code(_failure_code(load_env)),
-        _failure_message(load_env, after_fp, expected_fp, facts.pre_id, pre_summary),
-        result=result,
-        hint=(
-            f"The state before this change is saved: journal.restore_checkpoint "
-            f"(checkpoint={facts.pre_id!r}) puts it back."
-        ),
-        journal=journal_ref,
-    )
+        result["journalError"] = outcome_not_journaled_note(facts.journal_error, None)
+    return result
 
 
 def _pre_run_error(

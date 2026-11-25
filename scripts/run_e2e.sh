@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/run_e2e.sh <name> [TIMEOUT]       run it (TIMEOUT: seconds to wait for Flame to exit
-#                                             by itself after the client returns; default 600)
+#                                             by itself after the client returns; default 120)
 #   scripts/run_e2e.sh --list                 the names, in the order scripts/regress.sh runs them
 #   scripts/run_e2e.sh --print-config <name>  what <name> resolves to, as key=value lines
 #                                             (starts nothing)
@@ -40,7 +40,7 @@ set -euo pipefail
 # shellcheck source=e2e_lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_lib.sh"
 
-DEFAULT_TIMEOUT=600
+DEFAULT_TIMEOUT="$EXIT_WAIT_S"
 
 # name|runner|resultsDir|stageFilter|extraArgs|crashCheck|precondition|stages
 e2e_table() {
@@ -49,7 +49,7 @@ p3_3_segment|standard|p3|yes|no|no|-|setup, stages s, r, e, x, p, y, z
 p3_2b_plan_delete|standard|p3|yes|no|no|-|setup, stages p, d, w, m, k, r, g, z
 p3_2a_checkpoint|standard|p3|yes|no|no|-|setup, stages a-k, z
 p3_1b_write|standard|p3|yes|no|no|-|setup, stages a, a2, b, c, e, g, z
-p3_1a_read|standard|p3|yes|no|no|-|setup, stages a-f, h, i, g, z
+p3_1a_read|standard|p3|yes|no|no|-|setup, stages a-f, h, i, g, j, z
 p1_bridge|dedicated|-|-|-|-|-|-
 p1_transport|dedicated|-|-|-|-|-|-
 p1_mcp|standard|p1|no|no|no|-|-
@@ -78,6 +78,7 @@ fix7_small_items|standard|p3|yes|no|no|-|setup, stages a, b, c, d, z
 p5_batch_fx_loss|standard|p3|yes|no|no|-|setup, stages f, z
 p5_render_clip|standard|p3|yes|no|no|-|setup, stages r, t, z
 p5_plan_batch|standard|p3|yes|no|no|-|setup, stages b, a, n, z
+p107_plan_loop|standard|p3|yes|no|no|-|setup, stages r, f, w, s, x, z
 p5_setup_edit|standard|p3|yes|no|no|-|setup, stages c, p, n, z
 p6_list_all|standard|p3|yes|no|no|-|setup, stages l, z
 w3_timewarp|standard|p3|yes|no|no|FLAME_MCP_W3_SETUP=|setup, stages t, r, n, i, z

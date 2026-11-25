@@ -1,6 +1,6 @@
 [project]
 name = "flame-mcp"
-version = "0.4.0"
+version = "0.5.0"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
@@ -59,9 +59,9 @@ ignore_errors = true
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
-# Markdown (ruff would format the code blocks in it) and exploratory capture scripts are not held
-# to the lint and format rules.
-exclude = ["*.md", "scripts/phase0*", "scripts/modes", "scripts/decode_*.py"]
+# Markdown (ruff would format the code blocks in it), exploratory capture scripts and the one-off
+# measurement scripts are not held to the lint and format rules.
+exclude = ["*.md", "scripts/phase0*", "scripts/modes", "scripts/decode_*.py", "research"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "RUF"]

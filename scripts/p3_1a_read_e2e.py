@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Real-Flame end-to-end: the segment selector by `record_in` (with `expect_source_name`),
 `timeline.list_segments` with `effects`, `segment.list_effects`, `segment.shared_sources`,
-`desktop.find`, `desktop.info` and the sizes `desktop.list_children` carries (run with the `.venv`
+`desktop.find`, `desktop.info`, the sizes `desktop.list_children` carries and
+`timeline.list_segments` with `all_tracks` (run with the `.venv`
 Python; `scripts/run_e2e.sh p3_1a_read` starts Flame; `--dry-run` connects to nothing and only
 lists the stages and compiles the code).
 
 Checks: The segment selector by `record_in`, `timeline.list_segments` with effects,
 `segment.list_effects`, `segment.shared_sources`, `desktop.find`, `desktop.info`, and the `width`,
-`height` and `bitDepth` that `desktop.list_children` returns for clips and sequences.
+`height` and `bitDepth` that `desktop.list_children` returns for clips and sequences, and
+`timeline.list_segments` with `all_tracks=true` on the two-track S1: its `trackCount` equals the
+track count of `timeline.info`, each track's `total` and `items` equal a read of that track alone,
+`limit=1` marks the track with two or more segments `truncated`, and `all_tracks` with `track=1`
+is `INVALID_ARGS`.
 
 The test sequences are made with the bit depth of the media, read from the clip: Flame puts a
 Resize on each segment of a sequence of another bit depth, and a new sequence otherwise gets the
@@ -59,6 +64,10 @@ Stages
      bitDepth equal to transport's own reads of that object (found by uid); the reels of RG carry
      none of the three.
   g  the journal: every group of this run is landed / reverted, none unknown.
+  j  timeline.list_segments with all_tracks=true on S1 (two video tracks): trackCount equals
+     timeline.info's; each track's total and items equal a read of that track alone; limit=1
+     marks the track with two or more segments truncated and the others not; all_tracks with
+     track=1 -> INVALID_ARGS.
   z  cross-cutting checks; everything this run made is deleted; flame.exit().
 """
 
@@ -183,6 +192,26 @@ def wt(wiretap_id: str) -> dict[str, Any]:
 @call_for("a1_list_segments", "timeline.list_segments")
 def _a1(ids: dict[str, Any]) -> dict[str, Any]:
     return {"target": wt(ids["s1Wt"]), "version": 0, "track": 0, "limit": 100}
+
+
+@call_for("j1_list_all_tracks", "timeline.list_segments")
+def _j1(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["s1Wt"]), "all_tracks": True, "limit": 100}
+
+
+@call_for("j2_list_one_track", "timeline.list_segments")
+def _j2(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["s1Wt"]), "version": 0, "track": ids.get("track", 0), "limit": 100}
+
+
+@call_for("j3_list_all_tracks_limit_1", "timeline.list_segments")
+def _j3(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["s1Wt"]), "all_tracks": True, "limit": 1}
+
+
+@call_for("j4_all_tracks_with_track", "timeline.list_segments")
+def _j4(ids: dict[str, Any]) -> dict[str, Any]:
+    return {"target": wt(ids["s1Wt"]), "all_tracks": True, "track": 1, "limit": 100}
 
 
 @call_for("a2_info_by_index", "segment.info")
@@ -1637,6 +1666,71 @@ async def stage_g(ctx: Ctx) -> None:
         )
 
 
+# -- j: list_segments over all tracks
+
+
+async def stage_j(ctx: Ctx) -> None:
+    async with server_session(ctx, "p31a-j") as session:
+        info = _result_of(await run_call(session, ctx, "h1_timeline_info_s1"))
+        info_tracks = ((info.get("versions") or [{}])[0]).get("trackCount")
+        everything = await run_call(session, ctx, "j1_list_all_tracks")
+        got = _result_of(everything)
+        tracks = got.get("tracks") if isinstance(got.get("tracks"), list) else []
+        rec(
+            ctx,
+            "j1_all_tracks_track_count_equals_timeline_info",
+            everything.get("ok") is True
+            and isinstance(info_tracks, int)
+            and info_tracks >= 2
+            and got.get("trackCount") == info_tracks
+            and [t.get("track") for t in tracks] == list(range(info_tracks))
+            and got.get("version") == 0,
+            trackCount=got.get("trackCount"),
+            timelineInfo=info_tracks,
+            error=everything.get("error"),
+        )
+        same: list[bool] = []
+        for entry in tracks:
+            one = await run_call(session, ctx, "j2_list_one_track", track=entry.get("track"))
+            same.append(
+                one.get("ok") is True
+                and entry.get("items") == items_of(one)
+                and entry.get("total") == _result_of(one).get("total")
+                and "truncated" not in entry
+            )
+        rec(
+            ctx,
+            "j2_each_track_equals_a_read_of_that_track_alone",
+            bool(same) and all(same),
+            perTrack=same,
+        )
+        cut = await run_call(session, ctx, "j3_list_all_tracks_limit_1")
+        cut_tracks = _result_of(cut).get("tracks")
+        cut_tracks = cut_tracks if isinstance(cut_tracks, list) else []
+        rec(
+            ctx,
+            "j3_limit_1_marks_only_the_tracks_with_two_or_more_segments_truncated",
+            cut.get("ok") is True
+            and bool(cut_tracks)
+            and any((t.get("total") or 0) >= 2 for t in cut_tracks)
+            and all(
+                len(t.get("items") or []) == min(1, t.get("total") or 0)
+                and (t.get("truncated") is True) == ((t.get("total") or 0) >= 2)
+                for t in cut_tracks
+            ),
+            totals=[t.get("total") for t in cut_tracks],
+            truncated=[t.get("truncated") for t in cut_tracks],
+            error=cut.get("error"),
+        )
+        refused = await run_call(session, ctx, "j4_all_tracks_with_track")
+        rec(
+            ctx,
+            "j4_all_tracks_with_track_is_invalid_args",
+            expect_error(refused, "INVALID_ARGS"),
+            error=refused.get("error"),
+        )
+
+
 # -- z / driver
 
 
@@ -1696,6 +1790,7 @@ async def async_main(ctx: Ctx) -> None:
                 ("h", stage_h),
                 ("i", stage_i),
                 ("g", stage_g),
+                ("j", stage_j),
             ):
                 await guarded(ctx, name, stage)
         else:
@@ -1799,7 +1894,9 @@ def dry_run() -> int:
 
 
 EXPECTED_VALIDATION_FAILURES: Final[frozenset[str]] = frozenset({"b2_index_and_record_in"})
-EXPECTED_REFUSALS: Final[frozenset[str]] = frozenset({"f4_find_name_and_uid_refused"})
+EXPECTED_REFUSALS: Final[frozenset[str]] = frozenset(
+    {"f4_find_name_and_uid_refused", "j4_all_tracks_with_track"}
+)
 
 
 def main() -> int:

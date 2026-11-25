@@ -18,17 +18,13 @@ import pytest
 from flame_mcp import transport
 from flame_mcp.journal import Index
 from journal_test_helpers import BG1, Rig, bridge_result, make_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import a_seg, make_timeline_rig, trim
 
-
-@pytest.fixture
-def tl_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+tl_rig = rig_fixture(make_timeline_rig)
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def edit(rig: Rig, edge: str, offset: int) -> dict[str, Any]:

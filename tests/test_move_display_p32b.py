@@ -9,20 +9,15 @@ through the real Runtime with a scripted `transport.exec` over the fake Flame tr
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import ACTIVE_TIMELINE
 from journal_test_helpers import Rig
 from p32b_helpers import LIBREEL, MOVE, S1, S2, S3, make_p32b_rig, reel2, show, shown, uid
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import reel_names
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def move(rig: Rig, sources: list[dict[str, Any]], destination: dict[str, Any]) -> dict[str, Any]:

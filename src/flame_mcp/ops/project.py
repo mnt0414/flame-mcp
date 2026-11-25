@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp.registry import Registry
-from flame_mcp.types import Category, OperationSpec
+from flame_mcp.types import Category, OperationSpec, PlanKind, PlanUse
 
 CATEGORY = Category(
     name="project",
@@ -54,8 +54,14 @@ def _save_to_python(_args: Mapping[str, Any]) -> str:
     )
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
+_PLAN_USE_PROJECT_SAVE = PlanUse(
+    PlanKind.NEVER,
+    refusal=(
+        "project.save cannot be a plan step: it saves the whole project, which journal.revert "
+        "has no way to move back, so it has no place in a group that journal.revert is meant to "
+        "put back; call it on its own"
+    ),
+)
 
 
 def register(registry: Registry) -> None:
@@ -84,6 +90,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="project.save",
+            plan_use=_PLAN_USE_PROJECT_SAVE,
             category="project",
             description=(
                 "Save the project, like Flame's Ctrl+S (Save Project): PyWorkspace.commit() of "
@@ -102,7 +109,6 @@ def register(registry: Registry) -> None:
             undo="unsupported",
             thread="main-async",
             to_python=_save_to_python,
-            undo_steps=_no_undo_steps,
             requires=(
                 "flame.projects",
                 "PyProject.current_workspace",

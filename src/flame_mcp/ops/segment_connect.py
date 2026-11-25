@@ -13,9 +13,10 @@ from typing import Any, Final
 from flame_mcp import selectors
 from flame_mcp.ops._common import build_source, limit_param, offset_param, raise_on_error_src
 from flame_mcp.ops._segment_edit import (
+    CHECK_PHASES,
+    PHASE_CHECK,
     SEGMENT_TARGET_DESCRIPTION,
     edit_source,
-    no_undo_steps,
     seg_args,
     segment_target_param,
 )
@@ -23,13 +24,21 @@ from flame_mcp.registry import Registry
 from flame_mcp.segment_remove_run import (
     CONNECTIONS_OP,
     CREATE_OP,
-    PHASE_ARG,
     PHASE_STEP,
     REMOVE_OP,
     SYNC_OP,
     run_connection_write,
 )
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 MAX_REMOVE_TARGETS: Final[int] = 50
 
@@ -259,6 +268,14 @@ def _remove_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+def _connection_refusal(name: str) -> str:
+    return (
+        f"{name} cannot be a plan step: its connections may reach segments of other sequences, "
+        "it journals an intent but takes no checkpoint and has no revert, and a plan's group "
+        "would put nothing of it back without saying so. Call it on its own"
+    )
+
+
 def _register_write(
     registry: Registry, name: str, description: str, call: str, action: str
 ) -> None:
@@ -266,6 +283,7 @@ def _register_write(
     registry.register(
         OperationSpec(
             name=name,
+            plan_use=PlanUse(PlanKind.NEVER, refusal=_connection_refusal(name)),
             category="segment",
             description=description,
             effect="destructive",
@@ -273,9 +291,9 @@ def _register_write(
             params=_remove_params() if many else (segment_target_param(),),
             accepts=_ACCEPTS,
             to_python=_write_to_python(action),
-            undo_steps=no_undo_steps,
             precheck=_remove_precheck if many else None,
             wrap=run_connection_write,
+            phases=(PhaseSpec(PHASE_CHECK), PhaseSpec(PHASE_STEP)) if many else CHECK_PHASES,
             sample_args=_REMOVE_SAMPLE if many else None,
             requires=(call, *_WRITE_REQUIRES),
         )

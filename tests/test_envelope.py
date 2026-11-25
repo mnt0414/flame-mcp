@@ -5,9 +5,6 @@ Also the layer-3 byte-budget degrade."""
 from __future__ import annotations
 
 import json
-import shutil
-import uuid
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -17,20 +14,15 @@ from flame_mcp import errors as errors_mod
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.transport import BridgeResult, CrashInfo
 from flame_mcp.types import Category, OperationSpec
+from rig_fixtures import scratch_dir_fixture
 
 SCRATCH_ROOT = Path.home() / "Library" / "Application Support" / "flame-mcp" / "scratch" / "p14"
 
 
-@pytest.fixture
-def scratch_dir() -> Iterator[Path]:
-    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
-    d = SCRATCH_ROOT / uuid.uuid4().hex[:8]
-    d.mkdir(parents=True, exist_ok=True)
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+scratch_dir = scratch_dir_fixture(SCRATCH_ROOT)
 
 
-def _make_op(*, effect: str = "read", undo_steps: object = None) -> RegisteredOperation:
+def _make_op(*, effect: str = "read") -> RegisteredOperation:
     registry = Registry(symbols=frozenset())
     registry.register_category(
         Category(
@@ -49,7 +41,6 @@ def _make_op(*, effect: str = "read", undo_steps: object = None) -> RegisteredOp
             description="d",
             effect=effect,  # type: ignore[arg-type]
             to_python=lambda args: "_result = None",
-            undo_steps=undo_steps,  # type: ignore[arg-type]
         )
     )
     op = registry.get("test.op")
@@ -79,11 +70,11 @@ def _br(**overrides: object) -> BridgeResult:
 
 
 def test_build_envelope_success_shape() -> None:
-    env = envelope.build_envelope(ok=True, result=42, affected=1, undo_steps=1, duration_ms=7)
+    env = envelope.build_envelope(ok=True, result=42, affected=1, duration_ms=7)
     assert env["ok"] is True
     assert env["result"] == 42
     assert env["affected"] == 1
-    assert env["undoSteps"] == 1
+    assert "undoSteps" not in env
     assert env["partial"] is None
     assert env["pending"] is None
     assert env["error"] is None
@@ -127,7 +118,7 @@ def test_from_pre_bridge_error_unknown_operation_has_no_execution() -> None:
 
 
 def test_from_pre_bridge_error_policy_denied_has_execution_and_hint() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: affected)
+    op = _make_op(effect="reversible")
     env = envelope.from_pre_bridge_error(
         error="denied", error_code="POLICY_DENIED", op=op, duration_ms=3, hint="unset READONLY"
     )
@@ -145,7 +136,7 @@ def test_from_bridge_result_bridge_lost_has_no_context_and_has_crash() -> None:
         inflight_path=Path("/x/y.json"),
     )
     br = _br(ok=False, error_code="BRIDGE_LOST", error="lost", crash=crash, duration_ms=99)
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "BRIDGE_LOST"
     assert env["context"] is None  # never conflated with a rider that ran and got Nones
@@ -160,7 +151,7 @@ def test_from_bridge_result_bridge_lost_has_no_context_and_has_crash() -> None:
 def test_from_bridge_result_pending_is_ok_true_with_handle() -> None:
     op = _make_op()
     br = _br(ok=True, result=None, pending_handle="h123")
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is True
     assert env["pending"] == {"handle": "h123"}
     assert env["context"] is None
@@ -169,13 +160,13 @@ def test_from_bridge_result_pending_is_ok_true_with_handle() -> None:
 def test_from_bridge_result_malformed_wrapper_result_is_flame_api_error() -> None:
     op = _make_op()
     br = _br(ok=True, result="not-a-dict")
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "FLAME_API_ERROR"
 
 
 def test_from_bridge_result_op_error_maps_to_flame_api_error() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: affected)
+    op = _make_op(effect="reversible")
     raw = {
         "value": None,
         "affected": 0,
@@ -186,18 +177,17 @@ def test_from_bridge_result_op_error_maps_to_flame_api_error() -> None:
         "context": {"project": "P", "workspace": "W", "selected": 0},
     }
     br = _br(ok=True, result=raw)
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "FLAME_API_ERROR"
     assert env["error"] == "ValueError: boom"
     assert env["traceback"] == raw["opTraceback"]
     assert env["context"] == raw["context"]
     assert env["affected"] == 0
-    assert env["undoSteps"] == 0
 
 
 def test_from_bridge_result_op_error_code_selector_empty_is_passed_through() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: affected)
+    op = _make_op(effect="reversible")
     raw = {
         "value": None,
         "affected": 0,
@@ -209,14 +199,14 @@ def test_from_bridge_result_op_error_code_selector_empty_is_passed_through() -> 
         "context": {"project": "P", "workspace": "W", "selected": 0},
     }
     br = _br(ok=True, result=raw)
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "SELECTOR_EMPTY"
     assert env["error"] == "no match for 'R1' at path step 1"
 
 
 def test_from_bridge_result_unknown_op_error_code_falls_back_to_flame_api_error() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: affected)
+    op = _make_op(effect="reversible")
     raw = {
         "value": None,
         "affected": 0,
@@ -228,14 +218,14 @@ def test_from_bridge_result_unknown_op_error_code_falls_back_to_flame_api_error(
         "context": {"project": "P", "workspace": "W", "selected": 0},
     }
     br = _br(ok=True, result=raw)
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "FLAME_API_ERROR"
     assert "NOT_A_REAL_CODE" in env["error"]
 
 
 def test_from_bridge_result_verified_false_maps_to_silent_noop() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: affected)
+    op = _make_op(effect="reversible")
     raw = {
         "value": "ok",
         "affected": 1,
@@ -246,23 +236,15 @@ def test_from_bridge_result_verified_false_maps_to_silent_noop() -> None:
         "context": {"project": "P", "workspace": "W", "selected": 0},
     }
     br = _br(ok=True, result=raw)
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "SILENT_NOOP"
     assert env["error"] == "value did not stick"
     assert env["affected"] == 1
-    assert env["undoSteps"] == 1
 
 
-def test_from_bridge_result_success_maps_value_and_calls_undo_steps() -> None:
-    seen: dict[str, object] = {}
-
-    def undo_steps(args: dict[str, object], affected: int) -> int:
-        seen["args"] = args
-        seen["affected"] = affected
-        return affected * 2
-
-    op = _make_op(effect="reversible", undo_steps=undo_steps)
+def test_from_bridge_result_success_maps_value() -> None:
+    op = _make_op(effect="reversible")
     raw = {
         "value": {"renamed": True},
         "affected": 1,
@@ -273,12 +255,11 @@ def test_from_bridge_result_success_maps_value_and_calls_undo_steps() -> None:
         "context": {"project": "P", "workspace": "W", "selected": 3},
     }
     br = _br(ok=True, result=raw, duration_ms=12, app_log=("[warn] x",), app_log_note="note")
-    env = envelope.from_bridge_result(op, {"name": "new"}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is True
     assert env["result"] == {"renamed": True}
     assert env["affected"] == 1
-    assert env["undoSteps"] == 2
-    assert seen == {"args": {"name": "new"}, "affected": 1}
+    assert "undoSteps" not in env
     assert env["context"] == raw["context"]
     assert env["logs"] == ["[warn] x"]
     assert env["logsNote"] == "note"
@@ -334,7 +315,7 @@ def test_timeout_error_and_pending_client_side_timeout_keeps_its_own_error() -> 
 def test_from_bridge_result_timeout_queued_phase_sets_timeout_phase_no_pending() -> None:
     op = _make_op()
     br = _br(ok=False, error_code="TIMEOUT", error=None, timeout_phase="queued")
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "TIMEOUT"
     assert env["timeoutPhase"] == "queued"
@@ -348,7 +329,7 @@ def test_from_bridge_result_timeout_running_phase_sets_pending_handle() -> None:
     br = _br(
         ok=False, error_code="TIMEOUT", error=None, timeout_phase="running", pending_handle="h9"
     )
-    env = envelope.from_bridge_result(op, {}, br)
+    env = envelope.from_bridge_result(op, br)
     assert env["ok"] is False
     assert env["errorCode"] == "TIMEOUT"
     assert env["timeoutPhase"] == "running"
@@ -481,7 +462,7 @@ def _raw_with(**overrides: object) -> dict[str, object]:
 
 
 def test_from_bridge_result_op_error_keeps_the_result_and_partial() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: 0)
+    op = _make_op(effect="reversible")
     raw = _raw_with(
         value={"applied": ["a"], "failed": {"b": "silent_noop: ..."}},
         affected=1,
@@ -489,19 +470,18 @@ def test_from_bridge_result_op_error_keeps_the_result_and_partial() -> None:
         opError="set_attributes: applied 1, failed 1",
         opErrorCode="SILENT_NOOP",
     )
-    env = envelope.from_bridge_result(op, {}, _br(ok=True, result=raw))
+    env = envelope.from_bridge_result(op, _br(ok=True, result=raw))
     assert env["ok"] is False
     assert env["errorCode"] == "SILENT_NOOP"
     assert env["result"] == {"applied": ["a"], "failed": {"b": "silent_noop: ..."}}
     assert env["partial"] == {"applied": 1, "failed": 1}
     assert env["affected"] == 1
-    assert env["undoSteps"] == 0
 
 
 def test_from_bridge_result_success_passes_partial_through() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: 0)
+    op = _make_op(effect="reversible")
     raw = _raw_with(value="ok", partial={"applied": 3, "skipped": 1})
-    env = envelope.from_bridge_result(op, {}, _br(ok=True, result=raw))
+    env = envelope.from_bridge_result(op, _br(ok=True, result=raw))
     assert env["ok"] is True
     assert env["partial"] == {"applied": 3, "skipped": 1}
 
@@ -511,15 +491,15 @@ def test_from_bridge_result_success_passes_partial_through() -> None:
 )
 def test_from_bridge_result_drops_a_malformed_partial(garbage: object) -> None:
     op = _make_op()
-    env = envelope.from_bridge_result(op, {}, _br(ok=True, result=_raw_with(partial=garbage)))
+    env = envelope.from_bridge_result(op, _br(ok=True, result=_raw_with(partial=garbage)))
     assert env["ok"] is True
     assert env["partial"] is None
 
 
 def test_from_bridge_result_op_error_without_a_value_keeps_result_none() -> None:
-    op = _make_op(effect="reversible", undo_steps=lambda args, affected: 0)
+    op = _make_op(effect="reversible")
     raw = _raw_with(opError="boom", opErrorCode="SELECTOR_EMPTY")
-    env = envelope.from_bridge_result(op, {}, _br(ok=True, result=raw))
+    env = envelope.from_bridge_result(op, _br(ok=True, result=raw))
     assert env["result"] is None
     assert env["partial"] is None
 
@@ -553,10 +533,10 @@ def test_the_notice_is_on_failures_and_on_bridge_results_too() -> None:
     assert failed["notices"] == [envelope.MEDIA_PANEL_NOTICE]
     op = _make_op()
     raw = {"value": 1, "affected": 0, "opError": None, "opTraceback": None, "context": None}
-    env = envelope.from_bridge_result(op, {}, _br(ok=True, result=raw, app_log=(MEDIA_PANEL_LINE,)))
+    env = envelope.from_bridge_result(op, _br(ok=True, result=raw, app_log=(MEDIA_PANEL_LINE,)))
     assert env["ok"] is True and env["notices"] == [envelope.MEDIA_PANEL_NOTICE]
     lost = envelope.from_bridge_result(
-        op, {}, _br(ok=False, error_code="TIMEOUT", app_log=(MEDIA_PANEL_LINE,))
+        op, _br(ok=False, error_code="TIMEOUT", app_log=(MEDIA_PANEL_LINE,))
     )
     assert lost["notices"] == [envelope.MEDIA_PANEL_NOTICE]
 

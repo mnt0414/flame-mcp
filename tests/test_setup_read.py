@@ -19,6 +19,7 @@ from journal_test_helpers import BG1, Rig, make_rig
 from op_test_helpers import run_op
 from p32b_helpers import make_p32b_rig
 from p33_helpers import a_seg, seg_a, sel_at
+from rig_fixtures import rig_fixture
 from setup_xml_helpers import DEFAULT_XML, XmlBehaviour, install_effect_xml, install_node_xml
 from timeline_p32a_helpers import checkpoints, library_copy, seg_sel, wt
 
@@ -28,14 +29,10 @@ TW = "Timewarp"
 EXPO = {"kind": "node", "batch": BG1, "name": "exposure1"}
 
 
-@pytest.fixture
-def seg_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+seg_rig = rig_fixture(make_p32b_rig)
 
 
-@pytest.fixture
-def node_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+node_rig = rig_fixture(make_rig)
 
 
 @pytest.fixture

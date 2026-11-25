@@ -7,25 +7,20 @@ Run through the real Runtime with a scripted `transport.exec` over the fake Flam
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 import fake_selection_connections as fsc
 from fake_media_tree import PySegment
 from journal_test_helpers import Rig
 from p33_helpers import seg_a, seg_b
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import S2, a_seg, make_timeline_rig, seg_sel
+
+rig = rig_fixture(make_timeline_rig)
 
 REMOVE = "segment.remove_connection"
 CREATE = "segment.create_connection"
 CHECK = "journal.check"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def s2_seg(rig: Rig) -> PySegment:

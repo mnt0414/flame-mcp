@@ -42,19 +42,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import errors, execution
-from flame_mcp.checkpointed import ASCII_REFUSAL_HINT, _first_non_ascii
+from flame_mcp import errors
 from flame_mcp.colour_check import judge as judge_colour
 from flame_mcp.colour_check import problem_of
 from flame_mcp.desktop_run import (
     EXPECTED_ARG,
-    PHASE_ARG,
-    PHASE_READ,
     PHASE_WRITE,
-    pre_read_failure,
 )
 from flame_mcp.journal import STATE_LANDED, STATE_NOT_LANDED, STATE_PARTIAL, new_id, now_iso
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_clip_run import MEDIA_TYPES, _stable_selector, target_info
 from flame_mcp.render_files import (
@@ -70,18 +66,19 @@ from flame_mcp.render_files import (
     visible_folders,
     written_files,
 )
-from flame_mcp.render_run import (
+from flame_mcp.render_run import frames_verdict
+from flame_mcp.types import PHASE_ARG, ErrorCode
+from flame_mcp.write_run import (
     HANDLE_SOURCE_CLIENT,
+    Refused,
     RenderJudgement,
-    _fail_env,
-    _new_client_handle,
-    _refusal,
-    _remove_result_file,
-    _unknown_end,
-    frames_verdict,
+    append_intent,
+    check_ascii,
+    new_client_handle,
+    read_facts,
+    run_and_close,
+    settle_envelope,
 )
-from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -125,11 +122,6 @@ def preset_facts(preset: str) -> PresetFacts:
         for element in root.iter(tag)
     )
     return PresetFacts(text or None, poster)
-
-
-def preset_type(preset: str) -> str | None:
-    """The `<type>` element of an export preset (`image`, `movie`, `audio` ...)."""
-    return preset_facts(preset).type
 
 
 def expected_frames(preset: str, duration: Any, between_marks: bool) -> int | None:
@@ -237,8 +229,8 @@ def judge_export(
         return RenderJudgement(
             False,
             "FLAME_API_ERROR",
-            f"partial: export returned {returned!r} without an exception but only {written} of "
-            f"{expected} files (one per frame) were written",
+            f"{errors.PARTIAL_PREFIX} export returned {returned!r} without an exception but only "
+            f"{written} of {expected} files (one per frame) were written",
         )
     degraded: list[str] = []
     if returned is False:
@@ -302,7 +294,7 @@ def _intent_record(
     group_id: str,
     timeout_s: float,
     handle: str | None,
-) -> dict[str, Any]:
+) -> IntentRecord:
     before_files, hidden_count = directory_before(before)
     return {
         "type": "intent",
@@ -336,7 +328,7 @@ def _outcome_record(
     written: int,
     expected: int | None,
     unsure: str | None,
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     return {
         "type": "outcome",
         "id": intent_id,
@@ -363,7 +355,7 @@ def _existing_refusal(
     stable: Any,
     started: float,
 ) -> dict[str, Any]:
-    return _refusal(
+    return envelope_mod.refusal(
         op,
         "PRECONDITION_UNMET",
         f"nothing was exported: the output directory is not empty (it holds {len(existing)} "
@@ -381,39 +373,26 @@ def _existing_refusal(
     )
 
 
-def run_export(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
-) -> dict[str, Any]:
-    """The `wrap` of `render.export`."""
-    started = time.monotonic()
-    timeout_s = float(op_args["timeout_s"])
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        raw = pre_env.get("result")
-        if pre_env.get("ok") is not True or not isinstance(raw, dict):
-            return pre_read_failure(op, pre_env, "exported")
-        facts: dict[str, Any] = raw
-        stable = _stable_selector(facts, op_args["target"])
-        kind = facts.get("type")
-        if kind not in MEDIA_TYPES:
-            return _refusal(
+def _check_target(
+    op: RegisteredOperation, op_args: Mapping[str, Any], facts: Mapping[str, Any], started: float
+) -> Any:
+    """The stable selector of the target; `Refused` when it is not a clip / sequence or cannot be
+    found again."""
+    stable = _stable_selector(facts, op_args["target"])
+    kind = facts.get("type")
+    if kind not in MEDIA_TYPES:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "SELECTOR_TYPE",
                 f"nothing was exported: the target is a {kind}, not a PyClip / PySequence",
                 started,
                 result={"ran": False, "target": target_info(facts, stable)},
             )
-        if stable is None:
-            return _refusal(
+        )
+    if stable is None:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 "nothing was exported: the target has no wiretap id, so it could not be found "
@@ -422,11 +401,25 @@ def run_export(
                 result={"ran": False, "target": target_info(facts, stable)},
                 hint="Give a wiretap or a path selector.",
             )
-        colour = judge_colour(facts.get("colourScan")) if kind == "PySequence" else None
-        colour_problem = problem_of(colour) if colour is not None else None
-        skipped = bool(op_args.get("skip_colour_check", False)) and colour_problem is not None
-        if colour_problem is not None and not skipped:
-            return _refusal(
+        )
+    return stable
+
+
+def _check_colour(
+    op: RegisteredOperation,
+    op_args: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    stable: Any,
+    started: float,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The colour check of a sequence and, when `skip_colour_check` skipped a problem, that
+    problem; `Refused` for a problem that is not skipped."""
+    colour = judge_colour(facts.get("colourScan")) if facts.get("type") == "PySequence" else None
+    colour_problem = problem_of(colour) if colour is not None else None
+    skipped = bool(op_args.get("skip_colour_check", False)) and colour_problem is not None
+    if colour_problem is not None and not skipped:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 colour_problem,
@@ -437,105 +430,118 @@ def run_export(
                     "colour space is; skip_colour_check=true exports anyway."
                 ),
             )
-        issue = _first_non_ascii(
-            target=stable, uid=facts.get("uid"), wiretapId=facts.get("wiretapId")
         )
-        if issue is not None:
-            return _refusal(
-                op,
-                "INVALID_ARGS",
-                f"nothing was exported: {issue.path}: {issue.message}",
-                started,
-                result={"ran": False},
-                hint=ASCII_REFUSAL_HINT,
-            )
+    return colour, colour_problem if skipped else None
 
-        before = scan_tree(op_args["output_dir"], limit=EXPORT_SCAN_LIMIT)
-        if "" in before.unreadable:
-            return _refusal(
+
+def _check_output_dir(
+    op: RegisteredOperation,
+    op_args: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    stable: Any,
+    started: float,
+) -> Tree:
+    """The output directory as it is now; `Refused` unless it can be read, is small enough to
+    count afterwards and is empty."""
+    before = scan_tree(op_args["output_dir"], limit=EXPORT_SCAN_LIMIT)
+    info = {"ran": False, "target": target_info(facts, stable)}
+    if "" in before.unreadable:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 "nothing was exported: the output directory could not be read, so it cannot be "
                 "told whether it is empty",
                 started,
-                result={"ran": False, "target": target_info(facts, stable)},
+                result=info,
                 hint="Check the permissions of the directory, or use another one.",
             )
-        if before.truncated:
-            return _refusal(
+        )
+    if before.truncated:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 "nothing was exported: the output directory holds too many entries to tell "
                 "afterwards what the export wrote",
                 started,
-                result={"ran": False, "target": target_info(facts, stable)},
+                result=info,
                 hint="Use an empty or smaller directory.",
             )
-        existing = visible_entries(before)
-        if existing:
-            return _existing_refusal(op, existing, facts, stable, started)
+        )
+    existing = visible_entries(before)
+    if existing:
+        raise Refused(_existing_refusal(op, existing, facts, stable, started))
+    return before
 
+
+def run_export(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` of `render.export`."""
+    started = time.monotonic()
+    timeout_s = float(op_args["timeout_s"])
+    try:
+        facts = read_facts(rt, op, op_args, "exported")
+        stable = _check_target(op, op_args, facts, started)
+        colour, skipped_problem = _check_colour(op, op_args, facts, stable, started)
+        check_ascii(
+            op,
+            started,
+            "exported",
+            target=stable,
+            uid=facts.get("uid"),
+            wiretapId=facts.get("wiretapId"),
+        )
+        before = _check_output_dir(op, op_args, facts, stable, started)
         expected = expected_frames(
             op_args["preset"], facts.get("duration"), bool(op_args["between_marks"])
         )
         group_id = group if group is not None else new_id("g")
         intent_id = new_id("i")
-        client_handle = _new_client_handle(rt)
-        try:
-            rt.journal.append(
-                _intent_record(
-                    op,
-                    op_args,
-                    facts,
-                    stable,
-                    before,
-                    expected,
-                    intent_id=intent_id,
-                    group_id=group_id,
-                    timeout_s=timeout_s,
-                    handle=client_handle,
-                )
-            )
-        except OSError as exc:
-            return _refusal(
+        client_handle = new_client_handle(rt)
+        append_intent(
+            rt,
+            op,
+            _intent_record(
                 op,
-                "POLICY_DENIED",
-                f"nothing was exported: the journal cannot be written ({exc}), and this server "
-                "does not export without an intent on record",
-                started,
-                result={"ran": False},
-                hint=f"Make {rt.journal.directory} writable, then retry.",
-            )
-
-        run_args = {
-            **op_args,
-            "target": stable,
-            PHASE_ARG: PHASE_WRITE,
-            EXPECTED_ARG: facts.get("uid"),
-        }
-        env = execution.run_op(
-            op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s, handle=client_handle
+                op_args,
+                facts,
+                stable,
+                before,
+                expected,
+                intent_id=intent_id,
+                group_id=group_id,
+                timeout_s=timeout_s,
+                handle=client_handle,
+            ),
+            started,
+            done="exported",
+            action="export",
         )
-        end_code = env.get("errorCode")
-        if end_code in UNKNOWN_END_CODES or env.get("pending") is not None:
-            return _unknown_end(
-                rt,
-                env,
-                op,
-                intent_id,
-                group_id,
-                str(end_code or "TIMEOUT"),
-                timeout_s,
-                client_handle,
-                reads="the output directory",
-                noun="export",
-            )
-        finished = _finish(
+    except Refused as stop:
+        return stop.env
+    run_args = {
+        **op_args,
+        "target": stable,
+        PHASE_ARG: PHASE_WRITE,
+        EXPECTED_ARG: facts.get("uid"),
+    }
+    return run_and_close(
+        rt,
+        op,
+        run_args,
+        timeout_s=timeout_s,
+        handle=client_handle,
+        intent_id=intent_id,
+        group_id=group_id,
+        finish=lambda env: _finish(
             rt, op, env, op_args, facts, stable, before, expected, intent_id, group_id, started
-        )
-        if client_handle is not None and end_code != "BRIDGE_AMBIGUOUS":
-            _remove_result_file(rt, finished, client_handle)
-        return _with_colour_notes(finished, colour, colour_problem if skipped else None)
+        ),
+        reads="the output directory",
+        noun="export",
+        after=lambda env: _with_colour_notes(env, colour, skipped_problem),
+    )
 
 
 def _with_colour_notes(
@@ -558,6 +564,33 @@ def _with_colour_notes(
             *(f"colour spaces: {w}" for w in colour["warnings"]),
         ]
     return env
+
+
+def _export_result(
+    op_args: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    stable: Any,
+    flame: Mapping[str, Any],
+    found: Written,
+    expected: int | None,
+) -> dict[str, Any]:
+    shown, truncated = file_rows(found)
+    return {
+        "ran": True,
+        "target": target_info(facts, stable),
+        "preset": op_args["preset"],
+        "outputDir": op_args["output_dir"],
+        "betweenMarks": op_args["between_marks"],
+        "files": shown,
+        "filesTruncated": truncated,
+        "writtenCount": found.count,
+        "expectedFrames": expected,
+        "countComplete": found.complete,
+        "newFolders": found.folders[:EXISTING_CAP],
+        "returned": flame.get("returned"),
+        "elapsedS": flame.get("elapsedS"),
+        "undo": UNDO_NOTE,
+    }
 
 
 def _finish(
@@ -594,45 +627,21 @@ def _finish(
         expected=expected,
         unsure=unsure,
     )
-    shown, truncated = file_rows(found)
-    result: dict[str, Any] = {
-        "ran": True,
-        "target": target_info(facts, stable),
-        "preset": op_args["preset"],
-        "outputDir": op_args["output_dir"],
-        "betweenMarks": op_args["between_marks"],
-        "files": shown,
-        "filesTruncated": truncated,
-        "writtenCount": written,
-        "expectedFrames": expected,
-        "countComplete": found.complete,
-        "newFolders": found.folders[:EXISTING_CAP],
-        "returned": flame.get("returned"),
-        "elapsedS": flame.get("elapsedS"),
-        "undo": UNDO_NOTE,
-    }
-    if not judged.ok and judged.code is not None:
-        _fail_env(env, judged.code, judged.message or "")
-    env["result"] = result
-    env["affected"] = written
-    env["undoSteps"] = 0
-    env["partial"] = (
-        {"written": written, "expected": expected}
-        if expected is not None and written < expected and not judged.ok and not conflict
-        else None
+    return settle_envelope(
+        rt,
+        op,
+        env,
+        judged,
+        _outcome_record(intent_id, group_id, judged, flame, written, expected, unsure),
+        result=_export_result(op_args, facts, stable, flame, found, expected),
+        affected=written,
+        partial=(
+            {"written": written, "expected": expected}
+            if expected is not None and written < expected and not judged.ok and not conflict
+            else None
+        ),
+        degraded=judged.degraded,
+        intent_id=intent_id,
+        group_id=group_id,
+        started=started,
     )
-    env["degraded"] = [*env.get("degraded", []), *judged.degraded]
-    env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    env["durationMs"] = elapsed_ms(started)
-    try:
-        rt.journal.append(
-            _outcome_record(intent_id, group_id, judged, flame, written, expected, unsure)
-        )
-    except OSError as exc:
-        rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-        env["degraded"] = [
-            *env["degraded"],
-            f"the outcome could not be journaled ({exc}); the run's answer stands but this "
-            "server now refuses writes until journal.check has settled the intent",
-        ]
-    return env

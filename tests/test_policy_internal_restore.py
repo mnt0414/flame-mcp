@@ -12,14 +12,12 @@ from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
 from reformat_helpers import make_reformat_rig, reformat
 from reformat_helpers import revert as reformat_revert
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import a_seg, make_timeline_rig, revert, trim
 
+rig = rig_fixture(make_timeline_rig)
+
 NO_DESTRUCTIVE = {"FLAME_MCP_ALLOW_EFFECTS": "read,reversible,create"}
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def test_timeline_revert_is_denied_without_destructive(rig: Rig) -> None:

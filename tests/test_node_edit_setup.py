@@ -17,6 +17,7 @@ import pytest
 from fake_media_tree import PyNode
 from flame_mcp import setup_edit
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 from setup_xml_helpers import XmlBehaviour, install_node_xml
 
 EDIT = "node.edit_setup"
@@ -24,9 +25,7 @@ EXPO = {"kind": "node", "batch": BG1, "name": "exposure1"}
 BLUR = {"kind": "node", "batch": BG1, "name": "blur1"}
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 @pytest.fixture

@@ -6,11 +6,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from flame_mcp.desktop_run import run_library_create
+from flame_mcp.desktop_run import CREATED_REVERT_PHASES, PHASE_READ, run_library_create
 from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
-from flame_mcp.ops.desktop import _create_to_python, _no_undo_steps
+from flame_mcp.ops.desktop import _create_to_python
 from flame_mcp.registry import Registry
-from flame_mcp.types import Category, OperationParam, OperationSpec
+from flame_mcp.types import (
+    Category,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+)
 
 CATEGORY = Category(
     name="library",
@@ -62,8 +69,19 @@ _CREATE_DESCRIPTION = (
     "and nothing is deleted. A library that is closed (it reads as empty) is opened for the "
     "revert and closed again afterwards (result.librariesOpened); one that cannot be opened "
     "stops it (PRECONDITION_UNMET). "
-    "Native Ctrl+Z is not used (undoSteps 0). Not allowed in plan.run (it owns its journal "
+    "Native Ctrl+Z is not used. Not allowed in plan.run (it owns its journal "
     "group)."
+)
+
+
+_PLAN_USE_LIBRARY_CREATE = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "library.create cannot be a plan step: it journals a `desktop_create` intent that is "
+        "reverted by deleting the library it made (only while it is empty), and a plan's single "
+        "group is reverted by putting attribute values back -- it would skip such an intent "
+        "without saying so. Call it on its own"
+    ),
 )
 
 
@@ -73,6 +91,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="library.create",
+            plan_use=_PLAN_USE_LIBRARY_CREATE,
             category="library",
             description=_CREATE_DESCRIPTION,
             effect="create",
@@ -97,7 +116,7 @@ def register(registry: Registry) -> None:
                 ),
             ),
             to_python=_create_library_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(*CREATED_REVERT_PHASES, PhaseSpec(PHASE_READ)),
             wrap=run_library_create,
             sample_args={"name": "sample"},
             requires=(

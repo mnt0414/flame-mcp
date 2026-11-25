@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import (
     FakeAttr,
     FakeFlame,
@@ -22,17 +23,10 @@ from fake_media_tree import (
     PyWriteFileNode,
 )
 from flame_mcp import selectors
-from flame_mcp.ops import register_all
 from flame_mcp.registry import Registry
 from flame_mcp.types import Category, OperationParam, OperationSpec
 from op_test_helpers import run_op
 from test_ops_attributes import BG1, make_batch_world
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def resolver_registry() -> Registry:

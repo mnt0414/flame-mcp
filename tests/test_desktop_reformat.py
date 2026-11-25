@@ -39,12 +39,10 @@ from reformat_helpers import (
     untouched_world,
     wt,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import fingerprint_of_target
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_reformat_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_reformat_rig)
 
 
 def test_reformats_a_clip_in_place_and_reads_the_new_size_back(rig: Rig) -> None:
@@ -64,7 +62,7 @@ def test_reformats_a_clip_in_place_and_reads_the_new_size_back(rig: Rig) -> None
     assert row["changed"] is True and row["skipped"] is False
     assert env["result"]["mode"] == "in_place" and env["result"]["partial"] is False
     assert env["result"]["requested"] == 1 and env["result"]["notReformatted"] == []
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert env["journal"]["revert"] == {
         "op": "journal.revert",
         "args": {"group": env["journal"]["group"]},

@@ -10,10 +10,7 @@ scripts/p2_3b_node_action_e2e.py."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import FakeAttr, PyActionNode, PyBatch, PyCoNode
 from flame_mcp.journal import Index
@@ -21,6 +18,7 @@ from flame_mcp.node_prelude import ACTION_LINK_TYPES
 from flame_mcp.types import SelectorKind
 from journal_test_helpers import BG1, Rig, make_rig
 from op_test_helpers import run_op
+from rig_fixtures import rig_fixture
 
 ACTION = {"kind": "node", "batch": BG1, "name": "action1"}
 BLUR = {"kind": "node", "batch": BG1, "name": "blur1"}
@@ -30,9 +28,7 @@ def inner(name: str, action: dict[str, Any] = ACTION) -> dict[str, Any]:
     return {"kind": "action_node", "node": action, "name": name}
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def action_node(rig: Rig, name: str = "action1") -> PyActionNode:

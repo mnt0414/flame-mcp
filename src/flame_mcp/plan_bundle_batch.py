@@ -27,14 +27,17 @@ from flame_mcp import execution, selectors
 from flame_mcp.callargs import apply_param_defaults
 from flame_mcp.checkpointed import declared_run_args
 from flame_mcp.checkpoints import BATCH_KIND
+from flame_mcp.journal import JournalLink
 from flame_mcp.plan_bundle import (
     SKIPPED_KEY,
     BundleTarget,
     StepLike,
     is_bundled_op,
+    no_pinned_target,
     single_target,
     unreadable,
     unresolved,
+    with_late_rows,
 )
 from flame_mcp.reel_kinds import reel_kinds_named
 from flame_mcp.registry import RegisteredOperation, Registry
@@ -60,10 +63,6 @@ CREATED_AS_HINT: Final[str] = (
     "The node was made as {actual!r}, not as {wanted!r}. A later step must point at "
     "{actual!r} or carry `late: true`."
 )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def group_selector(step: StepLike) -> dict[str, Any]:
@@ -185,7 +184,6 @@ def preresolve_op() -> RegisteredOperation:
             description="internal: resolve a bundled plan's node selectors up front",
             effect="read",
             to_python=_preresolve_to_python,
-            undo_steps=_no_undo_steps,
             requires=("PyBatch.nodes", "PyBatch.uid", "PyBatch.name", "PyNode.attributes"),
         )
     )
@@ -250,7 +248,10 @@ def preresolve(ctx: ServerContext, steps: Sequence[StepLike]) -> BundleTarget:
     has been journaled or copied) when one does not resolve, when the writes are not all to one
     Batch group, or when that one cannot be found again by its uid."""
     writes = [s for s in steps if s.op is not None and is_bundled_op(s.op, BATCH_KIND)]
-    rows, specs = _rows(writes)
+    pinned = [s for s in writes if not s.has_refs]  # a step with references is late: its
+    if not pinned:  # selectors are known only when it is sent, so it pins no group
+        raise no_pinned_target(BATCH_KIND.subject)
+    rows, specs = _rows(pinned)
     env = execution.run_op(preresolve_op(), {SPECS_ARG: specs}, run_dir=ctx.run_dir)
     raw = env.get("result")
     value: dict[str, Any] = raw if isinstance(raw, dict) else {}
@@ -263,7 +264,8 @@ def preresolve(ctx: ServerContext, steps: Sequence[StepLike]) -> BundleTarget:
     ident, stable, uid = single_target(
         BATCH_KIND, [(r.step, a["target"]) for r, a in zip(rows, answers, strict=True)]
     )
-    return BundleTarget(BATCH_KIND, ident, stable, uid, _resolved(writes, rows, answers))
+    resolved = with_late_rows(_resolved(pinned, rows, answers), writes, nodes=[])
+    return BundleTarget(BATCH_KIND, ident, stable, uid, resolved)
 
 
 def _resolved(
@@ -358,13 +360,19 @@ def _check_created_name(step: StepLike, env: dict[str, Any]) -> dict[str, Any]:
     return env
 
 
-def _rebound_value_write(
-    op: RegisteredOperation, args: dict[str, Any], stable: Any
+def rebound(
+    op: RegisteredOperation, args: dict[str, Any], stable: dict[str, Any]
 ) -> dict[str, Any]:
-    sel = args["target"]
+    """`args` with the Batch group the step writes to (what `plan_bundle.Rebound` names) pointed
+    at the one the plan pinned: a checkpointed op as it declares, a `node.set_attributes` /
+    `action.set_attributes` by the `batch` of its node selector, any other op not at all."""
+    spec = op.checkpoint
+    if spec is not None and spec.target_kind == BATCH_KIND.name:
+        return declared_run_args(spec, args, stable)
     if op.name == "node.set_attributes":
-        return {**args, "target": {**sel, "batch": stable}}
+        return {**args, "target": {**args["target"], "batch": stable}}
     if op.name == "action.set_attributes":
+        sel = args["target"]
         return {**args, "target": {**sel, "node": {**sel["node"], "batch": stable}}}
     return args
 
@@ -382,11 +390,12 @@ def step_runner(
         assert op is not None and step.op_name is not None
         spec = op.checkpoint
         if spec is None or spec.target_kind != BATCH_KIND.name:
-            args = _rebound_value_write(op, step.args, target.stable)
-            return ctx.do(step.op_name, args, group=group)
+            return ctx.do(
+                step.op_name, rebound(op, step.args, target.stable), link=JournalLink(group)
+            )
         filled = dict(step.args)
         apply_param_defaults(op, filled)
-        run_args = declared_run_args(spec, filled, target.stable)
+        run_args = rebound(op, filled, target.stable)
         if spec.check is not None:
             refusal = spec.check(ctx, run_args)
             if refusal is not None:

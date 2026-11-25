@@ -15,14 +15,17 @@ from flame_mcp.errors import as_error_code
 from flame_mcp.ops._common import REEL_CLIP_NOTE, build_source, raise_on_error_src
 from flame_mcp.timeline_restore import NOT_RESTORED
 from flame_mcp.types import (
+    PHASE_ARG,
     CheckpointCheck,
     CheckpointSpec,
     OperationParam,
+    PhaseSpec,
     Refusal,
 )
 
-PHASE_ARG: Final[str] = "_phase"
 PHASE_CHECK: Final[str] = "check"
+CHECK_PHASES: Final[tuple[PhaseSpec, ...]] = (PhaseSpec(PHASE_CHECK),)
+"""The phases of an op whose `checkpoint.check` is `make_check`."""
 REFUSAL_HINT_KEY: Final[str] = "refusalHint"
 """A Flame-side check may put a hint for its own refusal under this key of its result; the refusal
 carries it instead of the generic hint of the error code, and it is not kept in the result."""
@@ -59,8 +62,8 @@ CHECKPOINTED_SEGMENT_NOTE: Final[str] = (
     "and nothing is touched; force=true overrides, journaled). Timeline restore: the edited "
     "sequence is moved into the stash reel (result.preCheckpoint: the revert can itself be "
     "undone) and the stashed copy is copied back, with a new uid and wiretap id at the end of "
-    "its reel. Not put back: " + "; ".join(NOT_RESTORED) + ". Native Ctrl+Z is not used "
-    "(undoSteps 0). Segment edits run on Flame's main thread only. In plan.run: a plan that holds "
+    "its reel. Not put back: " + "; ".join(NOT_RESTORED) + ". Native Ctrl+Z is not used. "
+    "Segment edits run on Flame's main thread only. In plan.run: a plan that holds "
     "this step is one checkpointed write on this sequence (one stashed copy, journal.revert(group) "
     "is one restore; the step's own checkpoint is not taken); see plan.run. "
     + REEL_CLIP_NOTE
@@ -72,10 +75,6 @@ def segment_target_param() -> OperationParam:
     return OperationParam(
         name="target", type="selector", description=SEGMENT_TARGET_DESCRIPTION, required=True
     )
-
-
-def no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def group_selector(args: Mapping[str, Any]) -> Mapping[str, Any]:

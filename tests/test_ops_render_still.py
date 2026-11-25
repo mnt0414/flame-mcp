@@ -39,7 +39,10 @@ from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from flame_mcp.server import create_server
 from journal_test_helpers import Rig, make_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import CLIPX, S1, make_timeline_rig, wt
+
+rig = rig_fixture(make_timeline_rig)
 
 OP = "render.still"
 PRESET_REL = "export/presets/flame/file_sequence/Tiff/Tiff (16-bit LZW).xml"
@@ -116,11 +119,6 @@ def still_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stub_log: Path) -
     for name in ("STUB_SLEEP", "STUB_EXIT", "STUB_BYTES_PER_PX"):
         monkeypatch.delenv(name, raising=False)
     return {"ffmpeg": ffmpeg, "stills": stills, "presets": presets}
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def clipx(rig: Rig) -> PyClip:
@@ -478,7 +476,7 @@ def test_one_frame_is_exported_converted_and_the_temporary_copy_is_gone(
     assert call["between_marks"] is True and call["foreground"] is True
     assert call["output_dir"] == str(stills[0])
     assert call["preset"].endswith(PRESET_REL)
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert env["journal"]["undo"] == "unsupported" and env["journal"]["revert"] is None
     assert len(ffmpeg_calls(stub_log)) == 1
 

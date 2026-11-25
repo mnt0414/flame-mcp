@@ -103,11 +103,11 @@ scripts/make_p2_av_media.sh
 ### Run the tests
 
 Run one test. The optional second argument is the number of seconds to wait for Flame to exit
-by itself after the client returns. The default is 600.
+by itself after the client returns. The default is 120.
 
 ```bash
 scripts/run_e2e.sh p2_2a_journal
-scripts/run_e2e.sh p2_2a_journal 900
+scripts/run_e2e.sh p2_2a_journal 300
 ```
 
 Run every test, one after another, and clean up at the end. Give names to run only those.
@@ -156,12 +156,11 @@ folder.
 ### Clean up
 
 `scripts/regress.sh` runs the clean-up when it finishes. After a single run, run it yourself.
-The first command prints what the script would delete, keep and create. The second does it. The
-number 900 is how many seconds to wait for Flame to exit.
+The first command prints what the script would delete, keep and create. The second does it.
 
 ```bash
-scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py 900 -- --mode dry-run
-scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py 900 -- --mode apply
+scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py -- --mode dry-run
+scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py -- --mode apply
 ```
 
 The script deletes only libraries, Batch groups and reel groups whose names have the form a test
@@ -179,7 +178,7 @@ the order the tests were written. It has no other meaning.
 | `p3_2b_plan_delete` | `p3` | `plan.run` with Timeline writes (one checkpoint, one revert), `desktop.delete` and its revert, how `desktop.move` handles a Timeline, `journal.purge_checkpoints`, and `journal.check` of the new intents. `desktop.delete` with `without_backup` deletes a clip with no stashed copy next to a stashed sequence, and its revert puts back only the sequence. | - |
 | `p3_2a_checkpoint` | `p3` | `timeline.fingerprint`, `timeline.checkpoint`, `segment.trim` (the first write behind a Timeline checkpoint), `journal.revert` and `journal.restore_checkpoint` of a sequence, and `journal.check`. | - |
 | `p3_1b_write` | `p3` | `mediahub.import`, `desktop.duplicate` and `desktop.move`, with their journal groups, `journal.revert` and `journal.check`. | - |
-| `p3_1a_read` | `p3` | The segment selector by `record_in`, `timeline.list_segments` with effects, `segment.list_effects`, `segment.shared_sources`, `desktop.find`, `desktop.info`, and the `width`, `height` and `bitDepth` that `desktop.list_children` returns for clips and sequences. | - |
+| `p3_1a_read` | `p3` | The segment selector by `record_in`, `timeline.list_segments` with effects, `segment.list_effects`, `segment.shared_sources`, `desktop.find`, `desktop.info`, and the `width`, `height` and `bitDepth` that `desktop.list_children` returns for clips and sequences, and `timeline.list_segments` with `all_tracks=true` on the two-track S1: its `trackCount` equals the track count of `timeline.info`, each track's `total` and `items` equal a read of that track alone, `limit=1` marks the track with two or more segments `truncated`, and `all_tracks` with `track=1` is `INVALID_ARGS`. | - |
 | `p1_bridge` | `p1` | The bridge over its socket: hello and ping, `exec` on the main thread, how an exception is reported, that a request sent to a blocked main thread is not executed, 200 consecutive reads, and a burst of writes. | Has its own orchestrator, `scripts/run_p1_bridge_e2e.sh`. |
 | `p1_transport` | `p1` | The server transport: discovery, `exec`, errors and timeouts, and what it reports when Flame is killed (`BRIDGE_LOST`, the in-flight file left behind, a stale socket). | Has its own orchestrator, `scripts/run_p1_transport_e2e.sh`. |
 | `p1_mcp` | `p1` | Eight basic operations (reads of the project, libraries, desktop, timeline and segments, and `desktop.rename`) and `project.save` through the MCP server: the catalog, the answers, a rename and its revert, the refusal of a rename inside a library, the error cases, and the save (ok, and its `readBackDecisive` is false). | - |
@@ -208,6 +207,7 @@ the order the tests were written. It has no other meaning.
 | `p5_batch_fx_loss` | `p3` | A restore of a Batch checkpoint names, in `result.timelineFxLost`, the reel clips whose Timeline FX were fewer after the restore, and leaves the clips that kept theirs out of it. | - |
 | `p5_render_clip` | `p3` | `render.clip` renders the Blur of a Desktop clip and of a Batch reel clip. It refuses a clip without Timeline FX, a clip that is already rendered (unless `force=true`) and a clip in a library. A render that outlasts `timeout_s` is decided by `journal.check`. | - |
 | `p5_plan_batch` | `p3` | A `plan.run` of Batch node edits is one checkpointed write, in a group that is not the current one and in the current one. The plan creates Blur b1 and Mux m1, connects b1 to m1 by the names the plan gave them, sets a note on a node that was there and deletes a node that was there. When it passes, the transport reads the edits and the journal holds one checkpoint. When its third step is made to fail, the first two stay applied. One `journal.revert` brings back the node names, the connections, the notes (the one the plan set included) and the `batch.fingerprint` the group had before. A plan whose node does not resolve runs nothing. | - |
+| `p107_plan_loop` | `p3` | A `plan.run` step can use a value of an earlier step (`{{ steps.<id>.result.<path> }}`), and a reference with no value stops the plan before the step is sent. A read loop of `plan.for_each` runs one step per item and honours `where` and `expect_count`. A write loop is confirmed by default (`dry_run` writes nothing, `approve` works once, a wrong digest runs nothing), one `journal.revert` of its parent group puts every item back, a loop that stops at a failed item says what ran, and `only` goes on with the rest. With FLAME_MCP_LOOP_UNATTENDED=1 a loop of renames runs in one call, but a loop of desktop.delete / desktop.reformat (rewrite) still needs `approve`. A loop that sets `allow_overwrite` is refused in every mode (with and without FLAME_MCP_LOOP_UNATTENDED=1), and a render loop (render.batch) is listed for review and not run. | - |
 | `p5_setup_edit` | `p3` | `segment.edit_effect_setup` sets `TW_FrameMode` of a Timewarp on a Desktop reel clip from 2 to 0, and an independent read of the setup (by transport) says 0. A second call with the same value is `PRECONDITION_UNMET`, and a value with `<` is `INVALID_ARGS`; neither leaves an intent in the journal. `journal.revert` puts the clip back to 2. A `plan.run` of three edits on the three segments of one sequence is one checkpoint, and one revert puts all three back. `node.edit_setup` does the same on a Timewarp node of a Batch group, and its revert puts the node back. Given the `file` argument, it edits the own file of a node that saves more than one file. `segment.read_effect_setup` and `node.read_setup` read tags without writing, and leave no work folder and no journal record. | - |
 | `p6_list_all` | `p3` | `desktop.list_all` lists a Desktop reel group, a Batch group, an open library with a folder and a closed library in the order an independent walk reads them, names the closed library in `closedLibraries` without opening it (`opened` is the same before and after), lists the Batch group by name without reading inside it, keeps the current Batch group, honours `types`, `scope` and paging, and refuses a scope outside the enum and a `types` that is not a list of strings. | - |
 | `w3_timewarp` | `p3` | `segment.trim` and `segment.slip` on a segment that has a Timewarp, and on a clip whose tail is 'infinite' before the edit (that side is not judged). | Skipped, and Flame is not started, unless `FLAME_MCP_W3_SETUP` names an existing file. |

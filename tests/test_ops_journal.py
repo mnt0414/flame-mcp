@@ -12,11 +12,9 @@ from flame_mcp.journal import new_id, now_iso
 from flame_mcp.policy import Policy, deny_operation
 from flame_mcp.runtime import TestHooks
 from journal_test_helpers import BG1, COMP, REEL_WIRETAP, Rig, make_rig
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def set_values(rig: Rig, values: dict[str, Any]) -> dict[str, Any]:
@@ -253,7 +251,7 @@ def test_revert_puts_the_previous_values_back_and_records_a_new_group(rig: Rig) 
 def test_revert_reports_affected_keys_and_no_native_undo(rig: Rig) -> None:
     env = set_values(rig, {"blend_type": "Gimp", "pos_x": 5.0})
     back = rig.do("journal.revert", {"group": env["journal"]["group"]})
-    assert back["affected"] == 2 and back["undoSteps"] == 0
+    assert back["affected"] == 2
 
 
 def test_revert_restores_a_rename(rig: Rig) -> None:

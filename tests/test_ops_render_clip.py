@@ -22,15 +22,13 @@ from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from flame_mcp.transport import BridgeResult
 from journal_test_helpers import FakeBridge, Rig, bridge_result, make_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import S1, make_timeline_rig, media, wt
+
+rig = rig_fixture(make_timeline_rig)
 
 OP = "render.clip"
 HEX32 = "0123456789abcdef"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def fx_clip(container: Any, name: str, effects: tuple[str, ...] = ("Blur",)) -> PyClip:
@@ -172,7 +170,7 @@ def test_a_render_makes_the_fx_rendered_and_reads_it_back(rig: Rig, clip: PyClip
             "include_handles": False,
         }
     ]
-    assert env["affected"] == 1 and env["undoSteps"] == 0 and env["degraded"] == []
+    assert env["affected"] == 1 and env["degraded"] == []
     assert env["journal"]["undo"] == "unsupported" and env["journal"]["revert"] is None
 
 
@@ -722,7 +720,6 @@ def test_the_declarations(rig: Rig) -> None:
     assert op.thread == "main-async" and op.wrap is not None
     assert op.checkpoint is None and op.journal is None
     assert op.accepts == ("wiretap", "path", "selection")
-    assert op.undo_steps({}, 1) == 0
     params = {p.name: p for p in op.params}
     assert list(params) == [
         "target",

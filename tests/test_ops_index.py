@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+from test_ops_catalog import REGISTERED_OP_COUNT
+
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
 
@@ -30,5 +32,5 @@ def test_the_index_shows_each_summary_sentence_whole() -> None:
     generator = _generator()
     rendered = generator.render(generator._build_registry())
     rows = [line for line in rendered.splitlines() if line.startswith("| `")]
-    assert len(rows) == 111
+    assert len(rows) == REGISTERED_OP_COUNT
     assert not [row for row in rows if row.endswith("… |")]

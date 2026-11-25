@@ -26,7 +26,7 @@
 # runs before the second launch.
 #
 # Usage: run_p2_4_restart_e2e.sh [TIMEOUT]
-#   [TIMEOUT]  seconds to wait for Flame to exit by itself after the client returns (default 600)
+#   [TIMEOUT]  seconds to wait for Flame to exit by itself after the client returns (default 120)
 #
 # This script starts Flame twice itself.
 set -euo pipefail
@@ -37,7 +37,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_lib.sh"
 P2_DIR="$APP_SUPPORT/p2"
 E2E_CLIENT="$SCRIPT_DIR/p2_4_restart_e2e.py"
 
-TIMEOUT="${1:-600}"
+TIMEOUT="${1:-$EXIT_WAIT_S}"
 GONE_WAIT_S=30
 
 e2e_init "$P2_DIR"

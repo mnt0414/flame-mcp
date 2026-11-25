@@ -19,7 +19,7 @@ from flame_mcp.ops._node_common import (
     rebind_node,
     rebind_params,
 )
-from flame_mcp.ops._segment_edit import PHASE_ARG, PHASE_CHECK, make_check
+from flame_mcp.ops._segment_edit import CHECK_PHASES, PHASE_CHECK, make_check
 from flame_mcp.ops._setup_edit import (
     EDIT_NOTE,
     keep_files_param,
@@ -29,7 +29,7 @@ from flame_mcp.ops._setup_edit import (
 )
 from flame_mcp.ops.node_writes import NODE_REQUIRES
 from flame_mcp.registry import Registry
-from flame_mcp.types import CheckpointSpec, OperationParam, OperationSpec, Refusal
+from flame_mcp.types import PHASE_ARG, CheckpointSpec, OperationParam, OperationSpec, Refusal
 
 EDIT_OP: Final[str] = "node.edit_setup"
 
@@ -95,14 +95,11 @@ def _to_python(args: Mapping[str, Any]) -> str:
     )
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=EDIT_OP,
+            brief_paths=("node",),
             category="node",
             description=_DESCRIPTION,
             effect="reversible",
@@ -133,7 +130,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_to_python,
-            undo_steps=_no_undo_steps,
+            phases=CHECK_PHASES,
             precheck=_precheck,
             checkpoint=CheckpointSpec(
                 group_selector=lambda a: batch_of_node(a["target"]),

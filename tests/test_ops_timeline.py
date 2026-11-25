@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import (
     PyAudioChannel,
     PyAudioTrack,
@@ -20,17 +21,9 @@ from fake_media_tree import (
     build_default_tree,
 )
 from flame_mcp.callargs import apply_param_defaults
-from flame_mcp.ops import register_all
 from flame_mcp.opschema import validate_op_args
-from flame_mcp.registry import Registry
 from op_test_helpers import run_op
 from timeline_p32a_helpers import S1, make_timeline_rig
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def _seq_target(h: dict[str, object]) -> dict[str, object]:

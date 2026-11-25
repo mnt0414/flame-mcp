@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from flame_mcp import server as server_mod
-from flame_mcp.ops import register_all
+from flame_mcp import agent_context
 from flame_mcp.registry import Registry
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,20 +55,13 @@ PROSE_FILES = [
 SRC_FILES = sorted((ROOT / "src").rglob("*.py"))
 
 
-@pytest.fixture(scope="module")
-def registry() -> Registry:
-    reg = Registry()
-    register_all(reg)
-    return reg
-
-
 def _texts(reg: Registry) -> list[tuple[str, str]]:
     texts: list[tuple[str, str]] = []
     for op in reg.list_ops():
         texts.append((f"op {op.name}", op.description))
         texts += [(f"param {op.name}.{p.name}", p.description) for p in op.params]
     texts += [(f"category {name}", c.description) for name, c in reg.categories().items()]
-    texts.append(("flame_context", json.dumps(server_mod._static_context(reg))))
+    texts.append(("flame_context", json.dumps(agent_context.static_context(reg))))
     return texts
 
 

@@ -24,12 +24,10 @@ from p32b_helpers import (
     uid,
     wt,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import reel_names, stash_library
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def group_reels(rig: Rig) -> list[str]:
@@ -57,7 +55,7 @@ def test_an_empty_reel_is_deleted_without_a_stash(rig: Rig) -> None:
     assert row["from"]["type"] == "PyReel" and row["from"]["name"] == "Reel 2"
     assert row["from"]["uid"] == old and row["from"]["parent"]["name"] == "RG"
     assert row["stash"] is None and row["checkpoint"] is None
-    assert env["result"]["partial"] is False and env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["result"]["partial"] is False and env["affected"] == 1
     assert stash_library(rig) is None
     assert env["journal"]["revert"]["op"] == "journal.revert"
     kinds = [r["type"] for r in rig.records()]

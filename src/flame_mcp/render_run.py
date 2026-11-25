@@ -33,14 +33,12 @@ Everything about the filesystem is in `render_files`; the Flame side is `render_
 from __future__ import annotations
 
 import time
-import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import errors, execution, transport
-from flame_mcp.checkpointed import note_unresolved, refuse_if_denied
+from flame_mcp import errors
+from flame_mcp.checkpointed import refuse_if_denied
 from flame_mcp.journal import (
     STATE_LANDED,
     STATE_NOT_LANDED,
@@ -48,7 +46,7 @@ from flame_mcp.journal import (
     new_id,
     now_iso,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.render_files import (
     MISSING_CAP,
@@ -61,9 +59,16 @@ from flame_mcp.render_files import (
     written_since,
 )
 from flame_mcp.render_plan import frames_of, preflight_problems
-from flame_mcp.transport import BridgeProtocolError, elapsed_ms
 from flame_mcp.types import ErrorCode, ServerOpError
-from flame_mcp_bridge.impl import FEATURE_CLIENT_HANDLE
+from flame_mcp.write_run import (
+    HANDLE_SOURCE_CLIENT,
+    Refused,
+    RenderJudgement,
+    append_intent,
+    new_client_handle,
+    run_and_close,
+    settle_envelope,
+)
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -74,44 +79,6 @@ MAX_FRAMES_LIMIT: Final[int] = 100_000
 RENDER_KIND: Final[str] = "render"
 """`kind` of a render intent in the journal (`journal.check` dispatches on it)."""
 _NOT_FOUND_CODE: Final[str] = "SELECTOR_EMPTY"
-BRIDGE_BUSY_NOTE: Final[str] = (
-    "While a Foreground render is still running the bridge may not answer at all, not even to its "
-    "hello: wait a little, then run journal.check again."
-)
-BRIDGE_BUSY_CODES: Final[frozenset[str]] = frozenset({"BRIDGE_UNAVAILABLE", "TIMEOUT"})
-HANDLE_SOURCE_CLIENT: Final[str] = "client"
-"""`handleSource` of an intent whose `handle` this server chose and sent to the bridge."""
-_PENDING_NOTE: Final[str] = (
-    "the bridge answered with a pending handle: the render was still running when timeout_s elapsed"
-)
-
-
-def _new_client_handle(rt: Runtime) -> str | None:
-    """A fresh handle for the run when the live bridge announces `client_handle`, else None (an
-    older bridge would ignore it and use its own)."""
-    if FEATURE_CLIENT_HANDLE in transport.probe_features(rt.run_dir):
-        return uuid.uuid4().hex
-    return None
-
-
-def _refusal(
-    op: RegisteredOperation,
-    code: ErrorCode,
-    message: str,
-    started: float,
-    *,
-    result: Any = None,
-    hint: str | None = None,
-) -> dict[str, Any]:
-    return envelope_mod.build_envelope(
-        ok=False,
-        result=result,
-        error=message,
-        error_code=code,
-        execution=envelope_mod.execution_meta(op),
-        duration_ms=elapsed_ms(started),
-        hint_override=hint,
-    )
 
 
 def _node_targets(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -149,7 +116,7 @@ def _intent_record(
     group_id: str,
     timeout_s: float,
     handle: str | None,
-) -> dict[str, Any]:
+) -> IntentRecord:
     nodes = [
         {
             "name": t["name"],
@@ -239,73 +206,6 @@ def frames_verdict(written: int, expected: int) -> str | None:
     return STATE_PARTIAL if written > 0 else STATE_NOT_LANDED
 
 
-def _fail_env(env: dict[str, Any], code: ErrorCode, message: str) -> None:
-    env.update(
-        ok=False,
-        error=message,
-        errorCode=code,
-        hint=errors.hint_for(code),
-        retryable=errors.is_retryable(code),
-    )
-
-
-def _unknown_end(
-    ctx: Runtime,
-    env: dict[str, Any],
-    op: RegisteredOperation,
-    intent_id: str,
-    group_id: str,
-    code: str,
-    timeout_s: float,
-    client_handle: str | None,
-    *,
-    reads: str = "Flame and the output files",
-    noun: str = "render",
-) -> dict[str, Any]:
-    """`noun` is what the hint and the notes call the thing that may still be running."""
-    ctx.guard.block(intent_id, group_id, op.name, code)
-    note_unresolved(ctx, intent_id, group_id, env)
-    handle = (env.get("pending") or {}).get("handle")
-    if isinstance(handle, str) and handle:
-        if client_handle is not None and handle != client_handle:
-            env["degraded"] = [
-                *env.get("degraded", []),
-                f"the bridge answered with its own pending handle {handle}, not the handle "
-                f"{client_handle} this server gave it: journal.check asks for the bridge's own",
-            ]
-        try:
-            ctx.journal.append(
-                {
-                    "type": "pending",
-                    "id": intent_id,
-                    "group": group_id,
-                    "ts": now_iso(),
-                    "handle": handle,
-                    "timeoutS": timeout_s,
-                }
-            )
-        except OSError:
-            pass  # the intent alone says "in doubt"; without the handle check falls back to files
-    if env.get("pending") is not None or env.get("ok") is True:
-        _fail_env(env, "TIMEOUT", _PENDING_NOTE.replace("render", noun))
-    hint = str(env.get("hint") or "")
-    handle_note = (
-        f" If the bridge received the call it keeps the {noun}'s result under handle "
-        f"{client_handle} (chosen by this server), and journal.check fetches it once the "
-        "bridge answers again."
-        if client_handle is not None
-        else ""
-    )
-    env["hint"] = (
-        f"{hint} It is not known whether the {noun} finished: a Foreground {noun} keeps "
-        "Flame occupied and a TIMEOUT does not stop it. This server now refuses every "
-        f"write until journal.check (group={group_id!r}) has read {reads} "
-        f"again.{handle_note} {BRIDGE_BUSY_NOTE.replace('render', noun)}"
-    ).strip()
-    env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    return env
-
-
 def _outcome_record(
     intent_id: str,
     group_id: str,
@@ -316,7 +216,7 @@ def _outcome_record(
     written: int,
     expected: int,
     flame: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     return {
         "type": "outcome",
         "id": intent_id,
@@ -343,33 +243,20 @@ def _outcome_record(
     }
 
 
-def run_render(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+def _read_plan(
+    rt: Runtime, op: RegisteredOperation, op_args: Mapping[str, Any], started: float
 ) -> dict[str, Any]:
-    """The `wrap` of `render.batch`."""
-    started = time.monotonic()
-    timeout_s = float(op_args["timeout_s"])
-    max_frames = int(op_args["max_frames"])
-    allow_default = bool(op_args.get("allow_default_path", False))
-    allow_overwrite = bool(op_args.get("allow_overwrite", False))
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        try:
-            refuse_if_denied(rt, ("render.plan",))
-        except ServerOpError as exc:
-            return _refusal(op, exc.code, exc.message, started, hint=exc.hint)
-
-        plan_env = rt.do("render.plan", {"target": op_args["target"]})
-        if plan_env.get("ok") is not True:
-            return _refusal(
+    """The enriched plan of the group; `Refused` when it cannot be read."""
+    try:
+        refuse_if_denied(rt, ("render.plan",))
+    except ServerOpError as exc:
+        raise Refused(
+            envelope_mod.refusal(op, exc.code, exc.message, started, hint=exc.hint)
+        ) from exc
+    plan_env = rt.do("render.plan", {"target": op_args["target"]})
+    if plan_env.get("ok") is not True:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 errors.as_error_code(str(plan_env.get("errorCode"))),
                 "nothing was run: the group's Write File / Render nodes could not be read "
@@ -378,23 +265,34 @@ def run_render(
                 result={"ran": False},
                 hint=plan_env.get("hint"),
             )
-        plan: dict[str, Any] = plan_env["result"]
-        problems = preflight_problems(
-            plan,
-            max_frames=max_frames,
-            allow_default_path=allow_default,
-            allow_overwrite=allow_overwrite,
         )
-        if not isinstance(plan.get("stable"), dict):
-            problems.append(
-                {
-                    "code": "no_uid",
-                    "node": None,
-                    "message": "the group has no uid, so it cannot be found again for the outcome",
-                }
-            )
-        if problems:
-            return _refusal(
+    plan: dict[str, Any] = plan_env["result"]
+    return plan
+
+
+def _check_preflight(
+    op: RegisteredOperation,
+    op_args: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    started: float,
+) -> None:
+    problems = preflight_problems(
+        plan,
+        max_frames=int(op_args["max_frames"]),
+        allow_default_path=bool(op_args.get("allow_default_path", False)),
+        allow_overwrite=bool(op_args.get("allow_overwrite", False)),
+    )
+    if not isinstance(plan.get("stable"), dict):
+        problems.append(
+            {
+                "code": "no_uid",
+                "node": None,
+                "message": "the group has no uid, so it cannot be found again for the outcome",
+            }
+        )
+    if problems:
+        raise Refused(
+            envelope_mod.refusal(
                 op,
                 "PRECONDITION_UNMET",
                 "nothing was rendered: " + "; ".join(p["message"] for p in problems),
@@ -405,84 +303,51 @@ def run_render(
                     "nothing was journaled."
                 ),
             )
+        )
 
+
+def run_render(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
+) -> dict[str, Any]:
+    """The `wrap` of `render.batch`."""
+    started = time.monotonic()
+    timeout_s = float(op_args["timeout_s"])
+    try:
+        plan = _read_plan(rt, op, op_args, started)
+        _check_preflight(op, op_args, plan, started)
         targets = _node_targets(plan)
         group_id = group if group is not None else new_id("g")
         intent_id = new_id("i")
-        client_handle = _new_client_handle(rt)
-        try:
-            rt.journal.append(
-                _intent_record(
-                    op,
-                    op_args,
-                    plan,
-                    targets,
-                    intent_id=intent_id,
-                    group_id=group_id,
-                    timeout_s=timeout_s,
-                    handle=client_handle,
-                )
-            )
-        except OSError as exc:
-            return _refusal(
+        client_handle = new_client_handle(rt)
+        append_intent(
+            rt,
+            op,
+            _intent_record(
                 op,
-                "POLICY_DENIED",
-                f"nothing was rendered: the journal cannot be written ({exc}), and this server "
-                "does not render without an intent on record",
-                started,
-                result={"ran": False},
-                hint=f"Make {rt.journal.directory} writable, then retry.",
-            )
-
-        run_args = {**op_args, "target": plan["stable"]}
-        env = execution.run_op(
-            op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s, handle=client_handle
+                op_args,
+                plan,
+                targets,
+                intent_id=intent_id,
+                group_id=group_id,
+                timeout_s=timeout_s,
+                handle=client_handle,
+            ),
+            started,
+            done="rendered",
+            action="render",
         )
-        end_code = env.get("errorCode")
-        if end_code in UNKNOWN_END_CODES or env.get("pending") is not None:
-            return _unknown_end(
-                rt,
-                env,
-                op,
-                intent_id,
-                group_id,
-                str(end_code or "TIMEOUT"),
-                timeout_s,
-                client_handle,
-            )
-        finished = _finish(rt, op, env, plan, targets, intent_id, group_id, started)
-        if client_handle is not None and end_code != "BRIDGE_AMBIGUOUS":
-            _remove_result_file(rt, finished, client_handle)
-        return finished
-
-
-def _remove_result_file(rt: Runtime, env: dict[str, Any], handle: str) -> None:
-    """The bridge keeps the result of a run that has a client handle in a file even when the
-    answer came in-band; one poll hands it over and deletes it. Best effort: a failure only
-    leaves the file to the bridge's own 24 h sweep, and is noted in `degraded`."""
-    try:
-        br = transport.poll(handle, run_dir=rt.run_dir)
-    except BridgeProtocolError as exc:
-        if "unknown handle" in str(exc):
-            return  # nothing kept under it (or already gone): nothing to remove
-        problem = f"PROTOCOL_ERROR: {exc}"
-    else:
-        if br.error_code is None:
-            return
-        problem = f"{br.error_code}: {br.error}"
-    env["degraded"] = [
-        *env.get("degraded", []),
-        f"the result file the bridge keeps under handle {handle} could not be removed ({problem}); "
-        "the bridge deletes it after 24 hours",
-    ]
-
-
-@dataclass(frozen=True)
-class RenderJudgement:
-    ok: bool
-    code: ErrorCode | None
-    message: str | None
-    degraded: list[str] = field(default_factory=list)
+    except Refused as stop:
+        return stop.env
+    return run_and_close(
+        rt,
+        op,
+        {**op_args, "target": plan["stable"]},
+        timeout_s=timeout_s,
+        handle=client_handle,
+        intent_id=intent_id,
+        group_id=group_id,
+        finish=lambda env: _finish(rt, op, env, plan, targets, intent_id, group_id, started),
+    )
 
 
 def judge_render(
@@ -516,7 +381,7 @@ def judge_render(
             f"of {expected} planned frames were written (see result.nodes for what is missing)"
         )
         if written > 0:
-            return RenderJudgement(False, "FLAME_API_ERROR", f"partial: {short}")
+            return RenderJudgement(False, "FLAME_API_ERROR", f"{errors.PARTIAL_PREFIX} {short}")
         code: ErrorCode = "FLAME_API_ERROR" if returned is False else "SILENT_NOOP"
         return RenderJudgement(False, code, short)
     degraded: list[str] = []
@@ -599,6 +464,41 @@ def missing_outputs(
     ]
 
 
+def _render_result(
+    plan: Mapping[str, Any],
+    flame: Mapping[str, Any],
+    rows: list[dict[str, Any]],
+    written: int,
+    expected: int,
+    checked: bool,
+    missing: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "ran": True,
+        "group": plan.get("batch"),
+        "renderOption": "Foreground",
+        "returned": flame.get("returned"),
+        "elapsedS": flame.get("elapsedS"),
+        "expectedFrames": expected,
+        "writtenFrames": written,
+        "verified": (written >= expected) if checked else None,
+        "verifiedNote": (
+            None
+            if checked
+            else "only Render nodes were rendered: they write clips into reels (result.newClips), "
+            "not files, so nothing could be checked on disk"
+        ),
+        "nodes": rows,
+        "newClips": flame.get("newClips"),
+        "newClipsUnknown": flame.get("newClipsUnknown"),
+        "missingOutputs": missing or None,
+        "reelsBefore": flame.get("reelsBefore"),
+        "reelsAfter": flame.get("reelsAfter"),
+        "destinationUnsupported": flame.get("destinationUnsupported"),
+        "undo": "unsupported: the frames on disk and the clips in the reels stay",
+    }
+
+
 def _finish(
     rt: Runtime,
     op: RegisteredOperation,
@@ -622,13 +522,12 @@ def _finish(
         expected=expected,
         checked=checked,
     )
-    ok, code, message, degraded = judged.ok, judged.code, judged.message, judged.degraded
-    verified: bool | None = (written >= expected) if checked else None
+    degraded = judged.degraded
     missing = (
         missing_outputs(
             plan, flame.get("newClips"), flame.get("newClipsUnknown"), flame.get("reelsAfter")
         )
-        if ok
+        if judged.ok
         else []
     )
     if missing:
@@ -637,47 +536,20 @@ def _finish(
             "some Render nodes wrote no clip into their destination reel (result.missingOutputs "
             "lists, per reel, the clips expected and the clips gained)",
         ]
-    result: dict[str, Any] = {
-        "ran": True,
-        "group": plan.get("batch"),
-        "renderOption": "Foreground",
-        "returned": flame.get("returned"),
-        "elapsedS": flame.get("elapsedS"),
-        "expectedFrames": expected,
-        "writtenFrames": written,
-        "verified": verified,
-        "verifiedNote": (
-            None
-            if checked
-            else "only Render nodes were rendered: they write clips into reels (result.newClips), "
-            "not files, so nothing could be checked on disk"
-        ),
-        "nodes": rows,
-        "newClips": flame.get("newClips"),
-        "newClipsUnknown": flame.get("newClipsUnknown"),
-        "missingOutputs": missing or None,
-        "reelsBefore": flame.get("reelsBefore"),
-        "reelsAfter": flame.get("reelsAfter"),
-        "destinationUnsupported": flame.get("destinationUnsupported"),
-        "undo": "unsupported: the frames on disk and the clips in the reels stay",
-    }
-    if not ok and code is not None:
-        _fail_env(env, code, message or "")
-    env["result"] = result
-    env["affected"] = written
-    env["undoSteps"] = 0
-    env["partial"] = {"written": written, "expected": expected} if checked else None
-    env["degraded"] = [*env.get("degraded", []), *degraded]
-    env["journal"] = {"group": group_id, "id": intent_id, "undo": "unsupported", "revert": None}
-    env["durationMs"] = elapsed_ms(started)
-    record = _outcome_record(intent_id, group_id, ok, code, message, rows, written, expected, flame)
-    try:
-        rt.journal.append(record)
-    except OSError as exc:
-        rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-        env["degraded"] = [
-            *env["degraded"],
-            f"the outcome could not be journaled ({exc}); the run's answer stands but this "
-            "server now refuses writes until journal.check has settled the intent",
-        ]
-    return env
+    record = _outcome_record(
+        intent_id, group_id, judged.ok, judged.code, judged.message, rows, written, expected, flame
+    )
+    return settle_envelope(
+        rt,
+        op,
+        env,
+        judged,
+        record,
+        result=_render_result(plan, flame, rows, written, expected, checked, missing),
+        affected=written,
+        partial={"written": written, "expected": expected} if checked else None,
+        degraded=degraded,
+        intent_id=intent_id,
+        group_id=group_id,
+        started=started,
+    )

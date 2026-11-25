@@ -4,15 +4,19 @@ itself is `_ip_walk` in `inspect_prelude.py`)."""
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 
 from flame_mcp.inspect_prelude import INSPECT_BUDGET_S
 from flame_mcp.list_fields import fields_note, fields_param
 from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.registry import Registry
-from flame_mcp.types import OperationParam, OperationSpec
+from flame_mcp.types import ListFields, OperationParam, OperationSpec
 
 SCOPES: tuple[str, ...] = ("all", "desktop", "libraries")
+_LIST_ALL_FIELDS: Final[ListFields] = ListFields(
+    "items",
+    ("type", "name", "uid", "selector", "parent", "path", "location", "library"),
+)
 
 OFFSET_BEYOND_HINT = (
     "The walk of this call stopped before `offset`: it stopped earlier than the walk of the call "
@@ -112,9 +116,10 @@ def register(registry: Registry) -> None:
                 ),
                 limit_param(),
                 offset_param(),
-                fields_param("desktop.list_all"),
+                fields_param(_LIST_ALL_FIELDS),
             ),
             to_python=_to_python,
+            list_fields=_LIST_ALL_FIELDS,
             requires=(
                 "flame.projects",
                 "PyProjectSelector.current_project",

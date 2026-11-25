@@ -107,7 +107,7 @@ def test_create_batch_group_reads_back_what_flame_made_and_says_current_moved(ri
     assert result["currentMoved"] is True
     assert CURRENT_MOVED_NOTE in result["notes"]
     assert "NEWBG" in batch_names(rig) and current_name(rig) == "NEWBG"
-    assert env["execution"]["effect"] == "create" and env["undoSteps"] == 0
+    assert env["execution"]["effect"] == "create"
     assert env["journal"]["revert"] == {
         "op": "journal.revert",
         "args": {"group": env["journal"]["group"]},
@@ -592,7 +592,7 @@ def test_copy_library_clip_to_a_desktop_reel_makes_a_new_clip_and_keeps_the_sour
     assert result["destinationEntriesAfter"] == ["c1", "clip1"]
     assert rig.flame.find_by_uid(source.uid.get_value()) is source
     assert entry_names(rig.handles["reel_group"].reels[0]) == ["c1", "clip1"]
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert rig.flame.media_panel.duplicate_actions == ["add"]
 
 
@@ -1030,7 +1030,7 @@ def test_declarations_match_what_the_ops_do() -> None:
         op = registry.get(name)
         assert op is not None
         assert (op.effect, op.thread, op.undo) == ("create", "main", "value")
-        assert op.undo_steps({}, 3) == 0 and op.wrap is desktop_run.run_desktop_write
+        assert op.wrap is desktop_run.run_desktop_write
         extra = {"batch", "desktop"} if name == "desktop.copy" else set()
         assert set(op.accepts) == {"wiretap", "path", "selection"} | extra
         for word in ("journal.revert", "plan.run", "Native Ctrl+Z"):

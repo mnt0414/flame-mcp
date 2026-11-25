@@ -7,7 +7,8 @@ Do not add third-party imports or 3.12-only syntax here.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Final, Literal
 
 ParamType = Literal["string", "number", "boolean", "array", "object", "any", "selector"]
@@ -76,14 +77,13 @@ class OperationParam:
 class ServerResult:
     """What a `server_handler` returns on success (a failure raises `ServerOpError`).
 
-    `undo_steps` None means "ask the op's own `undo_steps`"; `journal` is the envelope's
-    `{group, id}` when the call left journal records (plan.run: its group).
+    `journal` is the envelope's `{group, id}` when the call left journal records (plan.run:
+    its group).
     """
 
     result: Any
     affected: int = 0
     partial: Mapping[str, int] | None = None
-    undo_steps: int | None = None
     journal: Mapping[str, Any] | None = None
 
 
@@ -91,7 +91,7 @@ class ServerOpError(Exception):
     """Raised by a `server_handler` to end in a specific ErrorCode.
 
     `result` is kept beside the error (like an `_OpError` raised after `_result` was assigned) and
-    `hint`, when given, replaces the generic hint of `code`. `affected` / `undo_steps` /
+    `hint`, when given, replaces the generic hint of `code`. `affected` /
     `partial` / `journal` fill the envelope the same way `ServerResult` does (a plan that
     stopped half way still reports what its finished steps did).
     """
@@ -104,7 +104,6 @@ class ServerOpError(Exception):
         result: Any = None,
         hint: str | None = None,
         affected: int = 0,
-        undo_steps: int | None = None,
         partial: Mapping[str, int] | None = None,
         journal: Mapping[str, Any] | None = None,
     ) -> None:
@@ -114,7 +113,6 @@ class ServerOpError(Exception):
         self.result = result
         self.hint = hint
         self.affected = affected
-        self.undo_steps = undo_steps
         self.partial = partial
         self.journal = journal
 
@@ -224,6 +222,68 @@ class Category:
     preconditions: tuple[str, ...] = ()
 
 
+class PlanKind(Enum):
+    """What `journal.revert` can do with an op that `plan.run` refuses (or that is never a loop
+    step); `plan.for_each` sorts its steps by it."""
+
+    ROLLBACK = "rollback"
+    """Put back by its own revert (delete what it made, move things back, ...)."""
+    REWRITE = "rewrite"
+    """Put back, but it changes or deletes what is there now: a confirmed loop only."""
+    KEEPS_OUTPUT = "output"
+    """Cannot be put back, the data it wrote stays: a confirmed loop only; the parent's revert
+    leaves it and lists it."""
+    NEVER = "never"
+    """Not run by a loop."""
+
+
+@dataclass(frozen=True)
+class PlanUse:
+    """How `plan.run` / `plan.for_each` treat an op. An op without one is accepted by `plan.run`
+    (a value write, or a checkpointed one a plan bundles) and is a plain loop step.
+
+    `refusal`: why `plan.run` refuses the op (the problem text it reports); None when it does
+    not refuse it by name.
+    `own_group`: the op checkpoints and journals into a group of its own, or its result a restore
+    does not put back; a plan cannot revert it (`plan.run` refuses it as such).
+    """
+
+    kind: PlanKind
+    refusal: str | None = None
+    own_group: bool = False
+
+
+@dataclass(frozen=True)
+class ListFields:
+    """The members of each item a list op answers with, for its `fields` argument (see
+    `list_fields.py`). `items_key`: the key of `result` that holds the items; `groups_key`: when
+    set, the items are held by each entry of this list instead (`timeline.list_segments` with
+    `all_tracks=true`)."""
+
+    items_key: str
+    fields: tuple[str, ...]
+    groups_key: str | None = None
+
+
+PHASE_ARG: Final[str] = "_phase"
+"""The internal argument that picks which phase of an op `to_python` generates. A client cannot
+send it (`validate_op_args` refuses an argument name no param declares); the run modules add it."""
+
+
+@dataclass(frozen=True)
+class PhaseSpec:
+    """One phase of an op's `to_python`, besides the default one.
+
+    `name`: the value of `PHASE_ARG`.
+    `args`: the internal arguments (`_created`, `_expected`, ...) the phase needs, as sample
+    values. Registration generates the phase with the op's sample args plus these and runs the
+    same checks (syntax, and the loop guard of a write op) as for the default phase.
+    """
+
+    name: str
+    args: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class OperationSpec:
     """Declaration an op author writes.
@@ -251,10 +311,13 @@ class OperationSpec:
     undoable: bool = True
     to_python: Callable[[Mapping[str, Any]], str] | None = None
     verify: Callable[[Mapping[str, Any]], str | None] | None = None
-    undo_steps: Callable[[Mapping[str, Any], int], int] | None = None
     sample_args: Mapping[str, Any] | None = None
     server_handler: ServerHandler | None = None
     journal: JournalSpec | None = None
     precheck: Precheck | None = None
     wrap: WrapHandler | None = None
     checkpoint: CheckpointSpec | None = None
+    plan_use: PlanUse | None = None
+    phases: tuple[PhaseSpec, ...] = ()
+    brief_paths: tuple[str, ...] = ()
+    list_fields: ListFields | None = None

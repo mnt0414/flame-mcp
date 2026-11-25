@@ -12,11 +12,11 @@ from typing import Any, Final
 
 from flame_mcp import selectors
 from flame_mcp.ops._segment_edit import (
+    CHECK_PHASES,
     CHECKPOINTED_SEGMENT_NOTE,
     SEGMENT_REQUIRES,
     checkpoint_spec,
     edit_source,
-    no_undo_steps,
     seg_args,
     segment_target_param,
 )
@@ -174,6 +174,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=SLIP_OP,
+            brief_paths=("position",),
             category="segment",
             description=_SLIP_DESCRIPTION,
             effect="reversible",
@@ -194,8 +195,8 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment",),
             to_python=_slip_to_python,
-            undo_steps=no_undo_steps,
             precheck=_slip_precheck,
+            phases=CHECK_PHASES,
             checkpoint=checkpoint_spec(
                 SLIP_OP, lambda args: f"before segment.slip ({args['offset']})"
             ),
@@ -205,6 +206,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=REPLACE_OP,
+            brief_paths=("position",),
             category="segment",
             description=_REPLACE_DESCRIPTION,
             effect="reversible",
@@ -235,7 +237,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment", *_SOURCE_KINDS),
             to_python=_replace_to_python,
-            undo_steps=no_undo_steps,
             precheck=_replace_precheck,
             sample_args={
                 "target": {
@@ -248,6 +249,7 @@ def register(registry: Registry) -> None:
                 "source": {"kind": "wiretap", "id": "c"},
                 "mode": "media",
             },
+            phases=CHECK_PHASES,
             checkpoint=checkpoint_spec(
                 REPLACE_OP, lambda args: f"before segment.replace ({args.get('mode', 'media')})"
             ),

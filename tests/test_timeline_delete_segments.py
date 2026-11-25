@@ -34,6 +34,7 @@ from flame_mcp import timeline_checkpoints
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
 from p33_helpers import untouched_world
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     CLIPX,
     S1,
@@ -53,14 +54,11 @@ from timeline_p32a_helpers import (
     wt,
 )
 
+rig = rig_fixture(make_timeline_rig)
+
 OP = "timeline.delete_segments"
 GAP = "Gap"
 VIDEO = "Video Segment"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def delete(rig: Rig, segments: list[int], sequence: dict[str, Any] = S1, **extra: Any) -> Any:

@@ -104,6 +104,102 @@ def frames_of(node: Mapping[str, Any]) -> int | None:
     return max(counted, files) if isinstance(files, int) else int(counted)
 
 
+def _unwired_problems(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    for node in plan.get("nodes") or []:
+        if node.get("kind") != "render" or node.get("bypass") is True:
+            continue
+        if node.get("wiredInputs") == 0:
+            name = node.get("name")
+            problems.append(
+                {
+                    "code": "render_node_unwired",
+                    "node": name,
+                    "message": (
+                        f"{name!r}: a Render node with no input connected: PyBatch.render "
+                        "raises 'Render failed.' while the other nodes still write their "
+                        "clips; connect an input (node.connect) or delete the node "
+                        "(node.delete)"
+                    ),
+                }
+            )
+    return problems
+
+
+def _range_problem(node: Mapping[str, Any]) -> dict[str, Any] | None:
+    name = node.get("name")
+    frames = frames_of(node)
+    if frames is not None and frames >= 1:
+        return None
+    return {
+        "code": "range_unreadable",
+        "node": name,
+        "message": (
+            f"{name!r}: range_start / range_end are not a usable range "
+            f"({node.get('rangeStart')!r}-{node.get('rangeEnd')!r}), so the number "
+            "of frames it would write is not known"
+        ),
+    }
+
+
+def _writer_problems(
+    node: Mapping[str, Any], *, allow_default_path: bool, allow_overwrite: bool
+) -> list[dict[str, Any]]:
+    """What stops a Write File node: where it writes, files it would replace, a missing
+    directory."""
+    name = node.get("name")
+    if node.get("outputSpec") is None:
+        return [
+            {
+                "code": "output_unknown",
+                "node": name,
+                "message": (
+                    f"{name!r}: get_resolved_media_path() gave no path "
+                    f"({node.get('resolvedMediaPath')!r}), so where it writes is not known"
+                ),
+            }
+        ]
+    problems: list[dict[str, Any]] = []
+    if node.get("defaultPath") and not allow_default_path:
+        problems.append(
+            {
+                "code": "default_path",
+                "node": name,
+                "message": (
+                    f"{name!r}: media_path is the default output directory "
+                    f"({node.get('mediaPath')!r}; /var/tmp and /tmp are shared temp "
+                    "directories): set media_path on the node (node.set_attributes) or "
+                    "pass allow_default_path=true"
+                ),
+            }
+        )
+    existing = node.get("existingPlannedFiles")
+    if isinstance(existing, int) and existing > 0 and not allow_overwrite:
+        problems.append(
+            {
+                "code": "would_overwrite",
+                "node": name,
+                "message": (
+                    f"{name!r}: {existing} of the files it would write already exist in "
+                    f"{node.get('outputDir')!r} and a render replaces them for good: use "
+                    "another output directory, or pass allow_overwrite=true"
+                ),
+            }
+        )
+    if node.get("dirExists") is False:
+        problems.append(
+            {
+                "code": "output_dir_missing",
+                "node": name,
+                "message": (
+                    f"{name!r}: the output directory {node.get('outputDir')!r} does not "
+                    "exist (create it first)"
+                ),
+            }
+        )
+    return problems
+
+
 def preflight_problems(
     plan: Mapping[str, Any],
     *,
@@ -126,91 +222,19 @@ def preflight_problems(
                 ),
             }
         )
-    for node in plan.get("nodes") or []:
-        if node.get("kind") != "render" or node.get("bypass") is True:
-            continue
-        if node.get("wiredInputs") == 0:
-            name = node.get("name")
-            problems.append(
-                {
-                    "code": "render_node_unwired",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: a Render node with no input connected: PyBatch.render "
-                        "raises 'Render failed.' while the other nodes still write their "
-                        "clips; connect an input (node.connect) or delete the node "
-                        "(node.delete)"
-                    ),
-                }
-            )
+    problems.extend(_unwired_problems(plan))
     total = 0
     for node in effective:
-        name = node.get("name")
-        frames = frames_of(node)
-        if frames is None or frames < 1:
-            problems.append(
-                {
-                    "code": "range_unreadable",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: range_start / range_end are not a usable range "
-                        f"({node.get('rangeStart')!r}-{node.get('rangeEnd')!r}), so the number "
-                        "of frames it would write is not known"
-                    ),
-                }
-            )
+        range_problem = _range_problem(node)
+        if range_problem is not None:
+            problems.append(range_problem)
         else:
-            total += frames
-        if node.get("kind") != "write_file":
-            continue
-        if node.get("outputSpec") is None:
-            problems.append(
-                {
-                    "code": "output_unknown",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: get_resolved_media_path() gave no path "
-                        f"({node.get('resolvedMediaPath')!r}), so where it writes is not known"
-                    ),
-                }
-            )
-            continue
-        if node.get("defaultPath") and not allow_default_path:
-            problems.append(
-                {
-                    "code": "default_path",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: media_path is the default output directory "
-                        f"({node.get('mediaPath')!r}; /var/tmp and /tmp are shared temp "
-                        "directories): set media_path on the node (node.set_attributes) or "
-                        "pass allow_default_path=true"
-                    ),
-                }
-            )
-        existing = node.get("existingPlannedFiles")
-        if isinstance(existing, int) and existing > 0 and not allow_overwrite:
-            problems.append(
-                {
-                    "code": "would_overwrite",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: {existing} of the files it would write already exist in "
-                        f"{node.get('outputDir')!r} and a render replaces them for good: use "
-                        "another output directory, or pass allow_overwrite=true"
-                    ),
-                }
-            )
-        if node.get("dirExists") is False:
-            problems.append(
-                {
-                    "code": "output_dir_missing",
-                    "node": name,
-                    "message": (
-                        f"{name!r}: the output directory {node.get('outputDir')!r} does not "
-                        "exist (create it first)"
-                    ),
-                }
+            total += frames_of(node) or 0
+        if node.get("kind") == "write_file":
+            problems.extend(
+                _writer_problems(
+                    node, allow_default_path=allow_default_path, allow_overwrite=allow_overwrite
+                )
             )
     if total > max_frames:
         problems.append(

@@ -16,10 +16,10 @@ from flame_mcp.desktop_delete_run import (
 )
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_REVERT_PHASES,
     EXPECTED_ARG,
     MAX_SOURCES,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_READ,
     PHASE_REVERT,
     PHASE_WRITE,
@@ -35,7 +35,16 @@ from flame_mcp.timeline_checkpoints import (
     checkpoint_library_name,
     stash_reel_name,
 )
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
@@ -124,13 +133,9 @@ _DESCRIPTION = (
     "or whose stashed copy is gone (journal.purge_checkpoints) or changed, stays a CONFLICT "
     "while the others are put back (result.partial); a second revert puts back only what the "
     "first one did not. The stashed copies stay in the checkpoint library until "
-    "journal.purge_checkpoints removes them. Native Ctrl+Z is not used (undoSteps 0). Not "
+    "journal.purge_checkpoints removes them. Native Ctrl+Z is not used. Not "
     "allowed in plan.run."
 )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _delete_to_python(args: Mapping[str, Any]) -> str:
@@ -216,10 +221,22 @@ def _delete_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+_PLAN_USE_DESKTOP_DELETE = PlanUse(
+    PlanKind.REWRITE,
+    refusal=(
+        "desktop.delete cannot be a plan step: it journals a `desktop_delete` intent that is "
+        "reverted by copying the stashed copies back (they get new uids), and a plan's single "
+        "group is reverted by putting attribute values back -- it would skip such an intent "
+        "without saying so. Call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=DELETE_OP,
+            plan_use=_PLAN_USE_DESKTOP_DELETE,
             category="desktop",
             description=_DESCRIPTION,
             effect="destructive",
@@ -250,7 +267,11 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_delete_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(
+                *CREATED_REVERT_PHASES,
+                PhaseSpec(PHASE_READ),
+                PhaseSpec(PHASE_STASH, {SKIP_ARG: []}),
+            ),
             precheck=_delete_precheck,
             wrap=run_delete,
             sample_args={"targets": [{"kind": "wiretap", "id": "s"}]},

@@ -94,10 +94,6 @@ def _checkpoint_to_python(args: Mapping[str, Any]) -> str:
     )
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 _FINGERPRINT_REQUIRES = (
     "PySequence.versions",
     "PyVersion.tracks",
@@ -134,6 +130,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="timeline.checkpoint",
+            brief_paths=("checkpoint",),
             category="timeline",
             description=_CHECKPOINT_DESCRIPTION,
             effect="create",
@@ -150,7 +147,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_checkpoint_to_python,
-            undo_steps=_no_undo_steps,
             wrap=run_timeline_checkpoint,
             requires=(
                 *_FINGERPRINT_REQUIRES,

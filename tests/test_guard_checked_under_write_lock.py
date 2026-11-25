@@ -57,3 +57,18 @@ def test_revert_queued_behind_a_write_that_goes_unknown_is_refused(
     assert b["ok"] is False, "the revert wrote after the guard shut"
     assert b["errorCode"] == "POLICY_DENIED"
     assert "RACE1" in names()
+
+
+def test_a_shut_guard_refuses_every_write_op_before_any_runner_sends_to_flame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig: Rig = make_rig(monkeypatch, tmp_path)
+    rig.runtime.guard.block("i_x", "g_x", "batch.add_clips", "TIMEOUT")
+    writes = [op for op in rig.registry.list_ops() if op.effect != "read"]
+    assert len(writes) > 30
+    sent_before = len(rig.exec.calls)
+    for op in writes:
+        env = rig.runtime.execute(op, dict(op.sample_args))
+        assert env["errorCode"] == "POLICY_DENIED", op.name
+        assert env["error"].startswith("writes are refused"), op.name
+    assert len(rig.exec.calls) == sent_before

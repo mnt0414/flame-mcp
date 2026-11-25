@@ -20,6 +20,7 @@ import pytest
 
 from flame_mcp import clip_order
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 
 R1, R2 = "Schematic Reel 1", "Schematic Reel 2"
 NODE_RE = re.compile(r"<Node>.*?</Node>", re.DOTALL)
@@ -342,9 +343,7 @@ def test_the_report_names_what_happened(tmp_path: Path) -> None:
     }
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def take_checkpoint(rig: Rig) -> dict[str, Any]:

@@ -42,6 +42,8 @@ from flame_mcp.checkpointed import (
     run_envelope,
 )
 from flame_mcp.eval_check import check_eval_code
+from flame_mcp.journal import JournalLink
+from flame_mcp.journal_records import IntentRecord
 from flame_mcp.policy import Policy, deny_eval_effect
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
@@ -176,6 +178,10 @@ def _run_destructive(
             op, {**op_args, "target": stable}, run_dir=rt.run_dir, timeout_s=timeout_s
         )
 
+    def add_code(intent: IntentRecord) -> None:
+        intent["code"] = code
+        intent["codeSha256"] = sha
+
     try:
         facts = run_checkpointed(
             rt,
@@ -187,13 +193,13 @@ def _run_destructive(
                 "target": op_args["target"],
                 "timeout_s": op_args.get("timeout_s"),
             },
-            intent_extra={"code": code, "codeSha256": sha},
+            intent_extra=add_code,
             expected_fp=None,
             label=f"before eval {sha[:12]}",
             run=run,
             judge=_judge,
             failed_key="eval",
-            group=group,
+            link=JournalLink(group),
         )
     except PreRunRefusal as exc:
         return refusal_envelope(op, exc, _WORDS, meta, started, journal_dir=rt.journal.directory)

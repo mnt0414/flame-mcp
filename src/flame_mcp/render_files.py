@@ -277,14 +277,6 @@ def written_since(before: Mapping[str, Stat], after: Mapping[str, Stat]) -> list
     return sorted(name for name, stat in after.items() if before.get(name) != stat)
 
 
-def stat_of(path: str) -> Stat | None:
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_size, st.st_mtime_ns)
-
-
 def spec_frames_present(
     spec: OutputSpec, before: Mapping[str, Stat], now: Mapping[str, Stat]
 ) -> tuple[int, list[str]]:

@@ -20,7 +20,7 @@ revert knows where to copy from.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
@@ -36,7 +36,6 @@ from flame_mcp.desktop_revert import (
 from flame_mcp.desktop_run import (
     CREATED_ARG,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_REVERT,
     WriteProfile,
     rows_uids,
@@ -44,7 +43,6 @@ from flame_mcp.desktop_run import (
 )
 from flame_mcp.journal import (
     KIND_DESKTOP_DELETE,
-    KIND_DESKTOP_REVERT,
     STATE_DIVERGED,
     STATE_LANDED,
     VERDICT_UNKNOWN,
@@ -53,6 +51,7 @@ from flame_mcp.journal import (
     new_id,
     now_iso,
 )
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.timeline_checkpoints import (
     LIBRARY_ARG,
@@ -61,13 +60,15 @@ from flame_mcp.timeline_checkpoints import (
     checkpoint_record,
     stash_reel_name,
 )
-from flame_mcp.types import ServerOpError, ServerResult
+from flame_mcp.types import PHASE_ARG, ServerOpError, ServerResult
 from flame_mcp.unrecorded_end import shut_if_unanswered
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
 
 DELETE_OP: Final[str] = "desktop.delete"
+BATCH_REEL_PHRASE: Final[str] = "inside a reel of a Batch group"
+"""In the refusal of `desktop_delete_prelude.DELETE_HELPER`; it selects the Batch reel hint."""
 SNAPSHOT_ARG: Final[str] = "_snapshot"
 PHASE_STASH: Final[str] = "stash"
 SKIP_ARG: Final[str] = "_skip_stash"
@@ -109,16 +110,6 @@ def _item_key(row: Mapping[str, Any]) -> str:
     return "uid:" + str((row.get("from") or {}).get("uid"))
 
 
-def is_delete_intent(view: IntentView) -> bool:
-    """An intent of `desktop.delete`, or the revert of one."""
-    if view.desktop_kind == KIND_DESKTOP_DELETE:
-        return True
-    return (
-        view.desktop_kind == KIND_DESKTOP_REVERT
-        and view.intent.get("revertOf") == KIND_DESKTOP_DELETE
-    )
-
-
 def _refuse(
     op: RegisteredOperation, code: Any, message: str, *, result: Any = None, hint: str | None = None
 ) -> dict[str, Any]:
@@ -136,21 +127,20 @@ def _refuse(
 def stash_record(rt: Any, op: RegisteredOperation, group_id: str, stash: Mapping[str, Any]) -> str:
     """Journal one stashed copy as a timeline checkpoint; its id. Raises OSError."""
     checkpoint_id = new_id("c")
-    rt.journal.append(
-        checkpoint_record(
-            checkpoint_id,
-            group=group_id,
-            label=f"before {op.name}",
-            source=stash.get("source"),
-            stash=stash.get("stash"),
-            fingerprint=stash.get("fingerprint"),
-            segment_count=stash.get("segmentCount"),
-            displayed=stash.get("displayed"),
-            effectCount=stash.get("effectCount"),
-            display=stash.get("display"),
-            by=op.name,
-        )
+    record = checkpoint_record(
+        checkpoint_id,
+        group=group_id,
+        label=f"before {op.name}",
+        source=stash.get("source"),
+        stash=stash.get("stash"),
+        fingerprint=stash.get("fingerprint"),
+        segment_count=stash.get("segmentCount"),
+        displayed=stash.get("displayed"),
     )
+    record["effectCount"] = stash.get("effectCount")
+    record["display"] = stash.get("display")
+    record["by"] = op.name
+    rt.journal.append(record)
     return checkpoint_id
 
 
@@ -299,7 +289,7 @@ def _intent_record(
     *,
     intent_id: str,
     group_id: str,
-) -> dict[str, Any]:
+) -> IntentRecord:
     stashed = pre.get("stashed") or []
     return {
         "type": "intent",
@@ -369,9 +359,7 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
 
 
 def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
-    if pre.get("errorCode") == "INVALID_ARGS" and "inside a reel of a Batch group" in str(
-        pre.get("error")
-    ):
+    if pre.get("errorCode") == "INVALID_ARGS" and BATCH_REEL_PHRASE in str(pre.get("error")):
         return (
             "A clip or a sequence inside a reel of a Batch group is not deleted from here. "
             "Nothing was written and nothing journaled."
@@ -409,19 +397,17 @@ def _revert_count(view: IntentView, result: Mapping[str, Any]) -> int:
     return len(result.get("reverted") or [])
 
 
-def _revert_extra(result: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "restored": [
-            {
-                "checkpoint": r.get("checkpoint"),
-                "from": r.get("from"),
-                "stash": r.get("stash"),
-                "to": r.get("to"),
-            }
-            for r in result.get("reverted") or []
-        ],
-        "notRestored": result.get("notReverted") or [],
-    }
+def _revert_extra(result: Mapping[str, Any], outcome: OutcomeRecord) -> None:
+    outcome["restored"] = [
+        {
+            "checkpoint": r.get("checkpoint"),
+            "from": r.get("from"),
+            "stash": r.get("stash"),
+            "to": r.get("to"),
+        }
+        for r in result.get("reverted") or []
+    ]
+    outcome["notRestored"] = result.get("notReverted") or []
 
 
 def _revert_partial(result: Mapping[str, Any]) -> Mapping[str, int] | None:
@@ -444,7 +430,7 @@ def _restored_checkpoints(index: Index, group: str) -> set[str]:
     done: set[str] = set()
     for other in index.revert_groups_of(group):
         for view in index.groups.get(other, []):
-            restored = (view.outcome or {}).get("restored")
+            restored = view.outcome.get("restored") if view.outcome is not None else None
             for row in restored if isinstance(restored, list) else []:
                 if isinstance(row, dict):
                     done.add(_item_key(row))
@@ -452,7 +438,7 @@ def _restored_checkpoints(index: Index, group: str) -> set[str]:
 
 
 def revert_delete_group(
-    ctx: ServerContext, index: Index, group: str, views: list[IntentView]
+    ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
 ) -> ServerResult:
     """`journal.revert` of a group whose intent is a `desktop.delete`. What an earlier, partial
     revert put back is not put back again."""
@@ -468,7 +454,10 @@ def revert_delete_group(
                     f"group {group}: every thing this delete removed was put back already (by "
                     f"{', '.join(index.revert_groups_of(group))})",
                 )
-            outcome = {**(view.outcome or {}), "created": {**created, "deletes": rest}}
+            outcome = cast(
+                OutcomeRecord,
+                {**(view.outcome or {}), "created": {**created, "deletes": rest}},
+            )
             views = [
                 IntentView(
                     intent=view.intent,

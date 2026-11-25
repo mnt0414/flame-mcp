@@ -113,7 +113,6 @@ def _registry_with_op(
     effect: str = "read",
     to_python: Any,
     verify: Any = None,
-    undo_steps: Any = None,
     params: tuple[OperationParam, ...] = (),
 ) -> Registry:
     registry = Registry(symbols=frozenset())
@@ -136,7 +135,6 @@ def _registry_with_op(
             params=params,
             to_python=to_python,
             verify=verify,
-            undo_steps=undo_steps,
         )
     )
     return registry
@@ -175,7 +173,6 @@ def test_op_exception_sets_op_error_and_traceback_and_skips_verify() -> None:
         effect="reversible",
         to_python=lambda args: "raise ValueError('boom')",
         verify=lambda args: "_verified = True",
-        undo_steps=lambda args, affected: affected,
     )
     result = _run(registry, {})
     assert result["value"] is None
@@ -191,7 +188,6 @@ def test_reversible_op_default_affected_is_one_on_success() -> None:
     registry = _registry_with_op(
         effect="reversible",
         to_python=lambda args: "_result = 'ok'",
-        undo_steps=lambda args, affected: affected,
     )
     result = _run(registry, {})
     assert result["opError"] is None
@@ -202,7 +198,6 @@ def test_op_sets_affected_explicitly_and_preserves_dict_value() -> None:
     registry = _registry_with_op(
         effect="reversible",
         to_python=lambda args: "_result = {'inner': 42}\n_affected = 3",
-        undo_steps=lambda args, affected: affected,
     )
     result = _run(registry, {})
     assert result["value"] == {"inner": 42}
@@ -214,7 +209,6 @@ def test_verify_sets_verified_false_with_detail() -> None:
         effect="reversible",
         to_python=lambda args: f"_result = None\nflame._thing = {args['value']!r}\n_affected = 1",
         verify=lambda args: "_verified = False\n_verify_detail = 'value did not stick'",
-        undo_steps=lambda args, affected: affected,
         params=(OperationParam(name="value", type="string", description="v", required=True),),
     )
     result = _run(registry, {"value": "x"})
@@ -229,7 +223,6 @@ def test_verify_raising_is_caught_and_maps_to_verified_false() -> None:
         effect="reversible",
         to_python=lambda args: "_result = 'ok'\n_affected = 1",
         verify=lambda args: "raise RuntimeError('verify boom')",
-        undo_steps=lambda args, affected: affected,
     )
     result = _run(registry, {})
     assert result["verified"] is False
@@ -242,7 +235,6 @@ def test_verify_true_on_success() -> None:
         effect="reversible",
         to_python=lambda args: "_result = 'ok'\n_affected = 1",
         verify=lambda args: "_verified = True",
-        undo_steps=lambda args, affected: affected,
     )
     result = _run(registry, {})
     assert result["verified"] is True
@@ -300,7 +292,6 @@ def test_generated_code_embeds_distinct_op_and_verify_filenames() -> None:
         effect="reversible",
         to_python=lambda args: "_result = 'ok'\n_affected = 1",
         verify=lambda args: "_verified = True",
-        undo_steps=lambda args, affected: affected,
     )
     op = registry.get("test.op")
     assert op is not None
@@ -372,7 +363,6 @@ def test_generated_code_is_always_valid_python_ast() -> None:
         effect="reversible",
         to_python=lambda args: "_result = 'ok'\n_affected = 1",
         verify=lambda args: "_verified = True",
-        undo_steps=lambda args, affected: affected,
     )
     op = registry.get("test.op")
     assert op is not None
@@ -430,7 +420,6 @@ def test_op_partial_and_value_survive_an_op_error() -> None:
             "_result = {'kept': 1}\n_affected = 2\n_partial = {'applied': 2, 'failed': 1}\n"
             "raise _OpError('SILENT_NOOP', 'one did not stick')"
         ),
-        undo_steps=lambda args, affected: 0,
     )
     result = _run(registry, {})
     assert result["opErrorCode"] == "SILENT_NOOP"

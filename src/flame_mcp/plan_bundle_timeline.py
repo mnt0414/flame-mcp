@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Final
 from flame_mcp import execution, selectors
 from flame_mcp.checkpointed import declared_run_args
 from flame_mcp.checkpoints import TIMELINE_KIND
+from flame_mcp.journal import JournalLink
 from flame_mcp.plan_bundle import (
     BUNDLED_WRITE_OPS,
     SKIPPED_KEY,
@@ -24,9 +25,11 @@ from flame_mcp.plan_bundle import (
     StepLike,
     is_bundled_op,
     issue_of,
+    no_pinned_target,
     single_target,
     unreadable,
     unresolved,
+    with_late_rows,
 )
 from flame_mcp.registry import RegisteredOperation, Registry
 from flame_mcp.types import Category, OperationSpec
@@ -58,10 +61,6 @@ def _selector_parts(step: StepLike) -> tuple[dict[str, Any], dict[str, Any] | No
     else:
         parent = dict(sel)
     return parent, (sel if sel.get("kind") == "segment" else None)
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _preresolve_to_python(args: Mapping[str, Any]) -> str:
@@ -102,7 +101,6 @@ def preresolve_op() -> RegisteredOperation:
             description="internal: resolve a bundled plan's segment selectors up front",
             effect="read",
             to_python=_preresolve_to_python,
-            undo_steps=_no_undo_steps,
             requires=("PySequence.parent", "PyClip.parent", "PyTrack.segments"),
         )
     )
@@ -112,7 +110,10 @@ def preresolve(ctx: ServerContext, steps: Sequence[StepLike]) -> BundleTarget:
     """Resolve every write step's selector in one Flame read. Raises `ServerOpError` (and nothing
     has been journaled or copied) when one does not resolve, when the writes are not all to one
     sequence / clip, or when that one is not on the Desktop."""
-    writes = [s for s in steps if s.op is not None and is_bundled_op(s.op, TIMELINE_KIND)]
+    bundled = [s for s in steps if s.op is not None and is_bundled_op(s.op, TIMELINE_KIND)]
+    writes = [s for s in bundled if not s.has_refs]  # a step with references is late: its
+    if not writes:  # selector is known only when it is sent, so it pins no sequence
+        raise no_pinned_target(TIMELINE_KIND.subject)
     specs = []
     for step in writes:
         parent, segment = _selector_parts(step)
@@ -133,7 +134,21 @@ def preresolve(ctx: ServerContext, steps: Sequence[StepLike]) -> BundleTarget:
         {"index": s.index, "op": s.op_name, "late": s.late, "segment": r.get("segment")}
         for s, r in zip(writes, rows, strict=True)
     ]
+    resolved = with_late_rows(resolved, bundled, segment=None)
     return BundleTarget(TIMELINE_KIND, ident, stable, uid, resolved)
+
+
+def rebound(
+    op: RegisteredOperation, args: dict[str, Any], stable: dict[str, Any]
+) -> dict[str, Any]:
+    """`args` with the sequence the step writes to (what `plan_bundle.Rebound` names) pointed at
+    the one the plan pinned: a checkpointed op as it declares, a `segment.set_attributes` by the
+    parent of its segment selector, any other op not at all."""
+    if op.checkpoint is not None and op.checkpoint.target_kind == TIMELINE_KIND.name:
+        return declared_run_args(op.checkpoint, args, stable)
+    if op.name in BUNDLED_WRITE_OPS[TIMELINE_KIND.name]:
+        return {**args, "target": {**args["target"], "parent": stable}}
+    return args
 
 
 def step_runner(
@@ -149,7 +164,7 @@ def step_runner(
         op = step.op
         assert op is not None and step.op_name is not None
         if op.checkpoint is not None and op.checkpoint.target_kind == TIMELINE_KIND.name:
-            run_args = declared_run_args(op.checkpoint, step.args, target.stable)
+            run_args = rebound(op, step.args, target.stable)
             env = execution.run_op(
                 op, run_args, run_dir=ctx.run_dir, timeout_s=op.checkpoint.timeout_s
             )
@@ -162,10 +177,6 @@ def step_runner(
             ):
                 env[SKIPPED_KEY] = True
             return env
-        args = step.args
-        if op.name in BUNDLED_WRITE_OPS[TIMELINE_KIND.name]:
-            sel = args["target"]
-            args = {**args, "target": {**sel, "parent": target.stable}}
-        return ctx.do(step.op_name, args, group=group)
+        return ctx.do(step.op_name, rebound(op, step.args, target.stable), link=JournalLink(group))
 
     return run

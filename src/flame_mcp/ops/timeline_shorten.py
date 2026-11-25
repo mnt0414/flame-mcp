@@ -8,16 +8,16 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from flame_mcp import selectors
-from flame_mcp.ops._segment_edit import no_undo_steps
+from flame_mcp.ops._segment_edit import CHECK_PHASES
 from flame_mcp.ops.timeline_build import (
-    _ACCEPTS,
-    _AUDIO_JUDGED,
-    _AUDIO_REQUIRES,
-    _CHECKPOINTED_AUDIO,
-    _PUT_REQUIRES,
-    _checkpoint,
-    _phase_code,
-    _sequence_param,
+    ACCEPTS,
+    AUDIO_JUDGED,
+    AUDIO_REQUIRES,
+    CHECKPOINTED_AUDIO,
+    PUT_REQUIRES,
+    checkpoint_spec,
+    phase_code,
+    sequence_param,
 )
 from flame_mcp.registry import Registry
 from flame_mcp.timeline_checkpoints import checkpoint_library_name, stash_reel_name
@@ -93,16 +93,16 @@ _DESCRIPTION = (
     "cleanup, selection {before, dropped, changed, after, error, beforeCuts}, display, stash "
     "{library, "
     "reel}, libraryCreated, reelCreated, returned, changed, audio, notices, warnings. "
-    + _AUDIO_JUDGED
+    + AUDIO_JUDGED
     + "The op deletes the tail of the sequence, so its effect is destructive; the checkpoint makes "
     "it revertible, and journal.revert restores the video and, measured as above, the audio "
-    "rows. " + _CHECKPOINTED_AUDIO
+    "rows. " + CHECKPOINTED_AUDIO
 )
 
 
 def _shorten_to_python(args: Mapping[str, Any]) -> str:
     tail = f"seq, {int(args['duration'])!r}"
-    return _phase_code(
+    return phase_code(
         args,
         f"_ts_check({tail})",
         f"_ts_shorten({tail}, {checkpoint_library_name()!r}, {stash_reel_name()!r})",
@@ -114,12 +114,13 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=SHORTEN_OP,
+            brief_paths=("duration", "end"),
             category="timeline",
             description=_DESCRIPTION,
             effect="destructive",
             undo="checkpoint",
             params=(
-                _sequence_param(),
+                sequence_param(),
                 OperationParam(
                     name="duration",
                     type="number",
@@ -132,14 +133,14 @@ def register(registry: Registry) -> None:
                     minimum=1,
                 ),
             ),
-            accepts=_ACCEPTS,
+            accepts=ACCEPTS,
             to_python=_shorten_to_python,
-            undo_steps=no_undo_steps,
             sample_args={
                 "sequence": {"kind": "wiretap", "id": "sample"},
                 "duration": 1,
             },
-            checkpoint=_checkpoint(
+            phases=CHECK_PHASES,
+            checkpoint=checkpoint_spec(
                 SHORTEN_OP, lambda args: f"before timeline.shorten (to {args['duration']})"
             ),
             requires=(
@@ -163,8 +164,8 @@ def register(registry: Registry) -> None:
                 "PyTimeline.clip",
                 "flame.delete",
                 "flame.find_by_uid",
-                *_PUT_REQUIRES,
-                *_AUDIO_REQUIRES,
+                *PUT_REQUIRES,
+                *AUDIO_REQUIRES,
             ),
         )
     )

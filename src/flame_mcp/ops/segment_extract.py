@@ -10,9 +10,9 @@ from typing import Any, Final
 from flame_mcp import selectors
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_WRITE_PHASES,
     EXPECTED_ARG,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_READ,
     PHASE_REVERT,
@@ -20,10 +20,18 @@ from flame_mcp.desktop_run import (
 )
 from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.ops._media_phases import alive_source, probe_source
-from flame_mcp.ops._segment_edit import SEGMENT_REQUIRES, no_undo_steps, segment_target_param
+from flame_mcp.ops._segment_edit import SEGMENT_REQUIRES, segment_target_param
 from flame_mcp.registry import Registry
 from flame_mcp.segment_extract_run import COPY_OP, MATCH_OP, run_extract
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _DESTINATION_KINDS: Final[tuple[SelectorKind, ...]] = ("wiretap", "path")
 
@@ -69,8 +77,8 @@ _COMMON = (
     "journal.revert(group) deletes the new clip by uid (flame.delete) only while its name, "
     "duration and content (segments and effects) are still what they were right after the call; "
     "otherwise CONFLICT and nothing is deleted; a clip that is gone already is ok "
-    "(result.alreadyGone). The sequence is never touched. Native Ctrl+Z is not used (undoSteps "
-    "0). Not allowed in plan.run."
+    "(result.alreadyGone). The sequence is never touched. Native Ctrl+Z is not used. "
+    "Not allowed in plan.run."
 )
 
 _COPY_DESCRIPTION = (
@@ -185,10 +193,33 @@ _REQUIRES = (
 )
 
 
+_PLAN_USE_SEGMENT_COPY_TO_MEDIA_PANEL = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "segment.copy_to_media_panel cannot be a plan step: it journals a `desktop_extract` "
+        "intent that is reverted by deleting the clip it made (only while it is as made), and a "
+        "plan's single group is reverted by putting attribute values back -- it would skip such "
+        "an intent without saying so. Call it on its own"
+    ),
+)
+
+
+_PLAN_USE_SEGMENT_MATCH = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "segment.match cannot be a plan step: it journals a `desktop_extract` intent that is "
+        "reverted by deleting the clip it made (only while it is as made), and a plan's single "
+        "group is reverted by putting attribute values back -- it would skip such an intent "
+        "without saying so. Call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=COPY_OP,
+            plan_use=_PLAN_USE_SEGMENT_COPY_TO_MEDIA_PANEL,
             category="segment",
             description=_COPY_DESCRIPTION,
             effect="create",
@@ -196,7 +227,7 @@ def register(registry: Registry) -> None:
             params=(segment_target_param(), _destination_param()),
             accepts=("segment", *_DESTINATION_KINDS),
             to_python=_extract_to_python("copy"),
-            undo_steps=no_undo_steps,
+            phases=(*CREATED_WRITE_PHASES,),
             precheck=_precheck,
             wrap=run_extract,
             sample_args=_SAMPLE_ARGS,
@@ -206,6 +237,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=MATCH_OP,
+            plan_use=_PLAN_USE_SEGMENT_MATCH,
             category="segment",
             description=_MATCH_DESCRIPTION,
             effect="create",
@@ -233,7 +265,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment", *_DESTINATION_KINDS),
             to_python=_extract_to_python("match"),
-            undo_steps=no_undo_steps,
+            phases=(*CREATED_WRITE_PHASES,),
             precheck=_precheck,
             wrap=run_extract,
             sample_args={**_SAMPLE_ARGS, "preserve_handle": False, "include_timeline_fx": False},

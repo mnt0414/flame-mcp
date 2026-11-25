@@ -12,10 +12,10 @@ from flame_mcp import selectors
 from flame_mcp.desktop_media_run import IMPORT_OP, run_media_write
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_WRITE_PHASES,
     EXPECTED_ARG,
     MAX_SOURCES,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_READ,
     PHASE_REVERT,
@@ -25,9 +25,12 @@ from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.ops._media_phases import alive_source, probe_source
 from flame_mcp.registry import Registry
 from flame_mcp.types import (
+    PHASE_ARG,
     Category,
     OperationParam,
     OperationSpec,
+    PlanKind,
+    PlanUse,
     Refusal,
     SelectorKind,
 )
@@ -77,7 +80,7 @@ _IMPORT_DESCRIPTION = (
     "every one still has the name, duration and content (segments and effects) it had right "
     "after the call; if any changed, or the record has no content fingerprint, it is CONFLICT "
     "and nothing is deleted. One that is gone already is listed in result.skipped. Native "
-    "Ctrl+Z is not used (undoSteps 0). Not allowed in plan.run."
+    "Ctrl+Z is not used. Not allowed in plan.run."
 )
 
 
@@ -150,11 +153,23 @@ def _import_to_python(args: Mapping[str, Any]) -> str:
     )
 
 
+_PLAN_USE_MEDIAHUB_IMPORT = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "mediahub.import cannot be a plan step: it journals a `desktop_import` intent that is "
+        "reverted by deleting the clips it made, and a plan's single group is reverted by "
+        "putting attribute values back -- it would skip such an intent without saying so. Call "
+        "it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register_category(CATEGORY)
     registry.register(
         OperationSpec(
             name=IMPORT_OP,
+            plan_use=_PLAN_USE_MEDIAHUB_IMPORT,
             category="mediahub",
             description=_IMPORT_DESCRIPTION,
             effect="create",
@@ -183,7 +198,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_DESTINATION_KINDS,
             to_python=_import_to_python,
-            undo_steps=lambda args, affected: 0,
+            phases=CREATED_WRITE_PHASES,
             precheck=_import_precheck,
             wrap=run_media_write,
             sample_args={

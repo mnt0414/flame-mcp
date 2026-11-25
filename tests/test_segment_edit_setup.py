@@ -17,11 +17,11 @@ from typing import Any
 import pytest
 
 from fake_media_tree import PySegment, PyTimelineFX
-from flame_mcp import setup_edit
-from flame_mcp.ops import plan as plan_mod
+from flame_mcp import plan_step, setup_edit
 from journal_test_helpers import Rig
 from p32b_helpers import PLAN, make_p32b_rig
 from p33_helpers import LETTERBOX, a_seg, seg_a, seg_b, sel_at, untouched_world
+from rig_fixtures import rig_fixture
 from setup_xml_helpers import DEFAULT_XML, XmlBehaviour, install_effect_xml
 from timeline_p32a_helpers import S1, checkpoints, fingerprint_of_target, library_copy, seg_sel, wt
 
@@ -29,9 +29,7 @@ EDIT = "segment.edit_effect_setup"
 TW = "Timewarp"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 @pytest.fixture
@@ -527,18 +525,18 @@ def test_a_difference_in_the_readback_survives_inside_a_plan(
 
 
 def test_a_long_degraded_note_is_cut_in_a_plan_summary_and_whole_in_a_full_one() -> None:
-    step = plan_mod._Step(0, op_name=EDIT)
+    step = plan_step.Step(0, op_name=EDIT)
     env: dict[str, Any] = {
         "ok": True,
         "errorCode": None,
         "result": {},
         "degraded": ["x" * 500, "short"],
     }
-    short, _, _ = plan_mod._step_summary(step, env, 0, "summary")
-    assert short["degraded"] == ["x" * plan_mod._DEGRADED_NOTE_CHARS, "short"]
-    full, _, _ = plan_mod._step_summary(step, env, 0, "full")
+    short, _, _ = plan_step.step_summary(step, env, 0, "summary")
+    assert short["degraded"] == ["x" * plan_step._DEGRADED_NOTE_CHARS, "short"]
+    full, _, _ = plan_step.step_summary(step, env, 0, "full")
     assert full["degraded"] == ["x" * 500, "short"]
-    none, _, _ = plan_mod._step_summary(step, {**env, "degraded": []}, 0, "full")
+    none, _, _ = plan_step.step_summary(step, {**env, "degraded": []}, 0, "full")
     assert "degraded" not in none
 
 

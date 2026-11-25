@@ -15,7 +15,7 @@ from typing import Any
 
 from flame_mcp import selectors
 from flame_mcp.effective_effect import overwrite_precheck
-from flame_mcp.ops._common import build_source
+from flame_mcp.ops._common import batch_target_param, build_source, raise_if_error
 from flame_mcp.ops._node_common import (
     CHECKPOINTED_NODE_NOTE,
     batch_of_node,
@@ -42,26 +42,13 @@ def _node_param(name: str, description: str) -> OperationParam:
     return OperationParam(name=name, type="selector", description=description, required=True)
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
-def _raise_if_error(code: str) -> str:
-    return "\n".join(
-        [
-            "if _result['error'] is not None:",
-            f"    raise _OpError(_result.get('errorCode') or {code!r}, _result['error'])",
-        ]
-    )
-
-
 def _create_to_python(args: Mapping[str, Any]) -> str:
     return build_source(
         selectors.resolve_code(args["target"], "target"),
         "\n".join(
             [
                 f"_result = _create_node(target, {args['type']!r}, {args.get('name')!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -94,9 +81,7 @@ def _create_check(rt: Any, args: Mapping[str, Any]) -> Refusal | None:
 def _delete_to_python(args: Mapping[str, Any]) -> str:
     return build_source(
         selectors.resolve_code(args["target"], "target"),
-        "\n".join(
-            ["_result = _delete_node(target__batch, target)", _raise_if_error("SILENT_NOOP")]
-        ),
+        "\n".join(["_result = _delete_node(target__batch, target)", raise_if_error("SILENT_NOOP")]),
     )
 
 
@@ -113,7 +98,7 @@ def _connect_to_python(args: Mapping[str, Any]) -> str:
                 "_result = _connect_nodes(source__batch, source, target__batch, target, "
                 f"{args.get('source_socket', 'Default')!r}, "
                 f"{args.get('target_socket', 'Default')!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -176,7 +161,7 @@ def _disconnect_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _disconnect_node(target__batch, target, {args.get('socket')!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -206,7 +191,7 @@ def _duplicate_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _duplicate_node(target__batch, target, {keep!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -248,7 +233,7 @@ def _save_setup_to_python(args: Mapping[str, Any]) -> str:
             [
                 "_result = _node_save_setup(target__batch, target, "
                 f"{args['path']!r}, {overwrite!r})",
-                _raise_if_error("FLAME_API_ERROR"),
+                raise_if_error("FLAME_API_ERROR"),
             ]
         ),
     )
@@ -260,7 +245,7 @@ def _load_setup_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _node_load_setup(target__batch, target, {args['path']!r})",
-                _raise_if_error("FLAME_API_ERROR"),
+                raise_if_error("FLAME_API_ERROR"),
             ]
         ),
     )
@@ -304,6 +289,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.create",
+            brief_paths=("node",),
             category="node",
             description=(
                 "Create a node of a given type in a Batch group (PyBatch.create_node), "
@@ -331,12 +317,7 @@ def register_writes(registry: Registry) -> None:
             effect="create",
             undo="checkpoint",
             params=(
-                OperationParam(
-                    name="target",
-                    type="selector",
-                    description="A 'batch' selector (uid or name). The group need not be current.",
-                    required=True,
-                ),
+                batch_target_param(),
                 OperationParam(
                     name="type",
                     type="string",
@@ -354,7 +335,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_create_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=CheckpointSpec(check=_create_check),
             sample_args={
                 "target": {"kind": "batch", "name": "sample"},
@@ -373,6 +353,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.delete",
+            brief_paths=("deleted", "alsoRemoved"),
             category="node",
             description=(
                 "Delete a node from its Batch group (PyNode.delete(confirm=False)). Its links "
@@ -394,7 +375,6 @@ def register_writes(registry: Registry) -> None:
             params=(target,),
             accepts=("node",),
             to_python=_delete_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=_spec_checkpoint(check=_delete_check),
             requires=("PyNode.delete", "PyNode.sockets", *NODE_REQUIRES),
         )
@@ -403,6 +383,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.connect",
+            brief_paths=("source", "sourceSocket", "target", "targetSocket"),
             category="node",
             description=(
                 "Connect an output socket of one node to an input socket of another in the same "
@@ -446,7 +427,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_connect_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=CheckpointSpec(
                 batch_arg="target",
                 group_selector=lambda a: batch_of_node(a["target"]),
@@ -460,6 +440,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.disconnect",
+            brief_paths=("node", "socket"),
             category="node",
             description=(
                 "Cut the input links of a node (PyBatch.disconnect_node): the named input "
@@ -487,7 +468,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_disconnect_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=_spec_checkpoint(check=_disconnect_check),
             requires=("PyBatch.disconnect_node", "PyNode.sockets", *NODE_REQUIRES),
         )
@@ -496,6 +476,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.duplicate",
+            brief_paths=("node",),
             category="node",
             description=(
                 "Duplicate a node (PyNode.duplicate). Only works while the node's Batch group "
@@ -526,7 +507,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_duplicate_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=_spec_checkpoint(check=_duplicate_check),
             requires=("PyNode.duplicate", "PyNode.sockets", *NODE_REQUIRES),
         )
@@ -535,6 +515,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.save_setup",
+            brief_paths=("node", "path"),
             category="node",
             description=(
                 "Save a node's setup to a file (PyNode.save_node_setup); nothing in the project "
@@ -581,7 +562,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_save_setup_to_python,
-            undo_steps=_no_undo_steps,
             precheck=overwrite_precheck("node.save_setup"),
             requires=("PyNode.save_node_setup", *NODE_REQUIRES),
         )
@@ -590,6 +570,7 @@ def register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="node.load_setup",
+            brief_paths=("node", "path"),
             category="node",
             description=(
                 "Load a node setup file into a node (PyNode.load_node_setup): the node's "
@@ -619,7 +600,6 @@ def register_writes(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_load_setup_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_load_setup_precheck,
             checkpoint=_spec_checkpoint(check=_load_setup_check),
             requires=("PyNode.load_node_setup", *NODE_REQUIRES),

@@ -8,20 +8,13 @@ from typing import Any
 
 import pytest
 
+from conftest import shared_registry
 from fake_media_tree import build_default_tree
 from flame_mcp import compact
 from flame_mcp.compact import ResponseModeConfigError, compact_envelope, response_mode_from_env
 from flame_mcp.envelope import build_envelope
-from flame_mcp.ops import register_all
-from flame_mcp.registry import Registry
 from op_test_helpers import run_op
 from test_ops_desktop_list_all import build_world
-
-
-def _registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def _env(**kwargs: Any) -> dict[str, Any]:
@@ -49,11 +42,9 @@ def test_outer_empty_string_list_dict_and_none_are_left_out() -> None:
     assert out["kept"] == "x"
 
 
-def test_affected_and_undo_steps_are_left_out_at_zero_and_kept_otherwise() -> None:
-    assert "affected" not in compact_envelope(_env(result=1, affected=0, undo_steps=0))
-    assert "undoSteps" not in compact_envelope(_env(result=1, affected=0, undo_steps=0))
-    out = compact_envelope(_env(result=1, affected=3, undo_steps=2))
-    assert out["affected"] == 3 and out["undoSteps"] == 2
+def test_affected_is_left_out_at_zero_and_kept_otherwise() -> None:
+    assert "affected" not in compact_envelope(_env(result=1, affected=0))
+    assert compact_envelope(_env(result=1, affected=3))["affected"] == 3
 
 
 def test_ok_is_always_present_even_for_a_bare_failure() -> None:
@@ -367,7 +358,7 @@ def test_the_same_array_object_in_two_elements_gives_two_cells() -> None:
 
 def test_the_items_of_a_real_list_all_walk_become_a_table() -> None:
     flame, _h = build_world()
-    value = run_op(_registry(), "desktop.list_all", {"limit": 500}, flame)["value"]
+    value = run_op(shared_registry(), "desktop.list_all", {"limit": 500}, flame)["value"]
     assert len(value["items"]) >= 3 and all("path" in item for item in value["items"])
     table = compact_envelope(_env(result=value))["result"]["items"]
     assert table["columns"][:3] == ["type", "name", "uid"]
@@ -392,7 +383,7 @@ def test_the_items_of_a_real_list_segments_with_effects_become_a_table() -> None
     flame, h = build_default_tree()
     target = {"kind": "wiretap", "id": h["seq"].get_wiretap_node_id()}
     value = run_op(
-        _registry(),
+        shared_registry(),
         "timeline.list_segments",
         {"target": target, "version": 0, "track": 0, "limit": 50},
         flame,

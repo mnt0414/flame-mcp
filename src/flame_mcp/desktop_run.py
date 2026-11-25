@@ -50,18 +50,22 @@ from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
-from flame_mcp.checkpointed import note_unresolved
 from flame_mcp.journal import (
     KIND_DESKTOP_COPY,
     KIND_DESKTOP_CREATE,
     new_id,
     now_iso,
 )
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.journal_records import GroupFields, IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import (
+    UNKNOWN_END_CODES,
+    close_outcome,
+    note_unresolved,
+    outcome_not_journaled_note,
+)
 from flame_mcp.library_open import merge_into_envelope
 from flame_mcp.registry import RegisteredOperation
-from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import ErrorCode
+from flame_mcp.types import PHASE_ARG, PhaseSpec
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -72,7 +76,6 @@ COPY_OP: Final[str] = "desktop.copy"
 CREATE_OPS: Final[frozenset[str]] = frozenset({CREATE_OP, LIBRARY_CREATE_OP})
 """The ops that make one new thing and share `desktop.create`'s journal / revert / check
 (`library.create` is `desktop.create` with createKind 'library')."""
-PHASE_ARG: Final[str] = "_phase"
 EXPECTED_ARG: Final[str] = "_expected"
 CREATED_ARG: Final[str] = "_created"
 PHASE_READ: Final[str] = "read"
@@ -81,6 +84,17 @@ PHASE_REVERT: Final[str] = "revert"
 PHASE_REVERT_PLAN: Final[str] = "revert_plan"
 PHASE_ALIVE: Final[str] = "alive"
 PHASE_PROBE: Final[str] = "probe"
+CREATED_REVERT_PHASES: Final[tuple[PhaseSpec, ...]] = (
+    PhaseSpec(PHASE_ALIVE, {CREATED_ARG: {"items": []}}),
+    PhaseSpec(PHASE_REVERT, {CREATED_ARG: {}}),
+)
+"""The phases a journaled create reads its `created` back with: still alive, and revert."""
+CREATED_WRITE_PHASES: Final[tuple[PhaseSpec, ...]] = (
+    *CREATED_REVERT_PHASES,
+    PhaseSpec(PHASE_PROBE),
+    PhaseSpec(PHASE_READ),
+)
+"""`CREATED_REVERT_PHASES` plus the probe and the pre-read of the write-ahead pair."""
 WRITE_TIMEOUT_S: Final[float] = 30.0
 MAX_SOURCES: Final[int] = 50
 
@@ -108,6 +122,9 @@ CURRENT_DELETED_NOTE: Final[str] = (
     "The deleted group was the current Batch group, so Flame made another existing group "
     "current: `current` is the group that is current now, `previousCurrent` the deleted one."
 )
+BATCH_COPY_PREFIX: Final[str] = "Batch group copy:"
+"""Starts every refusal of `desktop_batch_prelude.BATCH_COPY_HELPER`; it selects the copy hint."""
+
 BATCH_COPY_HINT: Final[str] = (
     "Nothing was copied and nothing journaled. A Batch group is copied into a library or a "
     "library folder (a reel would take its clips instead), and a Batch group inside a library "
@@ -118,26 +135,6 @@ LAST_REEL_NOTE: Final[str] = (
     "delete (Reel 1 to 4 and Sequences, measured on Flame 2025.2.4); "
     "parentReelsAfter lists them."
 )
-
-
-def _refusal(
-    op: RegisteredOperation,
-    code: ErrorCode,
-    message: str,
-    started: float,
-    *,
-    result: Any = None,
-    hint: str | None = None,
-) -> dict[str, Any]:
-    return envelope_mod.build_envelope(
-        ok=False,
-        result=result,
-        error=message,
-        error_code=code,
-        execution=envelope_mod.execution_meta(op),
-        duration_ms=elapsed_ms(started),
-        hint_override=hint,
-    )
 
 
 def create_op_name(kind: Any) -> str:
@@ -189,11 +186,12 @@ def created_record(op_name: str, result: Mapping[str, Any] | None) -> dict[str, 
     return {"destination": result.get("destination"), "copies": copies}
 
 
-BATCH_REEL_HINT: Final[str] = (
-    "A reel of a Batch group takes clips through batch.add_clips (it checkpoints the group and "
-    "checks the Clip nodes); desktop.copy is for Desktop and library destinations. Nothing was "
-    "copied and nothing journaled."
-)
+def batch_reel_hint(op_name: str, places: str, done: str) -> str:
+    return (
+        "A reel of a Batch group takes clips through batch.add_clips (it checkpoints the group and "
+        f"checks the Clip nodes); {op_name} is for Desktop and library {places}. Nothing was "
+        f"{done} and nothing journaled."
+    )
 
 
 def pre_read_failure(
@@ -267,9 +265,9 @@ def _intent_record(
     *,
     intent_id: str,
     group_id: str,
-) -> dict[str, Any]:
+) -> IntentRecord:
     is_create = op.name in CREATE_OPS
-    record: dict[str, Any] = {
+    record: IntentRecord = {
         "type": "intent",
         "id": intent_id,
         "group": group_id,
@@ -330,7 +328,7 @@ def _refuse_taken_name(
     names = [row.get("name") for row in pre.get("existing") or []]
     if op_args["name"] not in names or op_args.get("allow_rename", False):
         return None
-    return _refusal(
+    return envelope_mod.refusal(
         op,
         "PRECONDITION_UNMET",
         f"nothing was created: a {op_args['kind']} named {op_args['name']!r} already exists",
@@ -345,9 +343,55 @@ def _refuse_taken_name(
 
 def _pre_read_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
     if op.name == COPY_OP and pre.get("errorCode") == "INVALID_ARGS":
-        if "Batch group copy:" in str(pre.get("error")):
+        if BATCH_COPY_PREFIX in str(pre.get("error")):
             return BATCH_COPY_HINT
-        return BATCH_REEL_HINT
+        return batch_reel_hint(op.name, "destinations", "copied")
+    return None
+
+
+def batch_reel_pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
+    if pre.get("errorCode") != "INVALID_ARGS":
+        return None
+    return batch_reel_hint(op.name, "places", "written")
+
+
+def entry_rows(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"name": e.get("name"), "uid": e.get("uid")} for e in entries]
+
+
+def read_destination(
+    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any]
+) -> dict[str, Any]:
+    return execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
+
+
+def open_group(
+    rt: Runtime,
+    op: RegisteredOperation,
+    group: str,
+    kind: str,
+    started: float,
+    *,
+    steps: list[str],
+    before: list[str] | None = None,
+    hint: str | None = None,
+) -> dict[str, Any] | None:
+    """Open the journal group of a write that runs more than one step: None, or the refusal when
+    the journal cannot be written."""
+    fields: GroupFields = {"label": None, "steps": steps}
+    if before is not None:
+        fields["before"] = before
+    why = rt.journal.append_group(group, kind, **fields)
+    if why is not None:
+        return envelope_mod.refusal(
+            op,
+            "POLICY_DENIED",
+            f"nothing was written: the journal cannot be written ({why}), and this server does "
+            "not write to the project without a record",
+            started,
+            result={"ran": False},
+            hint=hint,
+        )
     return None
 
 
@@ -368,16 +412,16 @@ def read_back_returned(env: Mapping[str, Any]) -> dict[str, Any] | None:
     return {"returned": result["returned"], "made": result.get("created") is not None}
 
 
-def partial_verdict(ok: bool, created: Mapping[str, Any] | None) -> dict[str, str]:
+def partial_verdict(ok: bool, created: Mapping[str, Any] | None) -> str | None:
     """The outcome key that makes the intent's state `partial` (`IntentView.state`): the call
     ended in an error after it had made or changed something that `created` records, so a
     `journal.revert` can still put that part back."""
-    return {"verdict": "partial"} if not ok and created is not None else {}
+    return "partial" if not ok and created is not None else None
 
 
 @dataclass(frozen=True)
 class WriteProfile:
-    """What differs between the desktop writes that share `run_write_flow` (the lock, the
+    """What differs between the desktop writes that share `run_write_flow` (the
     pre-read, the intent, the compare-and-swap write, the outcome, the fail-closed handling of an
     answer that never came). `desktop.create` / `desktop.copy` are `DEFAULT_PROFILE`;
     `desktop_media_run` brings one for import / duplicate / move."""
@@ -386,7 +430,7 @@ class WriteProfile:
         [RegisteredOperation, dict[str, Any], dict[str, Any]],
         tuple[dict[str, Any], dict[str, Any] | None, str | None],
     ]
-    intent: Callable[..., dict[str, Any]]
+    intent: Callable[..., IntentRecord]
     created: Callable[[str, Mapping[str, Any] | None], dict[str, Any] | None]
     notes: Callable[[RegisteredOperation, Mapping[str, Any], dict[str, Any]], None]
     pre_hint: Callable[[RegisteredOperation, Mapping[str, Any]], str | None]
@@ -422,106 +466,93 @@ def run_write_flow(
     group: str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
+    pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
+    if pre_env.get("ok") is not True or not isinstance(pre_env.get("result"), dict):
+        return _fail_pre_read(op, pre_env, profile.pre_hint(op, pre_env))
+    pre: dict[str, Any] = pre_env["result"]
 
-        pre_env = execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
-        if pre_env.get("ok") is not True or not isinstance(pre_env.get("result"), dict):
-            return _fail_pre_read(op, pre_env, profile.pre_hint(op, pre_env))
-        pre: dict[str, Any] = pre_env["result"]
+    refused = profile.refuse(op, op_args, pre, started)
+    if refused is not None:
+        merge_into_envelope(refused, pre)
+        return refused
+    group_id = group if group is not None else new_id("g")
+    if profile.prepare is not None:
+        prepared = profile.prepare(rt, op, op_args, pre, group_id)
+        if prepared is not None:
+            merge_into_envelope(prepared, pre)
+            return prepared
+    write_args, stable, problem = profile.stable_args(op, op_args, pre)
+    if problem is not None:
+        unmatched = envelope_mod.refusal(
+            op,
+            "PRECONDITION_UNMET",
+            f"nothing was written: {problem}",
+            started,
+            result={"ran": False},
+        )
+        merge_into_envelope(unmatched, pre)
+        return unmatched
 
-        refused = profile.refuse(op, op_args, pre, started)
-        if refused is not None:
-            merge_into_envelope(refused, pre)
-            return refused
-        group_id = group if group is not None else new_id("g")
-        if profile.prepare is not None:
-            prepared = profile.prepare(rt, op, op_args, pre, group_id)
-            if prepared is not None:
-                merge_into_envelope(prepared, pre)
-                return prepared
-        write_args, stable, problem = profile.stable_args(op, op_args, pre)
-        if problem is not None:
-            unmatched = _refusal(
-                op,
-                "PRECONDITION_UNMET",
-                f"nothing was written: {problem}",
-                started,
-                result={"ran": False},
-            )
-            merge_into_envelope(unmatched, pre)
-            return unmatched
+    intent_id = new_id("i")
+    try:
+        rt.journal.append(
+            profile.intent(op, op_args, pre, stable, intent_id=intent_id, group_id=group_id)
+        )
+    except OSError as exc:
+        unwritable = envelope_mod.refusal(
+            op,
+            "POLICY_DENIED",
+            f"nothing was written: the journal cannot be written ({exc}), and this server "
+            "does not write to the project without an intent on record",
+            started,
+            result={"ran": False},
+            hint=f"Make {rt.journal.directory} writable, then retry.",
+        )
+        merge_into_envelope(unwritable, pre)
+        return unwritable
 
-        intent_id = new_id("i")
-        try:
-            rt.journal.append(
-                profile.intent(op, op_args, pre, stable, intent_id=intent_id, group_id=group_id)
-            )
-        except OSError as exc:
-            unwritable = _refusal(
-                op,
-                "POLICY_DENIED",
-                f"nothing was written: the journal cannot be written ({exc}), and this server "
-                "does not write to the project without an intent on record",
-                started,
-                result={"ran": False},
-                hint=f"Make {rt.journal.directory} writable, then retry.",
-            )
-            merge_into_envelope(unwritable, pre)
-            return unwritable
-
-        write_args[PHASE_ARG] = PHASE_WRITE
-        write_args[EXPECTED_ARG] = rows_uids(pre.get("existing"))
-        env = execution.run_op(op, write_args, run_dir=rt.run_dir, timeout_s=WRITE_TIMEOUT_S)
-        end_code = env.get("errorCode")
-        if end_code in UNKNOWN_END_CODES:
-            rt.guard.block(intent_id, group_id, op.name, str(end_code))
-            note_unresolved(rt, intent_id, group_id, env)
-            hint = str(env.get("hint") or "")
-            env["hint"] = (
-                f"{hint} It is not known whether the call landed: this server now refuses every "
-                f"write until journal.check (group={group_id!r}) has read Flame again."
-            ).strip()
-            env["journal"] = _journal_ref(group_id, intent_id, None)
-            merge_into_envelope(env, pre)
-            return env
-
-        ok = env.get("ok") is True
-        created = profile.created(op.name, env.get("result"))
-        outcome: dict[str, Any] = {
-            "type": "outcome",
-            "id": intent_id,
-            "group": group_id,
-            "ts": now_iso(),
-            "ok": ok,
-            "applied": [],
-            "failed": {} if ok else {op.name: str(env.get("error"))},
-            "errorCode": None if ok else end_code,
-            "readBack": profile.read_back(env),
-            "created": created,
-            **partial_verdict(ok, created),
-        }
-        try:
-            rt.journal.append(outcome)
-        except OSError as exc:
-            rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-            env["degraded"] = [
-                *env.get("degraded", []),
-                f"the outcome could not be journaled ({exc}); the answer stands but this server "
-                "now refuses writes until journal.check has settled the intent",
-            ]
-        env["journal"] = _journal_ref(group_id, intent_id, created)
+    write_args[PHASE_ARG] = PHASE_WRITE
+    write_args[EXPECTED_ARG] = rows_uids(pre.get("existing"))
+    env = execution.run_op(op, write_args, run_dir=rt.run_dir, timeout_s=WRITE_TIMEOUT_S)
+    end_code = env.get("errorCode")
+    if end_code in UNKNOWN_END_CODES:
+        note_unresolved(rt, intent_id, group_id, env, op.name, str(end_code))
+        hint = str(env.get("hint") or "")
+        env["hint"] = (
+            f"{hint} It is not known whether the call landed: this server now refuses every "
+            f"write until journal.check (group={group_id!r}) has read Flame again."
+        ).strip()
+        env["journal"] = _journal_ref(group_id, intent_id, None)
         merge_into_envelope(env, pre)
-        profile.notes(op, op_args, env)
         return env
+
+    ok = env.get("ok") is True
+    created = profile.created(op.name, env.get("result"))
+    outcome: OutcomeRecord = {
+        "type": "outcome",
+        "id": intent_id,
+        "group": group_id,
+        "ts": now_iso(),
+        "ok": ok,
+        "applied": [],
+        "failed": {} if ok else {op.name: str(env.get("error"))},
+        "errorCode": None if ok else end_code,
+        "readBack": profile.read_back(env),
+        "created": created,
+    }
+    verdict = partial_verdict(ok, created)
+    if verdict is not None:
+        outcome["verdict"] = verdict
+    err = close_outcome(rt, outcome, intent_id, group_id, op.name)
+    if err is not None:
+        env["degraded"] = [
+            *env.get("degraded", []),
+            outcome_not_journaled_note(err, "the answer"),
+        ]
+    env["journal"] = _journal_ref(group_id, intent_id, created)
+    merge_into_envelope(env, pre)
+    profile.notes(op, op_args, env)
+    return env
 
 
 def run_desktop_write(

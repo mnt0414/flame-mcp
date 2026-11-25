@@ -46,10 +46,10 @@ from flame_mcp.desktop_revert import (
 from flame_mcp.desktop_run import (
     CREATED_ARG,
     EXPECTED_ARG,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_REVERT,
     WriteProfile,
+    batch_reel_pre_hint,
     rows_uids,
     run_write_flow,
 )
@@ -57,8 +57,6 @@ from flame_mcp.journal import (
     KIND_DESKTOP_DUPLICATE,
     KIND_DESKTOP_IMPORT,
     KIND_DESKTOP_MOVE,
-    KIND_DESKTOP_REVERT,
-    MEDIA_WRITE_KINDS,
     STATE_DIVERGED,
     STATE_LANDED,
     STATE_NOT_LANDED,
@@ -66,8 +64,9 @@ from flame_mcp.journal import (
     IntentView,
     now_iso,
 )
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
 from flame_mcp.registry import RegisteredOperation
-from flame_mcp.types import ServerResult
+from flame_mcp.types import PHASE_ARG, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.journal import Index
@@ -97,16 +96,6 @@ MOVE_REVERT_NOTE: Final[str] = (
     "What the Timeline shows is put back as after a move (result.shownBefore / shownAfter / "
     "reshown)."
 )
-
-
-def is_media_intent(view: IntentView) -> bool:
-    """An intent of `mediahub.import` / `desktop.duplicate` / `desktop.move`, or the revert of
-    one."""
-    if view.desktop_kind in MEDIA_WRITE_KINDS:
-        return True
-    return view.desktop_kind == KIND_DESKTOP_REVERT and view.intent.get("revertOf") in (
-        MEDIA_WRITE_KINDS
-    )
 
 
 def _entry_row(entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,8 +146,8 @@ def _intent_record(
     *,
     intent_id: str,
     group_id: str,
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
+) -> IntentRecord:
+    record: IntentRecord = {
         "type": "intent",
         "id": intent_id,
         "group": group_id,
@@ -255,22 +244,12 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
         env["degraded"] = [*env.get("degraded", []), *[f"read-back differs: {w}" for w in warnings]]
 
 
-def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
-    if pre.get("errorCode") != "INVALID_ARGS":
-        return None
-    return (
-        "A reel of a Batch group takes clips through batch.add_clips (it checkpoints the group and "
-        f"checks the Clip nodes); {op.name} is for Desktop and library places. Nothing was "
-        "written and nothing journaled."
-    )
-
-
 MEDIA_PROFILE: Final[WriteProfile] = WriteProfile(
     stable_args=_stable_args,
     intent=_intent_record,
     created=created_record,
     notes=_notes,
-    pre_hint=_pre_hint,
+    pre_hint=batch_reel_pre_hint,
     read_back=_read_back,
 )
 
@@ -312,8 +291,9 @@ def _revert_count(view: IntentView, result: Mapping[str, Any]) -> int:
     return len(result.get("reverted") or [])
 
 
-def _revert_extra(result: Mapping[str, Any]) -> dict[str, Any]:
-    return {"reverted": result["reverted"]} if "reverted" in result else {}
+def _revert_extra(result: Mapping[str, Any], outcome: OutcomeRecord) -> None:
+    if "reverted" in result:
+        outcome["reverted"] = result["reverted"]
 
 
 MEDIA_REVERT: Final[RevertProfile] = RevertProfile(
@@ -326,7 +306,7 @@ MEDIA_REVERT: Final[RevertProfile] = RevertProfile(
 
 
 def revert_media_group(
-    ctx: ServerContext, index: Index, group: str, views: list[IntentView]
+    ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
 ) -> ServerResult:
     """`journal.revert` of a group whose intent is an import / duplicate / move."""
     return revert_flow(ctx, index, group, views, MEDIA_REVERT)

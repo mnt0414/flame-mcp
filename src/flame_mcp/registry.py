@@ -20,16 +20,21 @@ from typing import Any, Literal, assert_never, get_args
 from flame_mcp import api_symbols
 from flame_mcp.types import (
     NO_DEFAULT,
+    PHASE_ARG,
     Category,
     CheckpointSpec,
     Depth,
     Effect,
     JournalSpec,
+    ListFields,
     OnError,
     OperationParam,
     OperationSpec,
     Pacing,
     ParamType,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
     Precheck,
     SelectorKind,
     ServerHandler,
@@ -116,10 +121,6 @@ def continues_on_error(on_error: OnError) -> bool:
             assert_never(unreachable)
 
 
-def _always_zero_undo_steps(args: Mapping[str, Any], target_count: int) -> int:
-    return 0
-
-
 @dataclass(frozen=True)
 class RegisteredOperation:
     """Every field of the spec, resolved to its effective value (op, category, global default)."""
@@ -143,7 +144,6 @@ class RegisteredOperation:
     max_limit: int
     to_python: Callable[[Mapping[str, Any]], str] | None
     verify: Callable[[Mapping[str, Any]], str | None] | None
-    undo_steps: Callable[[Mapping[str, Any], int], int]
     sample_args: Mapping[str, Any]
     sources: Mapping[str, Source]
     server_handler: ServerHandler | None = None
@@ -151,6 +151,10 @@ class RegisteredOperation:
     precheck: Precheck | None = None
     wrap: WrapHandler | None = None
     checkpoint: CheckpointSpec | None = None
+    plan_use: PlanUse | None = None
+    brief_paths: tuple[str, ...] = ()
+    list_fields: ListFields | None = None
+    phases: tuple[PhaseSpec, ...] = ()
 
 
 def _check_member(op_name: str, field_name: str, value: str, literal_type: Any) -> None:
@@ -260,6 +264,7 @@ def _check_to_python_output(
     effect: Effect,
     pacing: Pacing,
     kind: SelectorKind | None = None,
+    phase: str | None = None,
 ) -> None:
     """Runs ast.parse and the write-op pacing/loop guard on `generated`.
 
@@ -267,6 +272,8 @@ def _check_to_python_output(
     `kind` is only for the error message (which sample produced `generated`).
     """
     context = f" (accepts kind {kind!r})" if kind is not None else ""
+    if phase is not None:
+        context += f" (phase {phase!r})"
     try:
         tree = ast.parse(generated)
     except SyntaxError as exc:
@@ -333,6 +340,10 @@ class Registry:
         param_names = [p.name for p in spec.params]
         if len(param_names) != len(set(param_names)):
             raise RegistrationError(f"'{name}': duplicate parameter name in params")
+        if (spec.list_fields is not None) != ("fields" in param_names):
+            raise RegistrationError(
+                f"'{name}': list_fields and a `fields` param go together (list_fields.fields_param)"
+            )
 
         _check_member(name, "effect", spec.effect, Effect)
         for param in spec.params:
@@ -495,6 +506,10 @@ class Registry:
                         name, kind_generated, effect=spec.effect, pacing=pacing, kind=kind
                     )
 
+            self._check_phases(spec, sample_args, pacing)
+        elif spec.phases:
+            raise RegistrationError(f"'{name}': phases need to_python")
+
         if spec.journal is not None:
             self._check_journal_spec(spec, thread, undo, sample_args)
 
@@ -509,13 +524,8 @@ class Registry:
         if spec.checkpoint is not None:
             self._check_checkpoint_spec(spec, thread, undo)
 
-        undo_steps: Callable[[Mapping[str, Any], int], int]
-        if spec.effect == "read":
-            undo_steps = spec.undo_steps if spec.undo_steps is not None else _always_zero_undo_steps
-        else:
-            if spec.undo_steps is None:
-                raise RegistrationError(f"'{name}': non-read operations must declare undo_steps")
-            undo_steps = spec.undo_steps
+        if spec.plan_use is not None:
+            self._check_plan_use(spec)
 
         for symbol in (*spec.requires, *spec.diagnose):
             if not _is_well_formed_symbol(symbol):
@@ -543,7 +553,6 @@ class Registry:
             max_limit=max_limit,
             to_python=spec.to_python,
             verify=spec.verify,
-            undo_steps=undo_steps,
             sample_args=sample_args,
             sources=MappingProxyType(dict(sources)),
             server_handler=spec.server_handler,
@@ -551,9 +560,46 @@ class Registry:
             precheck=spec.precheck,
             wrap=spec.wrap,
             checkpoint=spec.checkpoint,
+            plan_use=spec.plan_use,
+            brief_paths=spec.brief_paths,
+            list_fields=spec.list_fields,
+            phases=spec.phases,
         )
         self._operations[name] = registered
         return registered
+
+    @staticmethod
+    def _check_phases(spec: OperationSpec, sample_args: Mapping[str, Any], pacing: Pacing) -> None:
+        name = spec.name
+        assert spec.to_python is not None
+        seen: set[str] = set()
+        for phase in spec.phases:
+            if phase.name in seen:
+                raise RegistrationError(f"'{name}': phase '{phase.name}' declared twice")
+            seen.add(phase.name)
+            phase_args = {**sample_args, **phase.args, PHASE_ARG: phase.name}
+            try:
+                generated = spec.to_python(phase_args)
+            except Exception as exc:  # registration-time smoke test, any failure is fatal
+                raise RegistrationError(
+                    f"'{name}': to_python raised {exc!r} for phase '{phase.name}'"
+                ) from exc
+            _check_to_python_output(
+                name, generated, effect=spec.effect, pacing=pacing, phase=phase.name
+            )
+
+    @staticmethod
+    def _check_plan_use(spec: OperationSpec) -> None:
+        name = spec.name
+        plan_use = spec.plan_use
+        assert plan_use is not None
+        if spec.effect == "read":
+            raise RegistrationError(f"'{name}': a read operation has no plan_use")
+        if plan_use.kind is not PlanKind.NEVER and not (plan_use.refusal or plan_use.own_group):
+            raise RegistrationError(
+                f"'{name}': plan_use kind {plan_use.kind.name} is for an op that plan.run "
+                "refuses: give a refusal or own_group"
+            )
 
     @staticmethod
     def _check_journal_spec(

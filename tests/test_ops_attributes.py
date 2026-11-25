@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import (
     FakeAttr,
     FakeFlame,
@@ -32,7 +33,6 @@ from fake_media_tree import (
     build_default_tree,
 )
 from flame_mcp import envelope as envelope_mod
-from flame_mcp.ops import register_all
 from flame_mcp.ops._attributes import register_attribute_ops
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.registry import RegistrationError, Registry
@@ -133,12 +133,6 @@ class _FakePyTime:
 _FakePyTime.__name__ = "PyTime"
 
 
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
-
-
 def call(registry: Registry, op: str, args: dict[str, Any], flame: Any) -> dict[str, Any]:
     """Validate like flame_do does, then run: the arguments must be a legal call."""
     result = validate_op_args(registry.get(op), args)  # type: ignore[arg-type]
@@ -176,7 +170,7 @@ def to_envelope(registry: Registry, op_name: str, args: dict[str, Any], raw: dic
         inflight_path=None,
         duration_ms=1,
     )
-    return envelope_mod.from_bridge_result(op, args, br)
+    return envelope_mod.from_bridge_result(op, br)
 
 
 def make_batch_world() -> tuple[FakeFlame, dict[str, Any]]:
@@ -673,7 +667,6 @@ def test_a_partial_failure_reaches_the_envelope_with_result_and_partial() -> Non
     assert env["errorCode"] == "SILENT_NOOP"
     assert env["partial"] == {"applied": 1, "failed": 1}
     assert env["affected"] == 1
-    assert env["undoSteps"] == 0
     assert env["result"]["applied"] == ["blend_type"]
     assert env["result"]["revert"]["op"] == "node.set_attributes"
 
@@ -832,7 +825,6 @@ def test_set_attributes_is_a_reversible_value_undo_zero_op(category: str) -> Non
     op = registry.get(f"{category}.set_attributes")
     assert op is not None
     assert (op.effect, op.undo, op.thread, op.pacing) == ("reversible", "value", "main", "none")
-    assert op.undo_steps({}, 5) == 0
     assert "set_value" in op.description and "revert" in op.description
     read = registry.get(f"{category}.get_attributes")
     assert read is not None and read.effect == "read"

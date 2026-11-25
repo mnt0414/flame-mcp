@@ -10,10 +10,10 @@ from flame_mcp import selectors
 from flame_mcp.desktop_media_run import DUPLICATE_OP, MOVE_OP, run_media_write
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_WRITE_PHASES,
     EXPECTED_ARG,
     MAX_SOURCES,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_READ,
     PHASE_REVERT,
@@ -22,7 +22,15 @@ from flame_mcp.desktop_run import (
 from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.ops._media_phases import alive_source, probe_source
 from flame_mcp.registry import Registry
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 _DESTINATION_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path")
@@ -51,7 +59,7 @@ _DUPLICATE_DESCRIPTION = (
     "still as made: a reel has the same name and number of entries, a clip / sequence the same "
     "name, duration and content (segments and effects); otherwise CONFLICT and nothing is "
     "deleted. A record made without a content fingerprint is a CONFLICT as well. A duplicate "
-    "that is gone already is ok (result.alreadyGone). Native Ctrl+Z is not used (undoSteps 0). "
+    "that is gone already is ok (result.alreadyGone). Native Ctrl+Z is not used. "
     "Not allowed in plan.run."
 )
 
@@ -101,13 +109,9 @@ _MOVE_DESCRIPTION = (
     "out of a library, since it undoes this server's own move. The things get new uids "
     "again and go to the end of their old parent (for a move inside one reel that is the same "
     "reel, whose old order the revert does not restore); "
-    "result.reverted[].to has the new selectors. Native Ctrl+Z is not used (undoSteps 0). Not "
+    "result.reverted[].to has the new selectors. Native Ctrl+Z is not used. Not "
     "allowed in plan.run."
 )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _duplicate_to_python(args: Mapping[str, Any]) -> str:
@@ -185,10 +189,33 @@ def _move_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+_PLAN_USE_DESKTOP_DUPLICATE = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "desktop.duplicate cannot be a plan step: it journals a `desktop_duplicate` intent that "
+        "is reverted by deleting the duplicate (only while it is as made), and a plan's single "
+        "group is reverted by putting attribute values back -- it would skip such an intent "
+        "without saying so. Call it on its own"
+    ),
+)
+
+
+_PLAN_USE_DESKTOP_MOVE = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "desktop.move cannot be a plan step: it journals a `desktop_move` intent that is "
+        "reverted by moving the things back (they get new uids), and a plan's single group is "
+        "reverted by putting attribute values back -- it would skip such an intent without "
+        "saying so. Call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=DUPLICATE_OP,
+            plan_use=_PLAN_USE_DESKTOP_DUPLICATE,
             category="desktop",
             description=_DUPLICATE_DESCRIPTION,
             effect="create",
@@ -206,7 +233,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_duplicate_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(*CREATED_WRITE_PHASES,),
             wrap=run_media_write,
             sample_args={"target": {"kind": "wiretap", "id": "s"}},
             requires=(
@@ -231,6 +258,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=MOVE_OP,
+            plan_use=_PLAN_USE_DESKTOP_MOVE,
             category="desktop",
             description=_MOVE_DESCRIPTION,
             effect="create",
@@ -259,7 +287,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_move_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(*CREATED_WRITE_PHASES,),
             precheck=_move_precheck,
             wrap=run_media_write,
             sample_args={

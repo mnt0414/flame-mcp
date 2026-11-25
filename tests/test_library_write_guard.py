@@ -8,7 +8,6 @@ through the real Runtime over the fake Flame tree."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,15 +16,14 @@ from fake_media_tree import PyFolder, adopt
 from journal_test_helpers import Rig
 from media_p31b_helpers import add_clip
 from p32b_helpers import LIB_CLIP1, LIBREEL, REEL1, make_p32b_rig, reel2, wt
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import S1, library_copy, reel_names, seg_sel
 
 LIB_WT = "/projects/p/ws/P1O"
 LIB = wt(LIB_WT)
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def deep_clip(rig: Rig, depth: int) -> Any:

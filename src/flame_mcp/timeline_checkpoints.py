@@ -31,6 +31,7 @@ from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
 from flame_mcp.checkpoints import CHECKPOINT_TIMEOUT_S
 from flame_mcp.journal import new_id, now_iso
+from flame_mcp.journal_records import CheckpointRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
 from flame_mcp.unrecorded_end import shut_if_unanswered
@@ -103,8 +104,7 @@ def checkpoint_record(
     fingerprint: Any,
     segment_count: Any,
     displayed: Any,
-    **extra: Any,
-) -> dict[str, Any]:
+) -> CheckpointRecord:
     return {
         "type": "checkpoint",
         "id": checkpoint_id,
@@ -117,7 +117,6 @@ def checkpoint_record(
         "fingerprint": fingerprint,
         "segmentCount": segment_count,
         "displayed": displayed,
-        **extra,
     }
 
 
@@ -133,48 +132,47 @@ def run_timeline_checkpoint(
         LIBRARY_ARG: checkpoint_library_name(),
         REEL_ARG: stash_reel_name(),
     }
-    with rt.write_lock:
-        env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
-        if env.get("ok") is not True:
-            shut_if_unanswered(rt.guard, env, op.name, group)
-            return env
-        raw = env.get("result")
-        result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-        result.pop("error", None)
-        result.pop("errorCode", None)
-        record = checkpoint_record(
-            checkpoint_id,
-            group=group,
-            label=op_args.get("label"),
-            source=result.get("source"),
-            stash=result.get("stash"),
-            fingerprint=result.get("fingerprint"),
-            segment_count=result.get("segmentCount"),
-            displayed=result.get("displayed"),
-            effectCount=result.get("effectCount"),
-            display=result.get("display"),
-        )
-        result["checkpoint"] = checkpoint_id
-        result["label"] = op_args.get("label")
-        try:
-            rt.journal.append(record)
-        except OSError as exc:
-            stash = result.get("stash") or {}
-            return envelope_mod.build_envelope(
-                ok=False,
-                result=result,
-                error=(
-                    f"the sequence was copied (uid {stash.get('uid')}, in "
-                    f"{stash.get('library')}/{stash.get('reel')}) but the checkpoint could not be "
-                    f"recorded in the journal ({exc}), so it cannot be restored by id"
-                ),
-                error_code="POLICY_DENIED",
-                execution=envelope_mod.execution_meta(op),
-                duration_ms=elapsed_ms(started),
-                hint_override=(
-                    f"Make {rt.journal.directory} writable, then take the checkpoint again."
-                ),
-            )
-        env["result"] = result
-        env["journal"] = {"group": group, "id": checkpoint_id, "kind": "checkpoint"}
+    env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
+    if env.get("ok") is not True:
+        shut_if_unanswered(rt.guard, env, op.name, group)
         return env
+    raw = env.get("result")
+    result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    result.pop("error", None)
+    result.pop("errorCode", None)
+    record = checkpoint_record(
+        checkpoint_id,
+        group=group,
+        label=op_args.get("label"),
+        source=result.get("source"),
+        stash=result.get("stash"),
+        fingerprint=result.get("fingerprint"),
+        segment_count=result.get("segmentCount"),
+        displayed=result.get("displayed"),
+    )
+    record["effectCount"] = result.get("effectCount")
+    record["display"] = result.get("display")
+    result["checkpoint"] = checkpoint_id
+    result["label"] = op_args.get("label")
+    try:
+        rt.journal.append(record)
+    except OSError as exc:
+        stash = result.get("stash") or {}
+        return envelope_mod.build_envelope(
+            ok=False,
+            result=result,
+            error=(
+                f"the sequence was copied (uid {stash.get('uid')}, in "
+                f"{stash.get('library')}/{stash.get('reel')}) but the checkpoint could not be "
+                f"recorded in the journal ({exc}), so it cannot be restored by id"
+            ),
+            error_code="POLICY_DENIED",
+            execution=envelope_mod.execution_meta(op),
+            duration_ms=elapsed_ms(started),
+            hint_override=(
+                f"Make {rt.journal.directory} writable, then take the checkpoint again."
+            ),
+        )
+    env["result"] = result
+    env["journal"] = {"group": group, "id": checkpoint_id, "kind": "checkpoint"}
+    return env

@@ -9,18 +9,16 @@ from typing import Any
 
 import pytest
 
-from flame_mcp.ops.plan import REFUSED_IN_PLAN
 from journal_test_helpers import Rig
+from plan_use_helpers import REFUSED_IN_PLAN
+from rig_fixtures import rig_fixture
 from test_colour_spaces import coloured, make_sequence
 from test_desktop_tc import SYNC, clip_of, make_clip
 from timeline_p32a_helpers import CLIPX, make_timeline_rig, media
 
+rig = rig_fixture(make_timeline_rig)
+
 EXPORT = "render.export"
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 @pytest.fixture

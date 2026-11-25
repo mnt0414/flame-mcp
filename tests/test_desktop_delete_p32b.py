@@ -32,6 +32,7 @@ from p32b_helpers import (
     uid,
     wt,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     checkpoints,
     fingerprint_of_target,
@@ -42,10 +43,7 @@ from timeline_p32a_helpers import (
     stash_library,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def reel(rig: Rig) -> Any:
@@ -82,7 +80,7 @@ def test_deletes_a_clip_after_stashing_it(rig: Rig) -> None:
         "op": "journal.revert",
         "args": {"group": env["journal"]["group"]},
     }
-    assert env["undoSteps"] == 0 and env["affected"] == 1
+    assert env["affected"] == 1
 
 
 def test_the_checkpoint_is_recorded_before_the_intent_and_the_intent_before_the_write(

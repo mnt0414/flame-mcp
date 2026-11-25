@@ -4,14 +4,12 @@ segments (and 'Gap'): the stash copy of it raises 'Invalid source entries suppli
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import PyClip, PySegment, PyTrack, PyVersion, adopt
 from journal_test_helpers import Rig
 from p32b_helpers import CLIPX, delete, make_p32b_rig, wt
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     add_sequence,
     checkpoints,
@@ -24,9 +22,7 @@ from timeline_p32a_helpers import (
 DELETE = "desktop.delete"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def seg(kind: str, record_in: int = 0, record_out: int = 23) -> PySegment:

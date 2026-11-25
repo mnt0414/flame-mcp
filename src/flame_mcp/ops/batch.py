@@ -17,7 +17,15 @@ from flame_mcp import selectors
 from flame_mcp.checkpointed import RESTORE_SIDE_EFFECTS
 from flame_mcp.effective_effect import overwrite_precheck
 from flame_mcp.ops._attributes import attribute_requires, register_attribute_ops
-from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
+from flame_mcp.ops._common import (
+    batch_target_param,
+    build_source,
+    limit_param,
+    list_result_src,
+    offset_param,
+    raise_if_error,
+    raise_on_error_src,
+)
 from flame_mcp.reel_kinds import reel_kinds_named
 from flame_mcp.registry import Registry
 from flame_mcp.types import (
@@ -25,6 +33,8 @@ from flame_mcp.types import (
     CheckpointSpec,
     OperationParam,
     OperationSpec,
+    PlanKind,
+    PlanUse,
     Refusal,
     SelectorKind,
 )
@@ -132,10 +142,6 @@ def _list_to_python(args: Mapping[str, Any]) -> str:
     )
 
 
-UNDO_UNCONFIRMED: Final[str] = "UNDO UNCONFIRMED"
-"""The marker a description carries while its undo claim is a placeholder. No op carries it
-any more; `tests/test_ops_batch_p23a.py` pins that."""
-
 MAX_CLIPS: Final[int] = 50
 """Most clips one `batch.add_clips` call takes (one `media_panel.copy` of a list)."""
 ADD_CLIPS_TIMEOUT_S: Final[float] = 30.0
@@ -150,7 +156,7 @@ _CHECKPOINTED = (
     "still the one the call left (else CONFLICT; force=true overrides, journaled). The "
     "fingerprint -- and so `changed` and that comparison -- covers nodes, wiring and the inner "
     "nodes of Action / Image / GMask Tracer nodes; it does NOT see reels, shelf reels, "
-    "iterations or positions. Native Undo is not used. "
+    "iterations, attribute values or node positions. Native Undo is not used. "
 )
 _CHECKPOINTED_IN_PLAN = (
     "In plan.run the step is bundled: the plan is one checkpointed write on the group, so the "
@@ -162,15 +168,6 @@ _CHECKPOINTED_NOT_IN_PLAN = (
     "Not allowed in plan.run (shelf reels and iterations are outside a setup, so the plan's "
     "restore would leave them). " + RESTORE_SIDE_EFFECTS + " "
 )
-
-
-def _target_param() -> OperationParam:
-    return OperationParam(
-        name="target",
-        type="selector",
-        description="A 'batch' selector (uid or name). The group need not be current.",
-        required=True,
-    )
 
 
 def _resolve(args: Mapping[str, Any]) -> str:
@@ -188,8 +185,7 @@ def _create_reel_to_python(shelf: bool) -> Any:
             "\n".join(
                 [
                     f"_result = _create_reel(target, {args['name']!r}, {shelf!r})",
-                    "if _result['error'] is not None:",
-                    "    raise _OpError('SILENT_NOOP', _result['error'])",
+                    raise_on_error_src("SILENT_NOOP"),
                 ]
             ),
         )
@@ -207,8 +203,7 @@ def _add_clips_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _add_clips(target, {args['reel']!r}, {kind!r}, [{names}])",
-                "if _result['error'] is not None:",
-                "    raise _OpError(_result.get('errorCode') or 'SILENT_NOOP', _result['error'])",
+                raise_if_error("SILENT_NOOP"),
             ]
         )
     )
@@ -273,8 +268,7 @@ def _organize_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 "_result = _organize(target)",
-                "if _result['error'] is not None:",
-                "    raise _OpError('FLAME_API_ERROR', _result['error'])",
+                raise_on_error_src("FLAME_API_ERROR"),
             ]
         ),
     )
@@ -289,8 +283,7 @@ def _iterate_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _iterate(target, {index_src!r}, {overwrite!r})",
-                "if _result['error'] is not None:",
-                "    raise _OpError(_result.get('errorCode') or 'SILENT_NOOP', _result['error'])",
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -329,15 +322,10 @@ def _save_setup_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _save_setup(target, {args['path']!r}, {overwrite!r})",
-                "if _result['error'] is not None:",
-                "    raise _OpError('FLAME_API_ERROR', _result['error'])",
+                raise_on_error_src("FLAME_API_ERROR"),
             ]
         ),
     )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _register_writes(registry: Registry) -> None:
@@ -363,7 +351,7 @@ def _register_writes(registry: Registry) -> None:
                 "(the call still succeeds)."
             ),
             effect="read",
-            params=(_target_param(),),
+            params=(batch_target_param(),),
             accepts=("batch",),
             to_python=_info_to_python,
             requires=(
@@ -398,6 +386,8 @@ def _register_writes(registry: Registry) -> None:
         registry.register(
             OperationSpec(
                 name=name,
+                plan_use=_PLAN_USE_BATCH_CREATE_SHELF_REEL if shelf else None,
+                brief_paths=() if shelf else ("reel",),
                 category="batch",
                 description=(
                     f"Create a {noun} in a Batch group (PyBatch."
@@ -412,7 +402,7 @@ def _register_writes(registry: Registry) -> None:
                 effect="create",
                 undo="unsupported" if shelf else "checkpoint",
                 params=(
-                    _target_param(),
+                    batch_target_param(),
                     OperationParam(
                         name="name",
                         type="string",
@@ -423,7 +413,6 @@ def _register_writes(registry: Registry) -> None:
                 ),
                 accepts=("batch",),
                 to_python=_create_reel_to_python(shelf),
-                undo_steps=_no_undo_steps,
                 checkpoint=CheckpointSpec(),
                 requires=requires_reel,
             )
@@ -431,6 +420,7 @@ def _register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.add_clips",
+            brief_paths=("reel", "applied"),
             category="batch",
             description=(
                 "Copy clips (desktop or library clips / sequences, by selector) into a reel of "
@@ -461,7 +451,7 @@ def _register_writes(registry: Registry) -> None:
             effect="create",
             undo="checkpoint",
             params=(
-                _target_param(),
+                batch_target_param(),
                 OperationParam(
                     name="reel",
                     type="string",
@@ -489,7 +479,6 @@ def _register_writes(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_add_clips_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_add_clips_precheck,
             checkpoint=CheckpointSpec(check=_add_clips_check, timeout_s=ADD_CLIPS_TIMEOUT_S),
             sample_args={
@@ -503,6 +492,7 @@ def _register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.organize",
+            brief_paths=("moved", "movedNodes"),
             category="batch",
             description=(
                 "Arrange the nodes of a Batch group (PyBatch.organize). result.moved counts the "
@@ -515,10 +505,9 @@ def _register_writes(registry: Registry) -> None:
             ),
             effect="reversible",
             undo="checkpoint",
-            params=(_target_param(),),
+            params=(batch_target_param(),),
             accepts=("batch",),
             to_python=_organize_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=CheckpointSpec(),
             requires=("PyBatch.organize", "PyBatch.nodes", "PyNode.attributes"),
         )
@@ -526,6 +515,7 @@ def _register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.iterate",
+            plan_use=_PLAN_USE_BATCH_ITERATE,
             category="batch",
             description=(
                 "Iterate a Batch group's setup (PyBatch.iterate): a new iteration named "
@@ -548,7 +538,7 @@ def _register_writes(registry: Registry) -> None:
             effect="create",
             undo="unsupported",
             params=(
-                _target_param(),
+                batch_target_param(),
                 OperationParam(
                     name="index",
                     type="number",
@@ -569,7 +559,6 @@ def _register_writes(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_iterate_to_python,
-            undo_steps=_no_undo_steps,
             precheck=overwrite_precheck("batch.iterate"),
             checkpoint=CheckpointSpec(check=_iterate_check),
             requires=(
@@ -583,6 +572,7 @@ def _register_writes(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.save_setup",
+            brief_paths=("path",),
             category="batch",
             description=(
                 "Save a Batch group's setup to a file (PyBatch.save_setup); nothing in the "
@@ -602,7 +592,7 @@ def _register_writes(registry: Registry) -> None:
             effect="create",
             undo="none",
             params=(
-                _target_param(),
+                batch_target_param(),
                 OperationParam(
                     name="path",
                     type="string",
@@ -620,11 +610,17 @@ def _register_writes(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_save_setup_to_python,
-            undo_steps=_no_undo_steps,
             precheck=overwrite_precheck("batch.save_setup"),
             requires=("PyBatch.save_setup", "PyBatch.uid", "PyBatch.name"),
         )
     )
+
+
+_PLAN_USE_BATCH_CREATE_SHELF_REEL = PlanUse(PlanKind.KEEPS_OUTPUT, own_group=True)
+_PLAN_USE_BATCH_ITERATE = PlanUse(
+    PlanKind.KEEPS_OUTPUT,
+    own_group=True,
+)
 
 
 def register(registry: Registry) -> None:

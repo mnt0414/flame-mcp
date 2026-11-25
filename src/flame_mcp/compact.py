@@ -4,7 +4,7 @@ FLAME_MCP_RESPONSE=compact (default `full`) makes `server._tool_result` run ever
 through `compact_envelope` (see `server._compact_within_limit` for how it meets the size limit).
 The transform is pure: the input is never modified.
 
-  - outer: items that are None / [] / {} / "" are left out (`affected` and `undoSteps` at 0
+  - outer: items that are None / [] / {} / "" are left out (`affected` at 0
     too); `ok` is always kept; `execution` is kept only on a failure; `context` stays
   - `result` (recursively): dict items that are None are left out, and so is a `wiretapId`
     that repeats the id of a wiretap `selector` in the same dict
@@ -42,7 +42,7 @@ INSTRUCTIONS_NOTE: Final[str] = (
 RESPONSE_FORMAT: Final[str] = (
     "Compact responses (FLAME_MCP_RESPONSE=compact). "
     "A field that is null, [], {} or an empty string is not sent: read a missing field as "
-    "null; affected and undoSteps are missing when 0. ok is always sent. execution is sent "
+    "null; affected is missing when 0. ok is always sent. execution is sent "
     "only when ok is false. "
     "Inside result, a dict item that is null is not sent, and a wiretapId equal to the id of "
     "the wiretap selector next to it is not sent: pass {kind: <selector.kind>, id: "
@@ -52,7 +52,12 @@ RESPONSE_FORMAT: Final[str] = (
     "{columns: [names], rows: [[values in the order of columns], ...]}: row i is the i-th "
     "object, and a null cell is a member that object did not have. A cell can itself be a list "
     "of plain values (e.g. path: ['Lib', 'Reel']): read it as that member's value. Any other "
-    "list keeps its form."
+    "list keeps its form. "
+    "plan.run with result_detail 'auto' keeps each read step's result and cuts a successful "
+    "write step to its brief (result.detail 'mixed', result.resultsNote); result_detail='full' "
+    "gives every step's result. "
+    "flame_catalog(op=...) without detail answers with detail='args' (argument shapes only); "
+    "pass detail='full' for the whole description."
 )
 
 
@@ -158,7 +163,7 @@ def compact_envelope(env: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in env.items():
         if key == "ok":
             out[key] = value
-        elif key in ("affected", "undoSteps"):
+        elif key == "affected":
             if value != 0 and not _is_empty(value):
                 out[key] = value
         elif key == "execution":

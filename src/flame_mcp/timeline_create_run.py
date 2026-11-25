@@ -38,7 +38,6 @@ from flame_mcp.desktop_run import (
     CREATED_ARG,
     EXPECTED_ARG,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_REVERT,
     WriteProfile,
@@ -47,7 +46,6 @@ from flame_mcp.desktop_run import (
     run_write_flow,
 )
 from flame_mcp.journal import (
-    KIND_DESKTOP_REVERT,
     KIND_DESKTOP_SEQUENCE,
     STATE_DIVERGED,
     STATE_LANDED,
@@ -57,9 +55,10 @@ from flame_mcp.journal import (
     IntentView,
     now_iso,
 )
+from flame_mcp.journal_records import IntentRecord
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.timeline_restore import uid_chain
-from flame_mcp.types import ServerResult
+from flame_mcp.types import PHASE_ARG, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -76,16 +75,6 @@ REVERT_NOTE: Final[str] = (
     "The sequence the call made was deleted (flame.delete). When it was the one the Timeline "
     "showed, the sequence shown before the call is opened again (result.reshown)."
 )
-
-
-def is_sequence_intent(view: IntentView) -> bool:
-    """An intent of `timeline.create_sequence`, or the revert of one."""
-    if view.desktop_kind == KIND_DESKTOP_SEQUENCE:
-        return True
-    return (
-        view.desktop_kind == KIND_DESKTOP_REVERT
-        and view.intent.get("revertOf") == KIND_DESKTOP_SEQUENCE
-    )
 
 
 def _stable_args(
@@ -109,7 +98,7 @@ def _intent_record(
     *,
     intent_id: str,
     group_id: str,
-) -> dict[str, Any]:
+) -> IntentRecord:
     return {
         "type": "intent",
         "id": intent_id,
@@ -222,7 +211,7 @@ def _sequence_revert(ctx: ServerContext) -> RevertProfile:
 
 
 def revert_sequence_group(
-    ctx: ServerContext, index: Index, group: str, views: list[IntentView]
+    ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
 ) -> ServerResult:
     """`journal.revert` of a group whose intent is a timeline.create_sequence."""
     return revert_flow(ctx, index, group, views, _sequence_revert(ctx))

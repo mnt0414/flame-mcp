@@ -36,8 +36,13 @@ from flame_mcp.checkpoints import (
 )
 from flame_mcp.clip_order import CLIP_ORDER_NOTE
 from flame_mcp.journal import Index
-from flame_mcp.ops._common import build_source, limit_param, offset_param
-from flame_mcp.ops._segment_edit import no_undo_steps
+from flame_mcp.ops._common import (
+    batch_target_param,
+    build_source,
+    limit_param,
+    offset_param,
+    raise_on_error_src,
+)
 from flame_mcp.registry import Registry
 from flame_mcp.restore import restore_checkpoint, run_load_setup
 from flame_mcp.runtime import ServerContext
@@ -48,7 +53,7 @@ from flame_mcp.timeline_purge import (
     purge_checkpoints,
 )
 from flame_mcp.timeline_restore import RESTORE_NOTE
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, ServerResult
+from flame_mcp.types import OperationParam, OperationSpec, PlanKind, PlanUse, Refusal, ServerResult
 
 CLIP_FX_REQUIRES: tuple[str, ...] = (
     "PyBatch.reels",
@@ -70,13 +75,6 @@ OVERWRITE_NOTE = (
     "restoring that undoes this call)."
 )
 
-_TARGET = OperationParam(
-    name="target",
-    type="selector",
-    description="A 'batch' selector (uid or name). The group need not be current.",
-    required=True,
-)
-
 
 def _checkpoint_to_python(args: Mapping[str, Any]) -> str:
     directory, base = args.get(DIR_ARG), args.get(BASE_ARG)
@@ -86,8 +84,7 @@ def _checkpoint_to_python(args: Mapping[str, Any]) -> str:
             [
                 f"_result = _save_checkpoint(target, {directory!r}, {base!r}, "
                 f"{list(DEFAULT_FINGERPRINT_SECTIONS)!r}, {list(FINGERPRINT_SECTIONS)!r})",
-                "if _result['error'] is not None:",
-                "    raise _OpError('FLAME_API_ERROR', _result['error'])",
+                raise_on_error_src("FLAME_API_ERROR"),
             ]
         ),
     )
@@ -128,8 +125,7 @@ def _compare_to_python(args: Mapping[str, Any]) -> str:
             [
                 f"_result = _save_for_compare(target, {directory!r}, {base!r})",
                 "_result['stable'] = _batch_selector(target)",
-                "if _result['error'] is not None:",
-                "    raise _OpError('FLAME_API_ERROR', _result['error'])",
+                raise_on_error_src("FLAME_API_ERROR"),
             ]
         ),
     )
@@ -216,8 +212,7 @@ _VALUES_NOTE = (
 def _load_setup_to_python(args: Mapping[str, Any]) -> str:
     lines = [
         f"_result = _load_setup_checked(target, {args['path']!r})",
-        "if _result['error'] is not None:",
-        "    raise _OpError(_result['errorCode'], _result['error'])",
+        raise_on_error_src(),
     ]
     recorded = args.get(REELS_ARG)
     if isinstance(recorded, list):
@@ -285,10 +280,33 @@ def _restore(args: Mapping[str, Any], ctx: ServerContext) -> ServerResult:
     return restore_checkpoint(ctx, str(args["checkpoint"]))
 
 
+_PLAN_USE_BATCH_LOAD_SETUP = PlanUse(
+    PlanKind.REWRITE,
+    own_group=True,
+)
+
+
+_PLAN_USE_JOURNAL_PURGE_CHECKPOINTS = PlanUse(
+    PlanKind.NEVER,
+    refusal=(
+        "journal.purge_checkpoints cannot be a plan step: it deletes the stashed copies that "
+        "journal.revert restores from and cannot itself be undone, so it has no place in a group "
+        "that journal.revert is meant to put back; call it on its own"
+    ),
+)
+
+
+_PLAN_USE_JOURNAL_RESTORE_CHECKPOINT = PlanUse(
+    PlanKind.REWRITE,
+    own_group=True,
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.checkpoint",
+            brief_paths=("checkpoint",),
             category="batch",
             description=(
                 "Save a Batch group's setup (PyBatch.save_setup) and record a checkpoint in "
@@ -302,7 +320,7 @@ def register(registry: Registry) -> None:
             effect="create",
             undo="none",
             params=(
-                _TARGET,
+                batch_target_param(),
                 OperationParam(
                     name="label",
                     type="string",
@@ -313,7 +331,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_checkpoint_to_python,
-            undo_steps=lambda args, affected: 0,
             wrap=run_checkpoint,
             requires=(
                 "PyBatch.save_setup",
@@ -345,7 +362,7 @@ def register(registry: Registry) -> None:
             ),
             effect="read",
             params=(
-                _TARGET,
+                batch_target_param(),
                 OperationParam(
                     name="include_nodes",
                     type="boolean",
@@ -377,12 +394,13 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.compare_setup",
+            brief_paths=("changed", "changedFiles"),
             category="batch",
             description=_COMPARE_DESCRIPTION,
             effect="read",
             undo="none",
             params=(
-                _TARGET,
+                batch_target_param(),
                 OperationParam(
                     name="baseline",
                     type="string",
@@ -398,7 +416,6 @@ def register(registry: Registry) -> None:
             accepts=("batch",),
             to_python=_compare_to_python,
             precheck=_compare_precheck,
-            undo_steps=no_undo_steps,
             wrap=run_compare_setup,
             requires=("PyBatch.save_setup", "PyBatch.uid", "PyBatch.name"),
         )
@@ -406,6 +423,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="batch.load_setup",
+            plan_use=_PLAN_USE_BATCH_LOAD_SETUP,
             category="batch",
             description=(
                 "Replace a Batch group's contents with a setup file (PyBatch.load_setup). The "
@@ -418,11 +436,16 @@ def register(registry: Registry) -> None:
                 "`.batch` path (a checkpoint's result.path). The group's fingerprint is read "
                 "back after the load; when that read fails the call ends in FLAME_API_ERROR "
                 "(the load was called and the group may have been replaced; the pre-load "
-                "checkpoint restores it). " + OVERWRITE_NOTE + " " + RESTORE_SIDE_EFFECTS
+                "checkpoint restores it). The fingerprint covers nodes, wiring and the inner "
+                "nodes of Action / Image / GMask Tracer nodes; it does NOT see reels, shelf "
+                "reels, iterations, attribute values or node positions. "
+                + OVERWRITE_NOTE
+                + " "
+                + RESTORE_SIDE_EFFECTS
             ),
             effect="destructive",
             params=(
-                _TARGET,
+                batch_target_param(),
                 OperationParam(
                     name="path",
                     type="string",
@@ -433,7 +456,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_load_setup_to_python,
-            undo_steps=lambda args, affected: 0,
             wrap=run_load_setup,
             requires=(
                 "PyBatch.load_setup",
@@ -450,6 +472,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="journal.restore_checkpoint",
+            plan_use=_PLAN_USE_JOURNAL_RESTORE_CHECKPOINT,
             category="journal",
             description=(
                 "Put a Batch group (or, for a checkpoint of kind 'timeline', a sequence / clip) "
@@ -488,7 +511,6 @@ def register(registry: Registry) -> None:
                 ),
             ),
             server_handler=_restore,
-            undo_steps=lambda args, affected: 0,
         )
     )
     registry.register(
@@ -514,6 +536,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="journal.purge_checkpoints",
+            plan_use=_PLAN_USE_JOURNAL_PURGE_CHECKPOINTS,
             category="journal",
             description=(
                 "Delete the stashed copies of Timeline checkpoints from the checkpoint library "
@@ -612,6 +635,5 @@ def register(registry: Registry) -> None:
             ),
             server_handler=purge_checkpoints,
             precheck=groups_precheck,
-            undo_steps=lambda args, affected: 0,
         )
     )

@@ -16,16 +16,17 @@ from typing import Any
 
 import pytest
 
-from flame_mcp import checkpointed, execution, server, transport
+from conftest import shared_registry
+from flame_mcp import agent_context, checkpointed, execution, server, transport
 from flame_mcp.__main__ import build_server
 from flame_mcp.checkpointed import Judgement, PreRunRefusal, run_checkpointed
-from flame_mcp.ops import register_all
 from flame_mcp.opschema import ArgIssue, validate_op_args
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from flame_mcp.types import OperationParam
 from flame_mcp_bridge import impl
 from journal_test_helpers import BG1, COMP, Rig, make_rig
+from rig_fixtures import rig_fixture
 from test_bridge_impl import (
     FakeFlame,
     FakeMainLoop,
@@ -93,9 +94,7 @@ def bridge(scratch_dir: Path, loop: FakeMainLoop) -> Iterator[impl.Bridge]:  # n
     started.stop()
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 # --- 1. the entrance: opschema.validate_op_args -------------------------------------------
@@ -247,9 +246,7 @@ def test_exec_still_contacts_the_bridge_for_ascii_code(tmp_path: Path) -> None:
 def test_a_send_point_refusal_is_a_plain_answer_in_the_envelope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    registry = Registry()
-    register_all(registry)
-    op = registry.get("node.get_attributes")
+    op = shared_registry().get("node.get_attributes")
     assert op is not None
     monkeypatch.setattr(execution, "build_exec_code", lambda _op, _args: f"_result = '{TE}'")
     env = execution.run_op(op, {"target": COMP}, run_dir=tmp_path)
@@ -364,11 +361,9 @@ def test_every_python_file_that_ships_into_or_to_flame_is_ascii(folder: str) -> 
 
 
 def test_the_code_every_registered_op_sends_is_ascii() -> None:
-    registry = Registry()
-    register_all(registry)
     checked = 0
     offenders: list[str] = []
-    for op in registry.list_ops():
+    for op in shared_registry().list_ops():
         if op.to_python is None:
             continue
         code = execution.build_exec_code(op, dict(op.sample_args))
@@ -384,7 +379,7 @@ def test_the_flame_context_code_is_ascii() -> None:
 
 
 def test_the_pitfall_and_the_docs_say_crash_and_give_no_uid_advice() -> None:
-    pitfalls = [p["text"] for p in server._static_context(Registry())["pitfalls"]]
+    pitfalls = [p["text"] for p in agent_context.static_context(Registry())["pitfalls"]]
     (text,) = [t for t in pitfalls if "2-byte" in t]
     assert "crash" in text and "ASCII" in text
     assert "uid" not in text and "wiretap" not in text
@@ -468,14 +463,12 @@ def test_the_send_point_message_names_the_op_not_a_line_and_the_hint_fits(
 
 
 def test_the_envelope_of_a_send_point_refusal_carries_that_hint(tmp_path: Path) -> None:
-    registry = Registry()
-    register_all(registry)
-    op = registry.get("node.get_attributes")
+    op = shared_registry().get("node.get_attributes")
     assert op is not None
     from flame_mcp import envelope as envelope_mod
 
     br = REAL_EXEC(f"_result = '{TE}'", thread="main", label=op.name, run_dir=tmp_path)
-    env = envelope_mod.from_bridge_result(op, {}, br)
+    env = envelope_mod.from_bridge_result(op, br)
     assert env["errorCode"] == "INVALID_ARGS"
     assert env["hint"] == br.hint
     assert "did not pass validation" not in env["hint"]
@@ -559,7 +552,6 @@ def test_run_checkpointed_refuses_a_non_ascii_stable_address_before_the_intent(
             op_name="batch.load_setup",
             kind="load",
             args={},
-            intent_extra={},
             expected_fp=None,
             label="t",
             run=run,
@@ -585,7 +577,6 @@ def test_run_checkpointed_refuses_non_ascii_args_before_taking_a_checkpoint(rig:
             op_name="batch.load_setup",
             kind="load",
             args={"path": f"/x/{TE}"},
-            intent_extra={},
             expected_fp=None,
             label="t",
             run=run,

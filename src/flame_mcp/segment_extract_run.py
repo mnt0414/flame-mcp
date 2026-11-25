@@ -40,17 +40,16 @@ from flame_mcp.desktop_revert import (
 from flame_mcp.desktop_run import (
     CREATED_ARG,
     EXPECTED_ARG,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_REVERT,
     WriteProfile,
+    batch_reel_pre_hint,
     read_back_returned,
     rows_uids,
     run_write_flow,
 )
 from flame_mcp.journal import (
     KIND_DESKTOP_EXTRACT,
-    KIND_DESKTOP_REVERT,
     STATE_DIVERGED,
     STATE_LANDED,
     STATE_NOT_LANDED,
@@ -59,8 +58,9 @@ from flame_mcp.journal import (
     IntentView,
     now_iso,
 )
+from flame_mcp.journal_records import IntentRecord
 from flame_mcp.registry import RegisteredOperation
-from flame_mcp.types import ServerResult
+from flame_mcp.types import PHASE_ARG, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -77,16 +77,6 @@ EXTRACT_NOTE: Final[str] = (
 EXTRACT_REVERT_NOTE: Final[str] = (
     "The clip the call made was deleted (flame.delete). Nothing in the sequence was touched."
 )
-
-
-def is_extract_intent(view: IntentView) -> bool:
-    """An intent of `segment.copy_to_media_panel` / `segment.match`, or the revert of one."""
-    if view.desktop_kind == KIND_DESKTOP_EXTRACT:
-        return True
-    return (
-        view.desktop_kind == KIND_DESKTOP_REVERT
-        and view.intent.get("revertOf") == KIND_DESKTOP_EXTRACT
-    )
 
 
 def _stable_args(
@@ -113,7 +103,7 @@ def _intent_record(
     *,
     intent_id: str,
     group_id: str,
-) -> dict[str, Any]:
+) -> IntentRecord:
     source = pre.get("source") or {}
     return {
         "type": "intent",
@@ -164,22 +154,12 @@ def _notes(op: RegisteredOperation, op_args: Mapping[str, Any], env: dict[str, A
         env["degraded"] = [*env.get("degraded", []), *[f"read-back differs: {w}" for w in warnings]]
 
 
-def _pre_hint(op: RegisteredOperation, pre: Mapping[str, Any]) -> str | None:
-    if pre.get("errorCode") != "INVALID_ARGS":
-        return None
-    return (
-        "A reel of a Batch group takes clips through batch.add_clips (it checkpoints the group and "
-        f"checks the Clip nodes); {op.name} is for Desktop and library places. Nothing was "
-        "written and nothing journaled."
-    )
-
-
 EXTRACT_PROFILE: Final[WriteProfile] = WriteProfile(
     stable_args=_stable_args,
     intent=_intent_record,
     created=created_record,
     notes=_notes,
-    pre_hint=_pre_hint,
+    pre_hint=batch_reel_pre_hint,
     read_back=read_back_returned,
 )
 
@@ -222,7 +202,7 @@ EXTRACT_REVERT: Final[RevertProfile] = RevertProfile(
 
 
 def revert_extract_group(
-    ctx: ServerContext, index: Index, group: str, views: list[IntentView]
+    ctx: ServerContext, index: Index, group: str, views: list[IntentView], force: bool
 ) -> ServerResult:
     """`journal.revert` of a group whose intent is a segment.copy_to_media_panel / match."""
     return revert_flow(ctx, index, group, views, EXTRACT_REVERT)

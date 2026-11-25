@@ -7,7 +7,6 @@ frame-rate difference, is measured on real Flame, not here."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,7 +14,10 @@ import pytest
 from fake_media_tree import FakeAttr, PyClip, PySegment, PyTime, PyTrack, PyVersion, adopt
 from flame_mcp.tc_rules import judge
 from journal_test_helpers import Rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import gap, make_timeline_rig
+
+rig = rig_fixture(make_timeline_rig)
 
 SYNC = "desktop.sync_record_tc"
 RATE = "23.976 fps"
@@ -74,11 +76,6 @@ def make_clip(
     adopt(reel, [clip])
     reel._children.append(clip)
     return {"kind": "wiretap", "id": f"/wt/RG/Reel 1/{name}"}
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def clip_of(rig: Rig, name: str) -> PyClip:

@@ -26,6 +26,7 @@ from p33_helpers import (
     sel_at,
     untouched_world,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     S1_WT,
@@ -39,10 +40,7 @@ from timeline_p32a_helpers import (
     wt,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_timeline_rig)
 
 
 def slip(rig: Rig, selector: dict[str, Any], offset: int) -> dict[str, Any]:
@@ -259,7 +257,7 @@ def test_a_slip_takes_a_checkpoint_first_and_journals_an_intent_and_an_outcome(r
 
 def test_the_envelope_says_undo_is_a_checkpoint_and_native_undo_is_not_used(rig: Rig) -> None:
     env = slip(rig, a_seg(), 3)
-    assert env["execution"]["undo"] == "checkpoint" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "checkpoint"
     assert env["execution"]["thread"] == "main" and env["execution"]["effect"] == "reversible"
 
 

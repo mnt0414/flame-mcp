@@ -22,9 +22,8 @@ import pytest
 
 from fake_media_tree import PyActionNode, PyBatch, PyCoNode
 from flame_mcp import checkpoints as checkpoints_mod
-from flame_mcp.checkpointed import run_declared
 from flame_mcp.journal import Index
-from flame_mcp.ops.batch import MAX_CLIPS, UNDO_UNCONFIRMED
+from flame_mcp.ops.batch import MAX_CLIPS
 from flame_mcp.policy import Policy
 from flame_mcp.registry import RegistrationError, Registry
 from flame_mcp.types import CheckpointSpec, OperationParam, OperationSpec
@@ -35,6 +34,7 @@ CLIP1 = {"kind": "wiretap", "id": "/projects/p/ws/P1O/R1/clip1"}
 CLIP2 = {"kind": "wiretap", "id": "/projects/p/ws/P1O/R1/clip2"}
 CLIP3 = {"kind": "wiretap", "id": "/projects/p/ws/P1O/R1/clip3"}
 SEQ1 = {"kind": "wiretap", "id": "/projects/p/ws/P1O/Seq1"}
+UNDO_UNCONFIRMED = "UNDO UNCONFIRMED"
 SCHEMATIC = "Schematic Reel 1"
 SHELF = "Batch Renders"
 CHECKPOINTED_OPS = (
@@ -179,7 +179,7 @@ def test_a_checkpointed_op_checkpoints_first_then_journals_the_intent_then_runs(
     assert journal["checkpoint"] == checkpoint["id"] and journal["changed"] is True
     assert journal["checkpointPath"] == checkpoint["path"]
     assert journal["revert"] == {"op": "journal.revert", "args": {"group": intent["group"]}}
-    assert env["execution"]["undo"] == "checkpoint" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "checkpoint"
 
 
 def test_the_op_runs_against_the_checkpointed_group_addressed_by_uid(rig: Rig) -> None:
@@ -299,16 +299,6 @@ def test_an_unknown_end_of_a_call_that_never_ran_checks_as_not_landed(rig: Rig) 
     add_clips(rig, [CLIP1])
     [entry] = rig.do("journal.check")["result"]["checked"]
     assert entry["verdict"] == "not_landed"
-
-
-def test_a_write_queued_behind_an_unsettled_one_is_refused_inside_the_lock(rig: Rig) -> None:
-    op = rig.registry.get("batch.organize")
-    assert op is not None
-    rig.runtime.guard.block("i_x", "g_x", "batch.add_clips", "TIMEOUT")
-    env = run_declared(rig.runtime, op, {"target": BG1})  # past Runtime.execute's own check
-    assert env["errorCode"] == "POLICY_DENIED" and "batch.checkpoint" not in sent(rig)
-    assert env["error"].startswith("writes are refused")  # the guard's own answer, not a
-    assert "checkpoint that makes" not in env["error"]  # checkpoint failure derived from it
 
 
 def test_the_engine_needs_checkpoint_and_fingerprint_to_be_allowed(
@@ -642,7 +632,7 @@ def test_save_setup_writes_a_file_and_returns_its_real_path(rig: Rig, tmp_path: 
     assert env["result"]["size"] == os.path.getsize(real) and env["result"]["written"] == [real]
     assert env["result"]["batch"] == {"uid": "uid-b1", "name": "BG1"}
     assert env["journal"] is None and env["execution"]["undo"] == "none"
-    assert rig.records() == [] and env["undoSteps"] == 0  # a file, not the project: no journal
+    assert rig.records() == []  # a file, not the project: no journal
 
 
 def test_save_setup_with_a_dot_in_the_name_reports_the_rewritten_path(
@@ -821,7 +811,6 @@ def test_the_checkpointed_ops_are_declared_as_the_decision_says(rig: Rig) -> Non
         assert op.checkpoint is not None and op.wrap is None and op.journal is None, name
         assert op.undo in ("checkpoint", "unsupported") and op.thread == "main", name
         assert op.effect != "read" and op.accepts == ("batch",), name
-        assert op.undo_steps({}, 1) == 0, name
 
 
 def test_no_op_carries_the_placeholder_undo_marker_any_more(rig: Rig) -> None:
@@ -885,7 +874,6 @@ def _spec(**kwargs: Any) -> OperationSpec:
         "params": (OperationParam(name="target", type="selector", description="t", required=True),),
         "accepts": ("batch",),
         "to_python": lambda args: "_result = 1",
-        "undo_steps": lambda args, affected: 0,
         "checkpoint": CheckpointSpec(),
     }
     base.update(kwargs)
@@ -939,7 +927,6 @@ def test_registry_refuses_a_checkpointed_server_op() -> None:
                 ),
                 accepts=("batch",),
                 server_handler=lambda args, ctx: None,  # type: ignore[arg-type,return-value]
-                undo_steps=lambda args, affected: 0,
                 checkpoint=CheckpointSpec(),
             )
         )

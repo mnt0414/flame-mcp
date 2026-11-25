@@ -75,7 +75,7 @@ def test_an_empty_schematic_reel_is_deleted_without_a_stash(rig: Rig, group: str
     assert row["from"]["uid"] == old and row["from"]["reelType"] == "Schematic"
     assert row["from"]["parent"]["type"] == "PyBatch" and row["from"]["parent"]["uid"] == uid(batch)
     assert row["stash"] is None and row["checkpoint"] is None
-    assert env["affected"] == 1 and env["undoSteps"] == 0 and env["result"]["partial"] is False
+    assert env["affected"] == 1 and env["result"]["partial"] is False
     assert stash_library(rig) is None
     assert [r["type"] for r in rig.records()] == ["intent", "outcome"]
     assert env["journal"]["revert"]["op"] == "journal.revert"

@@ -24,7 +24,7 @@ from flame_mcp.ops import register_all
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from flame_mcp.runtime import Runtime, TestHooks
-from flame_mcp.transport import BridgeProtocolError, BridgeResult
+from flame_mcp.transport import BridgeResult, UnknownHandleError
 from flame_mcp_bridge.impl import FEATURE_CLIENT_HANDLE
 from test_ops_attributes import SpyAttr, make_batch_world  # noqa: F401  (re-exported)
 
@@ -97,7 +97,7 @@ class FakeBridge:
 
     See `_handle_poll` in the bridge and `_send_request`. A finished result is handed over
     ONCE (the bridge deletes it), a running one answers `pending`, and a handle the bridge does
-    not have raises `BridgeProtocolError` ("unknown handle: ...") -- it is not a BridgeResult.
+    not have raises `UnknownHandleError` ("unknown handle: ...") -- it is not a BridgeResult.
     `features` is what its `hello` announces: with `client_handle`, `ScriptedExec` files the
     result of every call that carried a handle under it, like the real bridge does.
     """
@@ -122,7 +122,7 @@ class FakeBridge:
             return self.results.pop(handle)
         if handle in self.running:
             return bridge_result(pending_handle=handle)
-        raise BridgeProtocolError(f"unknown handle: {handle}")
+        raise UnknownHandleError(f"unknown handle: {handle}")
 
 
 class ScriptedExec:

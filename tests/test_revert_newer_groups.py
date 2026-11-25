@@ -19,19 +19,16 @@ from flame_mcp.newer_groups import newer_groups
 from journal_test_helpers import BG1, Rig, make_rig
 from p32b_helpers import MOVE, delete, make_p32b_rig, reel2
 from reformat_helpers import CLIPX, clip_format, make_reformat_rig, reel, reformat
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import REEL_WT, S1, a_seg, make_timeline_rig, seg_sel, trim, wt
 
 BG2 = {"kind": "batch", "name": "BG2"}
 
 
-@pytest.fixture
-def brig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+brig = rig_fixture(make_rig)
 
 
-@pytest.fixture
-def trig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+trig = rig_fixture(make_timeline_rig)
 
 
 def node(name: str) -> dict[str, Any]:

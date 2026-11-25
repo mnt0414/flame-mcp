@@ -28,7 +28,7 @@ their source.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
 from flame_mcp.checkpoints import TIMELINE_KIND, kind_named
@@ -117,7 +117,7 @@ def _ident_keys(value: Any) -> set[str]:
     return keys
 
 
-def _moves(record: Record) -> list[dict[str, Any]]:
+def _moves(record: Mapping[str, Any]) -> list[dict[str, Any]]:
     """`{from, to}` rows of a `desktop.move` outcome: what moved, and who it is afterwards."""
     created = record.get("created")
     rows = created.get("moves") if isinstance(created, dict) else None
@@ -173,19 +173,20 @@ def _component(seed: set[str], linked: dict[str, set[str]]) -> set[str]:
 def _timeline_keys(view: IntentView) -> set[str]:
     """The uids and wiretap ids of the sequences / clips a write of `view` acted on."""
     intent = view.intent
-    outcome = view.outcome or {}
+    outcome = view.outcome
     keys: set[str] = set()
     for value in (
         intent.get("targetUid"),
-        outcome.get("targetUid"),
-        outcome.get("replacedUid"),
+        outcome.get("targetUid") if outcome is not None else None,
+        outcome.get("replacedUid") if outcome is not None else None,
         _wiretap_of(intent.get("target")),
     ):
         if text := _text(value):
             keys.add(text)
     for name in (*_IDENT_FIELDS, "sources"):
         keys |= _ident_keys(intent.get(name))
-        keys |= _ident_keys(outcome.get(name))
+        if outcome is not None:
+            keys |= _ident_keys(outcome.get(name))
     return keys
 
 
@@ -193,7 +194,9 @@ def _made_keys(view: IntentView) -> set[str]:
     """Who the thing a make / move left behind is: the sequence a `create_sequence` made, the clip
     a `segment.match` / `copy_to_media_panel` made, the things a `desktop.move` put in the
     destination (its intent's `target` is the destination, not one of them)."""
-    outcome = view.outcome or {}
+    outcome = view.outcome
+    if outcome is None:
+        return set()
     keys = _ident_keys(outcome.get("created"))
     for move in _moves(outcome):
         keys |= _ident_keys(move.get("to"))

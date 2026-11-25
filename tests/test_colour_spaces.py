@@ -14,7 +14,10 @@ import pytest
 from fake_media_tree import PySegment
 from flame_mcp.colour_check import judge, mixed_message
 from journal_test_helpers import Rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import CLIPX, add_sequence, gap, make_timeline_rig, media
+
+rig = rig_fixture(make_timeline_rig)
 
 COLOUR = "timeline.colour_spaces"
 EXPORT = "render.export"
@@ -76,11 +79,6 @@ def test_a_scan_that_stopped_early_is_incomplete_not_mixed() -> None:
 def test_a_scan_with_no_answer_is_incomplete() -> None:
     verdict = judge(None)
     assert verdict["mixed"] is False and verdict["complete"] is False and verdict["warnings"]
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def make_sequence(rig: Rig, name: str, tracks: list[list[PySegment]]) -> dict[str, Any]:

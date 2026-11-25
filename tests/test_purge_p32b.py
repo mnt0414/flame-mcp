@@ -21,6 +21,7 @@ from flame_mcp.journal import JOURNAL_MAX_AGE_S, Journal
 from flame_mcp.types import NO_DEFAULT
 from journal_test_helpers import Rig
 from p32b_helpers import PURGE, S1, S2, S3, delete, make_p32b_rig, uid
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     a_seg,
     checkpoints,
@@ -35,9 +36,7 @@ from timeline_p32a_helpers import (
 OLD = "2026-08-01T00:00:00.000+00:00"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def old_checkpoint(rig: Rig, monkeypatch: pytest.MonkeyPatch, target: dict[str, Any]) -> str:

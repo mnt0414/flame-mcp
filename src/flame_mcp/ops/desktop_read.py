@@ -4,15 +4,16 @@ libraries (the rest of the `desktop` category lives in `desktop.py`)."""
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 
 from flame_mcp import selectors
 from flame_mcp.list_fields import fields_note, fields_param
 from flame_mcp.ops._common import build_source, limit_param, list_result_src, offset_param
 from flame_mcp.registry import Registry
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import ListFields, OperationParam, OperationSpec, Refusal, SelectorKind
 
 _FIND_PARENT_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path")
+_FIND_FIELDS: Final[ListFields] = ListFields("items", ("type", "name", "uid", "selector", "parent"))
 _INFO_TARGET_KINDS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection", "timeline")
 
 _FIND_DESCRIPTION = (
@@ -129,11 +130,12 @@ def register(registry: Registry) -> None:
                 ),
                 limit_param(),
                 offset_param(),
-                fields_param("desktop.find"),
+                fields_param(_FIND_FIELDS),
             ),
             accepts=_FIND_PARENT_KINDS,
             precheck=_find_precheck,
             to_python=_find_to_python,
+            list_fields=_FIND_FIELDS,
             requires=("flame.find_by_name", "flame.find_by_uid", "PyReel.parent"),
         )
     )

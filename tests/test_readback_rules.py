@@ -34,6 +34,7 @@ from flame_mcp import checkpoints
 from flame_mcp.journal import Index
 from flame_mcp.render_run import judge_render, missing_outputs
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import S1, make_timeline_rig
 
 BG2 = {"kind": "batch", "name": "BG2"}
@@ -45,9 +46,7 @@ CLIP2 = {"kind": "wiretap", "id": "/projects/p/ws/P1O/R1/clip2"}
 SCHEMATIC = "Schematic Reel 1"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def bg(rig: Rig, key: str = "bg1") -> PyBatch:
@@ -764,9 +763,7 @@ def test_judge_render_rules() -> None:
 # -- render.clip -----------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def clip_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+clip_rig = rig_fixture(make_timeline_rig)
 
 
 def fx_clip(rig: Rig) -> PyClip:

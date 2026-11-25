@@ -16,7 +16,14 @@ from flame_mcp.ops._common import (
     offset_param,
 )
 from flame_mcp.registry import Registry
-from flame_mcp.types import Category, OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    Category,
+    ListFields,
+    OperationParam,
+    OperationSpec,
+    Refusal,
+    SelectorKind,
+)
 
 CATEGORY = Category(
     name="timeline",
@@ -33,9 +40,35 @@ CATEGORY = Category(
 _SEQUENCE_TARGET_ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection", "timeline")
 _COMPARE_ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 DEFAULT_COMPARE_LIMIT: Final[int] = 50
+_SEGMENT_FIELDS: Final[ListFields] = ListFields(
+    "items",
+    (
+        "index",
+        "name",
+        "sourceName",
+        "recordIn",
+        "recordOut",
+        "sourceIn",
+        "sourceOut",
+        "recordDuration",
+        "type",
+        "isGap",
+        "head",
+        "tail",
+        "effects",
+        "connections",
+    ),
+    groups_key="tracks",
+)
 CONNECTION_BUDGET_S: Final[float] = 5.0
 """`timeline.list_segments` with `include_connections=true` stops reading connections after this
 long (the first segment is always read); the same value as batch.NODE_COUNT_BUDGET_S."""
+ALL_TRACKS_MAX_BYTES: Final[int] = 40_000
+"""`timeline.list_segments` with `all_tracks=true` stops adding segments once the JSON of the
+items read reaches this many bytes (the first segment is always read). The response limit is
+60,000 bytes (`envelope.MAX_RESPONSE_BYTES`); over it `degrade_for_size` collapses every list of
+the result, so the items of all tracks would be lost. A described segment measured in session
+records: median 427 bytes, at most 524 (1,665 segments, no `fields`), so this holds about 90."""
 
 
 def _resolved_identity_src() -> list[str]:
@@ -173,7 +206,54 @@ def _audio_pick_src(track: int, channel: int) -> list[str]:
     ]
 
 
+def _all_tracks_to_python(args: Mapping[str, Any]) -> str:
+    note = f"stopped reading at {ALL_TRACKS_MAX_BYTES} bytes of items over all tracks"
+    return build_source(
+        selectors.resolve_code(args["target"], "target"),
+        _segment_item_src(),
+        "\n".join(
+            [
+                "import json",
+                f"_version_idx = {args['version']!r}",
+                "_versions = list(target.versions)",
+                "if _version_idx >= len(_versions):",
+                "    raise _OpError('SELECTOR_EMPTY', 'version index ' + str(_version_idx) "
+                "+ ' out of range (have ' + str(len(_versions)) + ')')",
+                "_tracks = list(_versions[_version_idx].tracks)",
+                f"_limit = {args['limit']!r}",
+                f"_max_bytes = {ALL_TRACKS_MAX_BYTES!r}",
+                "_used = 0",
+                "_stop = False",
+                "_rows = []",
+                "for _t, _trk in enumerate(_tracks):",
+                "    _segments = list(_trk.segments)",
+                "    _items = []",
+                "    for _i, _s in enumerate(_segments[:_limit]):",
+                "        if _stop:",
+                "            break",
+                "        _item = _describe_segment(_i, _s)",
+                "        _size = len(json.dumps(_item, default=repr))",
+                "        if _used > 0 and _used + _size > _max_bytes:",
+                "            _stop = True",
+                "            break",
+                "        _items.append(_item)",
+                "        _used += _size",
+                "    _row = {'track': _t, 'total': len(_segments), 'items': _items}",
+                "    if len(_segments) > len(_items):",
+                "        _row['truncated'] = True",
+                "    _rows.append(_row)",
+                "_result = {'version': _version_idx, 'trackCount': len(_tracks), 'tracks': _rows}",
+                "if _stop:",
+                f"    _result['note'] = {note!r}",
+            ]
+        ),
+        "\n".join(_resolved_identity_src()),
+    )
+
+
 def _list_segments_to_python(args: Mapping[str, Any]) -> str:
+    if args.get("all_tracks"):
+        return _all_tracks_to_python(args)
     target_sel = args["target"]
     track = args["track"]
     limit = args["limit"]
@@ -236,6 +316,35 @@ def _list_segments_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | N
             "INVALID_ARGS",
             "include_connections only applies to media='video' (segment connections are read "
             "on video segments)",
+        )
+    if args.get("all_tracks"):
+        return _all_tracks_refusal(args)
+    return None
+
+
+def _all_tracks_refusal(args: Mapping[str, Any]) -> Refusal | None:
+    if args.get("media", "video") == "audio":
+        return Refusal(
+            "INVALID_ARGS",
+            "all_tracks only applies to media='video' (audio is read one channel at a time)",
+        )
+    if args.get("track", 0) != 0:
+        return Refusal(
+            "INVALID_ARGS",
+            "all_tracks reads every track, so `track` must be 0 or left out; to read one track, "
+            "leave all_tracks off",
+        )
+    if args.get("offset", 0) != 0:
+        return Refusal(
+            "INVALID_ARGS",
+            "all_tracks cannot page with `offset`; to continue a track that was cut, read that "
+            "track with `track` and `offset`",
+        )
+    if args.get("include_connections"):
+        return Refusal(
+            "INVALID_ARGS",
+            "all_tracks cannot be combined with include_connections; read the track you need "
+            "with `track`",
         )
     return None
 
@@ -300,8 +409,9 @@ def register(registry: Registry) -> None:
             description=(
                 "List the segments of one (version, track) pair, one page at a time "
                 "(`offset` skips segments; each item's `index` is its position in the "
-                "track). Each item carries `type` (Flame's segment type, e.g. 'Gap' or "
-                "'Video Segment'), `isGap`, and `head` / `tail` (handle frames as an "
+                "track). Each item carries `type` "
+                "(Flame's segment type, e.g. 'Gap' or 'Video Segment'), `isGap`, and "
+                "`head` / `tail` (handle frames as an "
                 "integer, or the string 'infinite' for a gap) and `effects` (the type names of "
                 "its timeline effects, [] for none or when they cannot be read; "
                 "segment.list_effects has the attributes). "
@@ -318,8 +428,17 @@ def register(registry: Registry) -> None:
                 "channel index that does not exist is SELECTOR_EMPTY; `channel` with "
                 "media='video' is INVALID_ARGS. There is no selector for an audio segment: the "
                 "segment.* ops and the segment selector work on video segments only. "
-                + AUTO_RESIZE_NOTE
-                + " "
+                "A sequence with two or more video tracks is read in one call with "
+                "all_tracks=true: the result is {version, trackCount, tracks: [{track, total, "
+                "items, truncated?}]}, the items are described as above, `limit` applies to each "
+                "track, and a track with more segments than were read has `truncated: true` "
+                "(`total` is its full count). The items of all tracks together stop at about "
+                + f"{ALL_TRACKS_MAX_BYTES:,}"
+                + " bytes of JSON (the first segment is always read); after that, each later "
+                "track that has segments comes back with empty `items` and `truncated: true`, "
+                "and the result has a `note`. To continue a cut track, read it with `track` and "
+                "`offset`. all_tracks is INVALID_ARGS with `track` other than 0, `offset`, "
+                "include_connections or media='audio'. " + AUTO_RESIZE_NOTE + " "
                 "The result's uid / wiretapId are those of the sequence that was read; to read "
                 "or edit that same sequence again, point at it with "
                 "{kind: 'wiretap', id: <wiretapId>}, because a timeline selector reads what the "
@@ -382,13 +501,26 @@ def register(registry: Registry) -> None:
                     required=False,
                     default=False,
                 ),
-                limit_param("Max segments to return."),
+                OperationParam(
+                    name="all_tracks",
+                    type="boolean",
+                    description=(
+                        "true: read every video track of `version` in one call; the result has "
+                        "`tracks` (one {track, total, items} per track) instead of `items`. "
+                        "`limit` then applies per track. Not with `track` other than 0, `offset`, "
+                        "include_connections or media='audio'. Default false."
+                    ),
+                    required=False,
+                    default=False,
+                ),
+                limit_param("Max segments to return (per track when all_tracks is true)."),
                 offset_param(),
-                fields_param("timeline.list_segments"),
+                fields_param(_SEGMENT_FIELDS),
             ),
             accepts=_SEQUENCE_TARGET_ACCEPTS,
             to_python=_list_segments_to_python,
             precheck=_list_segments_precheck,
+            list_fields=_SEGMENT_FIELDS,
             requires=(
                 "PySequence.audio_tracks",
                 "PyAudioTrack.channels",

@@ -43,17 +43,23 @@ from flame_mcp.checkpoints import (
     BATCH_KIND,
     TIMELINE_KIND,
     CheckpointKind,
+    add_intent_fields,
+    add_outcome_fields,
     fingerprint_of,
-    intent_fields,
     kind_named,
-    outcome_fields,
     read_fingerprint,
     stable_subject,
     take_checkpoint,
 )
-from flame_mcp.errors import as_error_code
-from flame_mcp.journal import new_id, now_iso
-from flame_mcp.journaled_write import UNKNOWN_END_CODES
+from flame_mcp.errors import as_error_code, is_partial_message
+from flame_mcp.journal import NO_LINK, JournalLink, new_id, now_iso
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord
+from flame_mcp.journaled_write import (
+    UNKNOWN_END_CODES,
+    close_outcome,
+    note_unresolved,
+    outcome_not_journaled_note,
+)
 from flame_mcp.opschema import ArgIssue, find_non_ascii
 from flame_mcp.policy import deny_operation
 from flame_mcp.registry import RegisteredOperation
@@ -92,6 +98,17 @@ restores a checkpoint (journal.revert, journal.restore_checkpoint, batch.load_se
 destructive eval.run, and each op that declares a `CheckpointSpec`)."""
 
 Stage = Literal["checkpoint", "uid", "intent", "ascii"]
+
+IntentExtra = Callable[[IntentRecord], None]
+"""Adds the keys of its own to the intent record of a checkpointed write (`eval.run`'s code).
+It must have no side effects: it is called twice, once on an empty record to check what it adds
+for non-ASCII values, then on the intent that is journaled."""
+OutcomeExtra = Callable[[OutcomeRecord, dict[str, Any], str | None], None]
+"""`(outcome, env, fingerprint_after)`: adds the keys of its own to the outcome record."""
+
+
+def no_intent_extra(intent: IntentRecord) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -212,7 +229,7 @@ def ascii_refusal_text(exc: PreRunRefusal) -> str:
     return f"{issue.path}: {issue.message}"
 
 
-def _first_non_ascii(**values: Any) -> ArgIssue | None:
+def first_non_ascii(**values: Any) -> ArgIssue | None:
     for name, value in values.items():
         issue = find_non_ascii(value, name)
         if issue is not None:
@@ -220,32 +237,21 @@ def _first_non_ascii(**values: Any) -> ArgIssue | None:
     return None
 
 
-def run_checkpointed(
+def _take_pre_checkpoint(
     ctx: ServerContext,
-    *,
     selector: Mapping[str, Any],
-    op_name: str,
-    kind: str,
     args: Mapping[str, Any],
-    intent_extra: Mapping[str, Any],
-    expected_fp: str | None,
+    intent_extra: IntentExtra,
     label: str,
-    run: Callable[[dict[str, Any]], dict[str, Any]],
-    judge: Callable[[dict[str, Any], str | None], Judgement],
-    failed_key: str,
-    outcome_extra: Callable[[dict[str, Any], str | None], dict[str, Any]] | None = None,
-    group: str | None = None,
-    reverts: str | None = None,
-    reverts_intent: str | None = None,
-    forced: Mapping[str, Any] | None = None,
-    checkpoint_kind: CheckpointKind = BATCH_KIND,
-) -> CheckpointedRun:
-    """The engine. `selector` addresses the Batch group (or the sequence / clip, for the timeline
-    kind); `run(stable)` runs the op against the target addressed by uid (wiretap id) and returns
-    Flame's envelope; `judge(env, fingerprint_after)` decides whether the run counts as done. The
-    caller must hold `ctx.write_lock`."""
-    group_id = group if group is not None else new_id("g")
-    issue = _first_non_ascii(args=args, intent=intent_extra)
+    group_id: str,
+    checkpoint_kind: CheckpointKind,
+) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    """Refuses a non-ASCII value, takes the checkpoint of the current state and finds the target
+    again by its stable address: `(checkpoint result, stable selector, uid)`. Raises
+    `PreRunRefusal` (nothing was run)."""
+    probe: IntentRecord = {"type": "intent", "id": "", "group": "", "ts": "", "op": ""}
+    intent_extra(probe)
+    issue = first_non_ascii(args=args, intent=probe)
     if issue is not None:
         raise PreRunRefusal("ascii", issue=issue, kind=checkpoint_kind)
     cp_env = take_checkpoint(ctx, selector, label=label, group=group_id, kind=checkpoint_kind)
@@ -257,13 +263,88 @@ def run_checkpointed(
     if subject is None:
         raise PreRunRefusal("uid", cp=pre, kind=checkpoint_kind)
     stable, uid = subject
-    issue = _first_non_ascii(target=stable)
+    issue = first_non_ascii(target=stable)
     if issue is not None:
         raise PreRunRefusal("ascii", cp=pre, issue=issue, kind=checkpoint_kind)
+    return pre, stable, uid
+
+
+def _settle_run(
+    ctx: ServerContext,
+    facts: CheckpointedRun,
+    stable: Mapping[str, Any],
+    op_name: str,
+    judge: Callable[[dict[str, Any], str | None], Judgement],
+    failed_key: str,
+    outcome_extra: OutcomeExtra | None,
+) -> None:
+    """After an answer: read the fingerprint again, let `judge` decide, journal the outcome."""
+    env = facts.env
+    kind = facts.kind
+    after_env = read_fingerprint(ctx, stable, kind)
+    facts.fingerprint_after = fingerprint_of(after_env)
+    facts.after_error = None if facts.fingerprint_after is not None else after_env.get("error")
+    facts.changed = (
+        facts.fingerprint_after != facts.fingerprint_before
+        if facts.fingerprint_after is not None
+        else None
+    )
+    judgement = judge(env, facts.fingerprint_after)
+    facts.ok = judgement.ok
+    outcome: OutcomeRecord = {
+        "type": "outcome",
+        "id": facts.intent_id,
+        "group": facts.group,
+        "ts": now_iso(),
+        "ok": judgement.ok,
+        "applied": [],
+        "failed": {} if judgement.ok else {failed_key: judgement.failed or ""},
+        "errorCode": None if judgement.ok else judgement.error_code,
+        "readBack": None,
+        "fingerprintAfter": facts.fingerprint_after,
+        "fingerprintAfterError": facts.after_error,
+        "changed": facts.changed,
+    }
+    add_outcome_fields(outcome, kind, after_env)
+    if _ended_partial(judgement):
+        outcome["verdict"] = "partial"
+    if outcome_extra is not None:
+        outcome_extra(outcome, env, facts.fingerprint_after)
+    journal_error = close_outcome(ctx, outcome, facts.intent_id, facts.group, op_name)
+    if journal_error is not None:
+        facts.journal_error = str(journal_error)
+
+
+def run_checkpointed(
+    ctx: ServerContext,
+    *,
+    selector: Mapping[str, Any],
+    op_name: str,
+    kind: str,
+    args: Mapping[str, Any],
+    expected_fp: str | None,
+    label: str,
+    run: Callable[[dict[str, Any]], dict[str, Any]],
+    judge: Callable[[dict[str, Any], str | None], Judgement],
+    failed_key: str,
+    intent_extra: IntentExtra = no_intent_extra,
+    outcome_extra: OutcomeExtra | None = None,
+    link: JournalLink = NO_LINK,
+    forced: Mapping[str, Any] | None = None,
+    checkpoint_kind: CheckpointKind = BATCH_KIND,
+) -> CheckpointedRun:
+    """The engine. `selector` addresses the Batch group (or the sequence / clip, for the timeline
+    kind); `run(stable)` runs the op against the target addressed by uid (wiretap id) and returns
+    Flame's envelope; `judge(env, fingerprint_after)` decides whether the run counts as done. It
+    runs under the `write_lock` that `Runtime.execute` holds."""
+    group_id = link.group if link.group is not None else new_id("g")
+    pre, stable, uid = _take_pre_checkpoint(
+        ctx, selector, args, intent_extra, label, group_id, checkpoint_kind
+    )
     pre_id = str(pre.get("checkpoint"))
 
     intent_id = new_id("i")
-    intent: dict[str, Any] = {
+    intent: IntentRecord = {
         "type": "intent",
         "id": intent_id,
         "group": group_id,
@@ -277,13 +358,10 @@ def run_checkpointed(
         "revertCheckpoint": pre_id,
         "fingerprintBefore": pre.get("fingerprint"),
         "fingerprintExpected": expected_fp,
-        **intent_fields(checkpoint_kind, pre, uid),
-        **intent_extra,
     }
-    if reverts is not None:
-        intent["reverts"] = reverts
-    if reverts_intent is not None:
-        intent["revertsIntent"] = reverts_intent
+    add_intent_fields(intent, checkpoint_kind, pre, uid)
+    intent_extra(intent)
+    link.stamp(intent)
     if forced is not None:
         intent["forced"] = dict(forced)
     try:
@@ -303,67 +381,17 @@ def run_checkpointed(
     )
     end_code = env.get("errorCode")
     if end_code in UNKNOWN_END_CODES:
-        ctx.guard.block(intent_id, group_id, op_name, str(end_code))
-        note_unresolved(ctx, intent_id, group_id, env)
+        note_unresolved(ctx, intent_id, group_id, env, op_name, str(end_code))
         facts.unknown_end = True
         return facts
-
-    after_env = read_fingerprint(ctx, stable, checkpoint_kind)
-    facts.fingerprint_after = fingerprint_of(after_env)
-    facts.after_error = None if facts.fingerprint_after is not None else after_env.get("error")
-    facts.changed = (
-        facts.fingerprint_after != facts.fingerprint_before
-        if facts.fingerprint_after is not None
-        else None
-    )
-    judgement = judge(env, facts.fingerprint_after)
-    facts.ok = judgement.ok
-    outcome: dict[str, Any] = {
-        "type": "outcome",
-        "id": intent_id,
-        "group": group_id,
-        "ts": now_iso(),
-        "ok": judgement.ok,
-        "applied": [],
-        "failed": {} if judgement.ok else {failed_key: judgement.failed or ""},
-        "errorCode": None if judgement.ok else judgement.error_code,
-        "readBack": None,
-        "fingerprintAfter": facts.fingerprint_after,
-        "fingerprintAfterError": facts.after_error,
-        "changed": facts.changed,
-        **outcome_fields(checkpoint_kind, after_env),
-        **({"verdict": "partial"} if _ended_partial(judgement) else {}),
-    }
-    if outcome_extra is not None:
-        outcome.update(outcome_extra(env, facts.fingerprint_after))
-    try:
-        ctx.journal.append(outcome)
-    except OSError as exc:
-        facts.journal_error = str(exc)
-        ctx.guard.block(intent_id, group_id, op_name, "JOURNAL_OUTCOME_NOT_WRITTEN")
+    _settle_run(ctx, facts, stable, op_name, judge, failed_key, outcome_extra)
     return facts
 
 
 def _ended_partial(judgement: Judgement) -> bool:
     """The run changed part of what it was asked to (its message starts with `partial:`): the
     outcome says so, so the intent's state is `partial` (`IntentView.state`) and not `failed`."""
-    return not judgement.ok and (judgement.failed or "").startswith("partial:")
-
-
-def note_unresolved(ctx: ServerContext, intent_id: str, group: str, env: Mapping[str, Any]) -> None:
-    try:
-        ctx.journal.append(
-            {
-                "type": "unresolved",
-                "id": intent_id,
-                "group": group,
-                "ts": now_iso(),
-                "errorCode": env.get("errorCode"),
-                "error": env.get("error"),
-            }
-        )
-    except OSError:
-        pass  # the intent alone already says "in doubt"; the guard is what matters
+    return not judgement.ok and is_partial_message(judgement.failed)
 
 
 @dataclass(frozen=True)
@@ -468,8 +496,7 @@ def run_envelope(
     if facts.journal_error is not None:
         env["degraded"] = [
             *env.get("degraded", []),
-            f"the outcome could not be journaled ({facts.journal_error}); the run's answer "
-            "stands but this server now refuses writes until journal.check has settled the intent",
+            outcome_not_journaled_note(facts.journal_error, "the run's answer"),
         ]
     if failure_hint and env.get("ok") is not True:
         hint = str(env.get("hint") or "")
@@ -515,62 +542,51 @@ def run_declared(
     meta = envelope_mod.execution_meta(op)
     words = Words(what=f"this {op.name} call")
     timeout_s = spec.timeout_s
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:  # this call queued behind a write that ended unknown
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        target_kind = kind_named(spec.target_kind)
-        try:
-            refuse_if_denied(rt, target_kind.needed_ops)
-        except ServerOpError as exc:
+    target_kind = kind_named(spec.target_kind)
+    try:
+        refuse_if_denied(rt, target_kind.needed_ops)
+    except ServerOpError as exc:
+        return envelope_mod.build_envelope(
+            ok=False,
+            error=exc.message,
+            error_code=exc.code,
+            execution=meta,
+            duration_ms=elapsed_ms(started),
+            hint_override=exc.hint,
+        )
+    if spec.check is not None:
+        refusal = spec.check(rt, op_args)
+        if refusal is not None:
             return envelope_mod.build_envelope(
                 ok=False,
-                error=exc.message,
-                error_code=exc.code,
+                result=refusal.result,
+                error=refusal.message,
+                error_code=refusal.code,
                 execution=meta,
                 duration_ms=elapsed_ms(started),
-                hint_override=exc.hint,
+                hint_override=refusal.hint,
             )
-        if spec.check is not None:
-            refusal = spec.check(rt, op_args)
-            if refusal is not None:
-                return envelope_mod.build_envelope(
-                    ok=False,
-                    result=refusal.result,
-                    error=refusal.message,
-                    error_code=refusal.code,
-                    execution=meta,
-                    duration_ms=elapsed_ms(started),
-                    hint_override=refusal.hint,
-                )
 
-        def run(stable: dict[str, Any]) -> dict[str, Any]:
-            run_args = declared_run_args(spec, op_args, stable)
-            return execution.run_op(op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s)
+    def run(stable: dict[str, Any]) -> dict[str, Any]:
+        run_args = declared_run_args(spec, op_args, stable)
+        return execution.run_op(op, run_args, run_dir=rt.run_dir, timeout_s=timeout_s)
 
-        group_selector = spec.group_selector(op_args) if spec.group_selector is not None else None
-        try:
-            facts = run_checkpointed(
-                rt,
-                selector=group_selector if group_selector is not None else op_args[spec.batch_arg],
-                op_name=op.name,
-                kind=op.name.split(".", 1)[-1],
-                args=op_args,
-                intent_extra={},
-                expected_fp=None,
-                label=spec.label(op_args) if spec.label is not None else f"before {op.name}",
-                run=run,
-                judge=_judge_declared,
-                failed_key=op.name,
-                group=group,
-                checkpoint_kind=target_kind,
-            )
-        except PreRunRefusal as exc:
-            return refusal_envelope(op, exc, words, meta, started, journal_dir=rt.journal.directory)
+    group_selector = spec.group_selector(op_args) if spec.group_selector is not None else None
+    try:
+        facts = run_checkpointed(
+            rt,
+            selector=group_selector if group_selector is not None else op_args[spec.batch_arg],
+            op_name=op.name,
+            kind=op.name.split(".", 1)[-1],
+            args=op_args,
+            expected_fp=None,
+            label=spec.label(op_args) if spec.label is not None else f"before {op.name}",
+            run=run,
+            judge=_judge_declared,
+            failed_key=op.name,
+            link=JournalLink(group),
+            checkpoint_kind=target_kind,
+        )
+    except PreRunRefusal as exc:
+        return refusal_envelope(op, exc, words, meta, started, journal_dir=rt.journal.directory)
     return run_envelope(facts, words, meta, failure_hint=True)

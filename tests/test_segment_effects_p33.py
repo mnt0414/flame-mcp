@@ -36,6 +36,7 @@ from p33_helpers import (
     track0,
     untouched_world,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     fingerprint_of_target,
@@ -45,10 +46,7 @@ from timeline_p32a_helpers import (
     wt,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_timeline_rig)
 
 
 def create(rig: Rig, fx_type: str, selector: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -473,8 +471,8 @@ def test_save_setup_takes_no_checkpoint_and_is_a_create_without_undo(
 ) -> None:
     create(rig, "Blur")
     before = len(checkpoints(rig))
-    env = save(rig, tmp_path / "bl", "Blur")
-    assert len(checkpoints(rig)) == before and env["undoSteps"] == 0
+    save(rig, tmp_path / "bl", "Blur")
+    assert len(checkpoints(rig)) == before
     op = rig.registry.get(SAVE_FX)
     assert op is not None and op.checkpoint is None and op.wrap is None
     assert (op.effect, op.undo) == ("create", "none")

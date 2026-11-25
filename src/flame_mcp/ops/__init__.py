@@ -28,6 +28,7 @@ from flame_mcp.ops import (
     node,
     node_edit_setup,
     plan,
+    plan_loop,
     project,
     render,
     render_clip,
@@ -45,6 +46,7 @@ from flame_mcp.ops import (
     timeline_checkpoints,
     timeline_colour,
     timeline_create,
+    timeline_restructure,
     timeline_shorten,
     timeline_usage,
 )
@@ -68,6 +70,7 @@ def register_all(registry: Registry) -> None:
     timeline_checkpoints.register(registry)
     timeline_colour.register(registry)
     timeline_build.register(registry)
+    timeline_restructure.register(registry)
     timeline_create.register(registry)
     timeline_shorten.register(registry)
     timeline_usage.register(registry)
@@ -91,4 +94,5 @@ def register_all(registry: Registry) -> None:
     checkpoints.register(registry)
     eval.register(registry)
     plan.register(registry)
+    plan_loop.register(registry)
     registry.validate_references()

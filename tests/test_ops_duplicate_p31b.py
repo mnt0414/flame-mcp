@@ -4,7 +4,6 @@ Also `journal.revert` and `journal.check`. See media_p31b_helpers.py for the rig
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,11 +29,9 @@ from media_p31b_helpers import (
     states,
     wt,
 )
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 def test_duplicate_a_clip_puts_a_same_named_clip_beside_it_and_keeps_the_source(rig: Rig) -> None:
@@ -52,7 +49,7 @@ def test_duplicate_a_clip_puts_a_same_named_clip_beside_it_and_keeps_the_source(
     info = rig.do("desktop.info", {"target": made["selector"]})
     assert info["ok"] is True and info["result"]["uid"] == made["uid"]
     assert rig.flame.find_by_uid(clip.uid.get_value()) is clip
-    assert env["affected"] == 1 and env["undoSteps"] == 0
+    assert env["affected"] == 1
     assert result["state"]["name"] == "c1" and "duration" in result["state"]
 
 

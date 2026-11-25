@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Final
 
+from flame_mcp.execution import raise_on_error_src as raise_on_error_src
 from flame_mcp.types import OperationParam
 
 AUTO_RESIZE_NOTE: Final[str] = (
@@ -24,6 +25,24 @@ REEL_CLIP_NOTE: Final[str] = (
     "wiretap, version 0, track 0, index 0 (a clip with one segment), with no sequence involved. "
     "Measured on Flame 2025.2.4."
 )
+
+
+def raise_if_error(code: str) -> str:
+    return "\n".join(
+        [
+            "if _result['error'] is not None:",
+            f"    raise _OpError(_result.get('errorCode') or {code!r}, _result['error'])",
+        ]
+    )
+
+
+def batch_target_param() -> OperationParam:
+    return OperationParam(
+        name="target",
+        type="selector",
+        description="A 'batch' selector (uid or name). The group need not be current.",
+        required=True,
+    )
 
 
 def build_source(*blocks: str) -> str:
@@ -64,15 +83,4 @@ def offset_param() -> OperationParam:
         default=0,
         integer=True,
         minimum=0,
-    )
-
-
-def raise_on_error_src() -> str:
-    """The op's code after a helper that answers `{error, errorCode}`: turn it into `_OpError` so
-    the helper's partial `_result` stays in the envelope (desktop writes)."""
-    return "\n".join(
-        [
-            "if _result['error'] is not None:",
-            "    raise _OpError(_result['errorCode'], _result['error'])",
-        ]
     )

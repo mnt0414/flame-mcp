@@ -482,7 +482,6 @@ async def roundtrip(
         ctx.results,
         f"{label}_2_set",
         setenv.get("ok") is True
-        and setenv.get("undoSteps") == 0
         and setenv.get("partial") is None
         and result.get("applied") == keys
         and result.get("failed") == {}

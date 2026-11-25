@@ -5,12 +5,15 @@ files reads FLAME_MCP_SPILL_DIR)."""
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 
 import pytest
 
 from flame_mcp import envelope, setup_work
 from flame_mcp import journal as journal_mod
+from flame_mcp.ops import register_all
+from flame_mcp.registry import Registry
 
 
 @pytest.fixture(autouse=True)
@@ -31,3 +34,21 @@ def _no_leaked_setup_work_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """`setup_work` keeps the journal directory of the last `Runtime` made: a test that makes none
     must not pick up the one an earlier test left."""
     monkeypatch.setattr(setup_work, "_journal_directory", None)
+
+
+def make_registry() -> Registry:
+    registry = Registry()
+    register_all(registry)
+    return registry
+
+
+@cache
+def shared_registry() -> Registry:
+    """The registry of every public op, built once for the whole run: for a test that only reads
+    it. A test that registers into a registry or changes one makes its own with `make_registry`."""
+    return make_registry()
+
+
+@pytest.fixture(scope="module")
+def registry() -> Registry:
+    return make_registry()

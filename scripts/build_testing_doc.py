@@ -133,11 +133,11 @@ scripts/make_p2_av_media.sh
 ### Run the tests
 
 Run one test. The optional second argument is the number of seconds to wait for Flame to exit
-by itself after the client returns. The default is 600.
+by itself after the client returns. The default is 120.
 
 ```bash
 scripts/run_e2e.sh p2_2a_journal
-scripts/run_e2e.sh p2_2a_journal 900
+scripts/run_e2e.sh p2_2a_journal 300
 ```
 
 Run every test, one after another, and clean up at the end. Give names to run only those.
@@ -186,12 +186,11 @@ folder.
 ### Clean up
 
 `scripts/regress.sh` runs the clean-up when it finishes. After a single run, run it yourself.
-The first command prints what the script would delete, keep and create. The second does it. The
-number 900 is how many seconds to wait for Flame to exit.
+The first command prints what the script would delete, keep and create. The second does it.
 
 ```bash
-scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py 900 -- --mode dry-run
-scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py 900 -- --mode apply
+scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py -- --mode dry-run
+scripts/run_flame_with_bridge.sh scripts/p2_4_clean_probe_project.py -- --mode apply
 ```
 
 The script deletes only libraries, Batch groups and reel groups whose names have the form a test

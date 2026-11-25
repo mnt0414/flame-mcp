@@ -82,7 +82,7 @@ def test_a_sequence_is_made_in_the_reel_and_read_back(rig: Rig) -> None:
     assert len(made.versions[0].tracks) == 2
     assert result["state"]["name"] == "NEWSEQ" and result["state"]["fingerprint"]
     assert result["returned"]["type"] == "PySequence"
-    assert env["execution"]["effect"] == "create" and env["undoSteps"] == 0
+    assert env["execution"]["effect"] == "create"
 
 
 def test_the_defaults_are_one_track_from_zero(rig: Rig) -> None:

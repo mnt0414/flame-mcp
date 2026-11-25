@@ -4,7 +4,8 @@ OLD_CONFIGS is what the 25 per-e2e orchestrators that run_e2e.sh replaced said (
 directory, result-file glob, whether the stage files are filtered out of the result listing,
 whether E2E_EXTRA_ARGS reaches the client, whether the client's exit is followed by a shell.log
 crash check, the precondition file, the default TIMEOUT and the stage description).
-`run_e2e.sh --print-config <name>` has to say the same.
+`run_e2e.sh --print-config <name>` has to say the same, except the default TIMEOUT: it is now
+EXIT_WAIT_S for every e2e (the old scripts said 600).
 
 Nothing here starts Flame: a fake `pgrep` that reports Flame as running stops every run before it
 deploys or opens anything, and HOME points into tmp_path."""
@@ -30,6 +31,7 @@ E2E_LIB = SCRIPTS / "e2e_lib.sh"
 E2E_FLAME_ENV = SCRIPTS / "e2e_flame_env.sh"
 RUN_WITH_BRIDGE = SCRIPTS / "run_flame_with_bridge.sh"
 W3_SETUP_UNSET = "env:FLAME_MCP_W3_SETUP"
+EXIT_WAIT_S = "120"
 
 
 class OldConfig(NamedTuple):
@@ -55,7 +57,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages l, b, r, d, c, e, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -67,7 +69,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages n, c, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -79,7 +81,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a, t, p, s, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -91,7 +93,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages n, c, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -103,7 +105,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a, b, c, d, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -115,7 +117,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "",
     ),
     OldConfig(
@@ -127,7 +129,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "",
     ),
     OldConfig(
@@ -139,7 +141,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-f, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -151,7 +153,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -163,7 +165,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-e, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -175,7 +177,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-e, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -187,7 +189,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-f, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -199,7 +201,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a-i, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -211,7 +213,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a-g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -223,7 +225,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a-e, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -235,7 +237,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages c, t, b, r, u, s, o, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -247,7 +249,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(stages a-e, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -259,7 +261,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "yes",
         "yes",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -271,7 +273,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "yes",
         "yes",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -283,8 +285,8 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
-        "(setup, stages a-f, h, i, g, z; each stage starts a flame_mcp subprocess)",
+        EXIT_WAIT_S,
+        "(setup, stages a-f, h, i, g, j, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p3_1b_write",
@@ -295,7 +297,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a, a2, b, c, e, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -307,7 +309,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a-k, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -319,7 +321,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages p, d, w, m, k, r, g, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -331,7 +333,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages s, r, e, x, p, y, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -343,7 +345,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages o, i, k, v, c, p, y, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -355,7 +357,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages a, n, b, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -367,7 +369,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages d, m, a, s, q, c, y, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -379,7 +381,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages f, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -391,7 +393,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages r, t, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -403,8 +405,20 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages b, a, n, z; each stage starts a flame_mcp subprocess)",
+    ),
+    OldConfig(
+        "p107_plan_loop",
+        "scripts/p107_plan_loop_e2e.py",
+        "p3",
+        "p107_plan_loop_e2e_*.json",
+        "yes",
+        "no",
+        "no",
+        None,
+        EXIT_WAIT_S,
+        "(setup, stages r, f, w, s, x, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
         "p5_setup_edit",
@@ -415,7 +429,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages c, p, n, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -427,7 +441,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         None,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages l, z; each stage starts a flame_mcp subprocess)",
     ),
     OldConfig(
@@ -439,7 +453,7 @@ OLD_CONFIGS: list[OldConfig] = [
         "no",
         "no",
         W3_SETUP_UNSET,
-        "600",
+        EXIT_WAIT_S,
         "(setup, stages t, r, n, i, z; each stage starts a flame_mcp subprocess)",
     ),
 ]
@@ -564,7 +578,7 @@ def test_list_names_the_configured_e2es_and_the_dedicated_ones(tmp_path: Path) -
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.split()
     assert sorted(names) == sorted(ALL_NAMES)
-    assert len(names) == 36
+    assert len(names) == 37
 
 
 @pytest.mark.parametrize("name", DEDICATED)
@@ -952,10 +966,10 @@ def test_latest_result_says_so_when_there_is_none(tmp_path: Path) -> None:
 
 def test_e2e_lib_waits_are_the_values_the_old_scripts_had(tmp_path: Path) -> None:
     out = lib(
-        'echo "$POLL_INTERVAL $BIN_WAIT_TIMEOUT $SOCKET_WAIT_S $TERM_WAIT"',
+        'echo "$POLL_INTERVAL $BIN_WAIT_TIMEOUT $SOCKET_WAIT_S $TERM_WAIT $EXIT_WAIT_S"',
         tmp_path,
     )
-    assert out.split() == ["5", "60", "120", "10"]
+    assert out.split() == ["5", "60", "120", "10", EXIT_WAIT_S]
 
 
 def test_e2e_lib_sleeps_only_for_the_known_waits() -> None:
@@ -966,9 +980,9 @@ def test_e2e_lib_sleeps_only_for_the_known_waits() -> None:
 @pytest.mark.parametrize(
     ("script", "variable", "value"),
     [
-        (RUN_E2E, "DEFAULT_TIMEOUT", "600"),
-        (SCRIPTS / "run_p1_bridge_e2e.sh", "TIMEOUT", '"${1:-600}"'),
-        (SCRIPTS / "run_p2_4_restart_e2e.sh", "TIMEOUT", '"${1:-600}"'),
+        (RUN_E2E, "DEFAULT_TIMEOUT", '"$EXIT_WAIT_S"'),
+        (SCRIPTS / "run_p1_bridge_e2e.sh", "TIMEOUT", '"${1:-$EXIT_WAIT_S}"'),
+        (SCRIPTS / "run_p2_4_restart_e2e.sh", "TIMEOUT", '"${1:-$EXIT_WAIT_S}"'),
         (SCRIPTS / "run_p2_4_restart_e2e.sh", "GONE_WAIT_S", "30"),
         (SCRIPTS / "run_p1_transport_e2e.sh", "POST_RUN_EXIT_WAIT_S", "15"),
         (SCRIPTS / "run_p1_transport_e2e.sh", "POST_RUN_POLL_INTERVAL", "1"),

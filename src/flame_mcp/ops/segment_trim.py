@@ -11,13 +11,18 @@ from typing import Any, Final
 from flame_mcp import execution, selectors
 from flame_mcp.errors import as_error_code
 from flame_mcp.ops._common import build_source, raise_on_error_src
+from flame_mcp.ops._segment_edit import CHECK_PHASES, PHASE_CHECK
 from flame_mcp.registry import Registry
 from flame_mcp.timeline_restore import NOT_RESTORED
-from flame_mcp.types import CheckpointSpec, OperationParam, OperationSpec, Refusal
+from flame_mcp.types import (
+    PHASE_ARG,
+    CheckpointSpec,
+    OperationParam,
+    OperationSpec,
+    Refusal,
+)
 
 OP_NAME: Final[str] = "segment.trim"
-PHASE_ARG: Final[str] = "_phase"
-PHASE_CHECK: Final[str] = "check"
 EDGES: Final[tuple[str, ...]] = ("head", "tail")
 
 _DESCRIPTION = (
@@ -67,7 +72,7 @@ _DESCRIPTION = (
     "force=true overrides, journaled). Timeline restore: the edited sequence is moved into the "
     "stash reel (result.preCheckpoint: the revert can itself be undone) and the stashed copy is "
     "copied back. Not put back: " + "; ".join(NOT_RESTORED) + ". "
-    "Native Ctrl+Z is not used (undoSteps 0). Segment edits run on Flame's main thread only. "
+    "Native Ctrl+Z is not used. Segment edits run on Flame's main thread only. "
     "In plan.run: a plan that holds this step is one checkpointed write on this sequence (one "
     "stashed copy, journal.revert(group) is one restore; the step's own checkpoint is not "
     "taken); see plan.run."
@@ -138,14 +143,11 @@ def _label(args: Mapping[str, Any]) -> str:
     return f"before segment.trim ({args['edge']} {args['offset']})"
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=OP_NAME,
+            brief_paths=("position",),
             category="segment",
             description=_DESCRIPTION,
             effect="reversible",
@@ -189,8 +191,8 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment",),
             to_python=_trim_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_trim_precheck,
+            phases=CHECK_PHASES,
             checkpoint=CheckpointSpec(
                 target_kind="timeline",
                 label=_label,

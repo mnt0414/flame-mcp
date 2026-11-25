@@ -164,8 +164,8 @@ def test_the_name_must_match_exactly_when_the_env_names_the_project(
     assert "'flame_mcp_probe_2026'" in capsys.readouterr().err
 
 
-def test_the_client_list_is_the_36_of_run_e2e() -> None:
-    assert len(ORCHESTRATED) == 36
+def test_the_client_list_is_the_37_of_run_e2e() -> None:
+    assert len(ORCHESTRATED) == 37
 
 
 @pytest.mark.parametrize("name", CLIENTS)

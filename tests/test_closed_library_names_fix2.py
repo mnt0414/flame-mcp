@@ -5,7 +5,6 @@ lost (the notes of the other write runs)."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,14 +13,13 @@ from flame_mcp import execution, library_open, timeline_checkpoints
 from flame_mcp.library_open import library_refs, merge_into_envelope
 from journal_test_helpers import Rig
 from p32b_helpers import PURGE, S1, S2, make_p32b_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import stash_entries, stash_library, take_checkpoint
 
 OLD = "2026-08-01T00:00:00.000+00:00"
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 def old_checkpoint(rig: Rig, monkeypatch: pytest.MonkeyPatch, target: dict[str, Any]) -> str:

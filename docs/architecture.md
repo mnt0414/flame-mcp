@@ -103,7 +103,7 @@ The effective `thread` and where it came from (operation, category, or global de
 
 Every operation declares an `effect` (what a call does to the project) and an `undo` class (how `journal.revert` reverses it). [safety.md](safety.md#effect-and-undo-classes) defines the values, and [ops.md](ops.md) shows both for each operation.
 
-If an operation does not declare `undo`, the registry derives it from `effect`: `read` gives `none`, `reversible` gives `value`, and `create` and `destructive` give `checkpoint`. Many operations override the default. The server never uses Flame's own Undo, so `undoSteps` is 0 for writes.
+If an operation does not declare `undo`, the registry derives it from `effect`: `read` gives `none`, `reversible` gives `value`, and `create` and `destructive` give `checkpoint`. Many operations override the default. The server never uses Flame's own Undo; a write is taken back with `journal.revert`.
 
 ### Policy
 
@@ -320,7 +320,6 @@ Every tool returns one shape.
 | --- | --- |
 | `ok`, `result` | Success flag and the operation's value. A failed operation can still return a `result`. |
 | `affected`, `partial` | How many targets changed. `partial` counts what applied and what failed when only some did. An `ok` call can carry `partial` too, for example `plan.run` (`{done, failed, notRun}`) and `render.batch` (`{written, expected}`, when it checked the files). |
-| `undoSteps` | Always 0 for writes, because the server does not use Flame's Undo. |
 | `error`, `errorCode`, `hint`, `retryable`, `traceback` | The failure, in words and as a code. |
 | `pending`, `timeoutPhase` | A handle for a call that outlived its wait, and which phase it was in. |
 | `context` | The rider: project, workspace, and selection count. |
@@ -346,10 +345,11 @@ Three mechanisms keep a response small:
 
 With `FLAME_MCP_RESPONSE=compact`, the server rewrites each envelope before it returns it. Both the text and the structured content of the tool result carry the compact form.
 
-* A field that is null, `[]`, `{}`, or an empty string is not sent, so `affected` and `undoSteps` are missing when they are 0. `ok` is always sent. `execution` is sent only when `ok` is false. `context` is kept.
+* A field that is null, `[]`, `{}`, or an empty string is not sent, so `affected` is missing when it is 0. `ok` is always sent. `execution` is sent only when `ok` is false. `context` is kept.
 * Inside `result`, a member that is null is not sent, and a `wiretapId` equal to the id of the wiretap selector next to it is not sent.
 * Inside `result`, a list of 3 or more objects whose members are all plain values is sent as `{columns, rows}`. A nested object becomes dotted column names (`selector.id`), and a list of plain values can be a cell. Row *i* is the *i*-th object, and a null cell is a member that object did not have. Any other list keeps its form.
 * What sits under `revert`, `inverse`, and `args` is left as it is, because the assistant passes it back in a later call.
+* `flame_catalog(op=...)` without `detail` answers with `detail='args'` (argument shapes only) instead of `'full'`; an explicit `detail` is followed, and `result.detail` says which form came back. The tool descriptions and the listing's `note` change with the mode, and the `note` of an `'args'` answer says where the whole description is. A listing (no `op`) is the same in both modes.
 
 When the compact envelope is over the byte budget, the server applies the budget to the full envelope first and then makes the result compact. Making it compact first would turn the lists into tables that the budget no longer recognizes as lists, and the envelope would go to a spill file instead of having its lists replaced with a count.
 
@@ -403,6 +403,12 @@ The journal is a record of what the server attempted. It lives in `journal/journ
 A write whose undo is `value` runs as two round trips under a write lock. The server reads the current values first, appends the intent, and then sends the write with the values it expects. The generated code compares each value right before writing and writes nothing if one differs (`CONFLICT`). This also detects a change that a person makes in the Flame UI between the read and the write.
 
 If the write's answer never comes (`TIMEOUT`, `BRIDGE_LOST`, or `BRIDGE_UNAVAILABLE`), there is no outcome. The server refuses further non-read operations until `journal.check` has read Flame and decided whether the write landed. The server never retries a write on its own.
+
+### Loops and their groups
+
+`plan.for_each` is an operation of thread `server`: the loop runs in the server process, and for each item it sends each step through the ordinary call path (policy, defaults, journaled write, read-back). Flame receives one operation per step, as if the assistant had called them one by one. The generated code never holds a loop, so the rule that a write's script has no loop or comprehension stays as it is. A loop that writes takes the server's write lock for the whole run, so no other write or `journal.check` runs in between; a loop of reads does not.
+
+The journal holds two levels. The loop opens a parent group, which has a record of its own (the label, the keys and the step names) and holds no intent. Each item, or each step that has a revert of its own kind, writes into a child group, and the parent records the ids of its children in the order they ran. A checkpointed Timeline or Batch write is one group for a run of such steps in one item, with one checkpoint for each target. `journal.revert` on the parent walks its children newest first and calls the revert of each; `journal.revert` on a child works as it does for any group.
 
 ### Checkpoints
 

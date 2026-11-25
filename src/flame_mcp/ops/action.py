@@ -16,7 +16,7 @@ from typing import Any
 from flame_mcp import selectors
 from flame_mcp.node_prelude import ACTION_LINK_TYPES
 from flame_mcp.ops._attributes import attribute_requires, register_attribute_ops
-from flame_mcp.ops._common import build_source
+from flame_mcp.ops._common import build_source, raise_if_error
 from flame_mcp.ops._node_common import (
     CHECKPOINTED_NODE_NOTE,
     batch_of_action_node,
@@ -61,19 +61,6 @@ INNER_REQUIRES = (
 DEFAULT_LINK_TYPE = "Default"
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
-def _raise_if_error(code: str) -> str:
-    return "\n".join(
-        [
-            "if _result['error'] is not None:",
-            f"    raise _OpError(_result.get('errorCode') or {code!r}, _result['error'])",
-        ]
-    )
-
-
 def _list_to_python(args: Mapping[str, Any]) -> str:
     return build_source(
         selectors.resolve_code(args["target"], "target"),
@@ -87,7 +74,7 @@ def _create_to_python(args: Mapping[str, Any]) -> str:
         "\n".join(
             [
                 f"_result = _action_create_node(target, {args['type']!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -115,7 +102,7 @@ def _connect_to_python(args: Mapping[str, Any]) -> str:
             [
                 "_result = _action_connect(parent__node__batch, parent__node, parent, "
                 f"child__node__batch, child__node, child, {link!r})",
-                _raise_if_error("SILENT_NOOP"),
+                raise_if_error("SILENT_NOOP"),
             ]
         ),
     )
@@ -193,6 +180,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="action.create_node",
+            brief_paths=("created",),
             category="action",
             description=(
                 f"Create an inner node in an {ACTION_NODE_KINDS} node (PyActionNode."
@@ -225,7 +213,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_create_to_python,
-            undo_steps=_no_undo_steps,
             checkpoint=CheckpointSpec(
                 group_selector=lambda a: batch_of_node(a["target"]),
                 rebind=rebind_params(rebind_node, "target"),
@@ -238,6 +225,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="action.connect",
+            brief_paths=("action", "child", "parent", "linked"),
             category="action",
             description=(
                 "Link two inner nodes of the same Action node (PyActionNode.connect_nodes): "
@@ -287,7 +275,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("action_node",),
             to_python=_connect_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_connect_precheck,
             checkpoint=CheckpointSpec(
                 batch_arg="parent",

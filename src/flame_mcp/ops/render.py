@@ -13,7 +13,7 @@ from typing import Any
 
 from flame_mcp import selectors
 from flame_mcp.effective_effect import deny_destructive_call
-from flame_mcp.ops._common import build_source
+from flame_mcp.ops._common import batch_target_param, build_source
 from flame_mcp.registry import Registry
 from flame_mcp.render_plan import DEFAULT_MAX_FRAMES, run_plan
 from flame_mcp.render_run import (
@@ -22,7 +22,7 @@ from flame_mcp.render_run import (
     MAX_TIMEOUT_S,
     run_render,
 )
-from flame_mcp.types import Category, OperationParam, OperationSpec, Refusal
+from flame_mcp.types import Category, OperationParam, OperationSpec, PlanKind, PlanUse, Refusal
 
 CATEGORY = Category(
     name="render",
@@ -38,15 +38,6 @@ CATEGORY = Category(
     allowed_thread=frozenset({"main", "main-async"}),
     allowed_pacing=frozenset({"none"}),
 )
-
-
-def _target_param() -> OperationParam:
-    return OperationParam(
-        name="target",
-        type="selector",
-        description="A 'batch' selector (uid or name). The group need not be current.",
-        required=True,
-    )
 
 
 def _plan_to_python(args: Mapping[str, Any]) -> str:
@@ -79,10 +70,6 @@ def _batch_precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 PLAN_REQUIRES = (
     "PyBatch.nodes",
     "PyBatch.uid",
@@ -100,6 +87,17 @@ PLAN_REQUIRES = (
     "PyNode.sockets",
     "PyNode.attributes",
     "PyWriteFileNode.get_resolved_media_path",
+)
+
+
+_PLAN_USE_RENDER_BATCH = PlanUse(
+    PlanKind.KEEPS_OUTPUT,
+    refusal=(
+        "render.batch cannot be a plan step: a Foreground render occupies Flame for as long as "
+        "it runs (no MCP call gets through meanwhile) and its output -- files on disk, a clip in "
+        "the shelf reel -- cannot be undone, so it has no place in a group that journal.revert "
+        "is meant to put back; call it on its own"
+    ),
 )
 
 
@@ -136,7 +134,7 @@ def register(registry: Registry) -> None:
                 "render.batch of these frames occupies Flame while it runs."
             ),
             effect="read",
-            params=(_target_param(),),
+            params=(batch_target_param(),),
             accepts=("batch",),
             to_python=_plan_to_python,
             wrap=run_plan,
@@ -147,6 +145,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name="render.batch",
+            plan_use=_PLAN_USE_RENDER_BATCH,
             category="render",
             description=(
                 "Render a Batch group in the Foreground (PyBatch.render, works on a group that "
@@ -204,7 +203,7 @@ def register(registry: Registry) -> None:
             undo="unsupported",
             thread="main-async",
             params=(
-                _target_param(),
+                batch_target_param(),
                 OperationParam(
                     name="timeout_s",
                     type="number",
@@ -254,7 +253,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("batch",),
             to_python=_batch_to_python,
-            undo_steps=_no_undo_steps,
             precheck=_batch_precheck,
             wrap=run_render,
             requires=(*PLAN_REQUIRES, "PyBatch.render"),

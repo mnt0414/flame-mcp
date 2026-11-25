@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -161,7 +162,7 @@ def test_library_create_makes_an_empty_library_and_journals_it(rig: Rig) -> None
     assert result["name"] == "BACKUPS" and result["renamed"] is False
     assert result["selector"]["kind"] == "wiretap"
     assert "BACKUPS" in lib_names(rig)
-    assert env["execution"]["effect"] == "create" and env["undoSteps"] == 0
+    assert env["execution"]["effect"] == "create"
     intent, outcome = rig.records()
     assert intent["kind"] == "desktop_create" and intent["op"] == "library.create"
     assert intent["createKind"] == "library" and outcome["ok"] is True
@@ -272,7 +273,7 @@ def test_library_create_declaration() -> None:
     op = registry.get("library.create")
     assert op is not None
     assert (op.category, op.effect, op.thread, op.undo) == ("library", "create", "main", "value")
-    assert op.undo_steps({}, 1) == 0 and op.wrap is not None
+    assert op.wrap is not None
     for word in ("journal.revert", "plan.run", "allow_rename", "CONFLICT"):
         assert word in op.description, word
 
@@ -1106,7 +1107,7 @@ def test_an_early_refusal_of_a_write_still_tells_which_library_was_left_open(rig
     lib.close()
     lib.close_fails = True
 
-    def broken(record: dict[str, Any]) -> None:
+    def broken(record: Mapping[str, Any]) -> None:
         raise OSError("disk full")
 
     rig.journal.append = broken  # type: ignore[method-assign]

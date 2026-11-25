@@ -20,10 +20,10 @@ from typing import TYPE_CHECKING, Any, Final
 from flame_mcp.desktop_media_run import MEDIA_REVERT
 from flame_mcp.desktop_reorder_run import REORDER_OP
 from flame_mcp.desktop_revert import PreRevert, observe, revert_flow
-from flame_mcp.desktop_run import PHASE_ARG, PHASE_READ
+from flame_mcp.desktop_run import PHASE_READ
 from flame_mcp.journal import Index, IntentView
 from flame_mcp.reel_reorder import moves_to_reorder
-from flame_mcp.types import ServerResult
+from flame_mcp.types import PHASE_ARG, ServerResult
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -42,8 +42,8 @@ def _conflict(message: str, code: str = "CONFLICT") -> PreRevert:
 
 
 def _old_uids(ctx: ServerContext, view: IntentView) -> list[str] | None:
-    record = Index(ctx.journal.read_all().records).group_meta.get(view.group, {})
-    before = record.get("before")
+    record = Index(ctx.journal.read_all().records).group_meta.get(view.group)
+    before = record.get("before") if record is not None else None
     if isinstance(before, list) and all(isinstance(uid, str) for uid in before):
         return before
     return None

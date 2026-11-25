@@ -9,20 +9,15 @@ ok, verified false."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fake_media_tree import FakeAttr, PyClip, PySegment
 from journal_test_helpers import Rig
 from p33_helpers import REPLACE, a_seg, add_media_clip, clip_sel, seg_a
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import make_timeline_rig
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_timeline_rig)
 
 
 def replace(rig: Rig, clip: PyClip) -> dict[str, Any]:

@@ -10,9 +10,9 @@ from typing import Any, Final
 from flame_mcp import selectors
 from flame_mcp.desktop_run import (
     CREATED_ARG,
+    CREATED_WRITE_PHASES,
     EXPECTED_ARG,
     PHASE_ALIVE,
-    PHASE_ARG,
     PHASE_PROBE,
     PHASE_READ,
     PHASE_REVERT,
@@ -22,7 +22,15 @@ from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.ops._media_phases import alive_source, probe_source
 from flame_mcp.registry import Registry
 from flame_mcp.timeline_create_run import CREATE_SEQUENCE_OP, run_create_sequence
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 FRAME_RATES: Final[tuple[str, ...]] = (
     "23.976 fps",
@@ -77,10 +85,6 @@ _DESCRIPTION = (
     "the Timeline showed, the sequence shown before the call is opened again (result.reshown). "
     "Envelope journal = {group, id, revert}. Not allowed in plan.run."
 )
-
-
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
 
 
 def _to_python(args: Mapping[str, Any]) -> str:
@@ -154,10 +158,22 @@ _SAMPLE_ARGS: Final[Mapping[str, Any]] = {
 }
 
 
+_PLAN_USE_TIMELINE_CREATE_SEQUENCE = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "timeline.create_sequence cannot be a plan step: it journals a `desktop_sequence` intent "
+        "that is reverted by deleting the sequence it made (only while it is as made), and a "
+        "plan's single group is reverted by putting attribute values back -- it would skip such "
+        "an intent without saying so. Call it on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=CREATE_SEQUENCE_OP,
+            plan_use=_PLAN_USE_TIMELINE_CREATE_SEQUENCE,
             category="timeline",
             description=_DESCRIPTION,
             effect="create",
@@ -238,7 +254,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(*CREATED_WRITE_PHASES,),
             precheck=_precheck,
             wrap=run_create_sequence,
             sample_args=_SAMPLE_ARGS,

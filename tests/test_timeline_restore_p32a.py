@@ -10,7 +10,6 @@ fake Flame tree."""
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +18,7 @@ from flame_mcp import timeline_restore
 from flame_mcp.journal import Index
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     S1_WT,
@@ -38,10 +38,7 @@ from timeline_p32a_helpers import (
     wt,
 )
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_timeline_rig)
 
 
 def s1_in_reel(rig: Rig) -> list[Any]:

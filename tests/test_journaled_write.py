@@ -9,15 +9,15 @@ from typing import Any
 
 import pytest
 
+from flame_mcp.journal import JournalLink
+from flame_mcp.journaled_write import note_unresolved, outcome_not_journaled_note
 from flame_mcp.policy import Policy
 from flame_mcp.runtime import TestHooks, TestHooksConfigError
 from journal_test_helpers import COMP, DESKTOP_REEL_ID, REEL_WIRETAP, Rig, make_rig
+from rig_fixtures import rig_fixture
 from test_ops_attributes import ColourLabelAttr, add_attr
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def set_blend(rig: Rig, value: str = "Gimp") -> dict[str, Any]:
@@ -58,11 +58,35 @@ def test_records_are_intent_then_outcome_with_the_previous_and_written_values(ri
     assert rig.handles["comp"].blend_type.get_value() == "Gimp"
 
 
+def test_record_keys_are_written_in_a_fixed_order(rig: Rig) -> None:
+    set_blend(rig)
+    intent, outcome = rig.records()
+    assert list(intent) == [
+        "type", "id", "group", "ts", "op", "args", "target", "targetAfter", "readOp",
+        "before", "after",
+    ]  # fmt: skip
+    assert list(outcome) == [
+        "type", "id", "group", "ts", "ok", "applied", "changedKeys", "failed", "errorCode",
+        "readBack",
+    ]  # fmt: skip
+
+
+def test_a_link_adds_reverts_and_reverts_intent_after_the_intents_own_keys(rig: Rig) -> None:
+    first = set_blend(rig, "Gimp")
+    rig.runtime.call(
+        "node.set_attributes",
+        {"target": COMP, "values": {"blend_type": "Flame"}},
+        link=JournalLink("g_new", reverts=first["journal"]["group"], reverts_intent="i_x"),
+    )
+    revert = next(r for r in rig.records() if r["type"] == "intent" and r["group"] == "g_new")
+    assert list(revert)[-2:] == ["reverts", "revertsIntent"]
+    assert revert["reverts"] == first["journal"]["group"] and revert["revertsIntent"] == "i_x"
+
+
 def test_the_envelope_names_its_journal_records_and_keeps_the_revert(rig: Rig) -> None:
     env = set_blend(rig)
     assert set(env["journal"]) == {"group", "id"}
     assert env["result"]["revert"]["op"] == "node.set_attributes"
-    assert env["undoSteps"] == 0
     read = rig.do("node.get_attributes", {"target": COMP, "keys": ["blend_type"]})
     assert read["journal"] is None
 
@@ -85,7 +109,7 @@ def test_a_call_may_join_an_existing_group(rig: Rig) -> None:
     second = rig.runtime.call(
         "node.set_attributes",
         {"target": COMP, "values": {"blend_type": "Photoshop"}},
-        group=first["journal"]["group"],
+        link=JournalLink(first["journal"]["group"]),
     )
     assert second["journal"]["group"] == first["journal"]["group"]
     assert second["journal"]["id"] != first["journal"]["id"]
@@ -293,7 +317,12 @@ def test_an_outcome_that_cannot_be_written_closes_the_door_but_keeps_the_answer(
     monkeypatch.setattr(rig.journal, "append", failing_outcome)
     env = set_blend(rig)
     assert env["ok"] is True and any("outcome could not be journaled" in d for d in env["degraded"])
+    assert env["degraded"][-1] == (
+        "the outcome could not be journaled (disk full); the write's answer stands but this "
+        "server now refuses writes until journal.check has settled the intent"
+    )
     assert rig.runtime.guard.denial() is not None
+    assert [b.reason for b in rig.runtime.guard.blocked()] == ["JOURNAL_OUTCOME_NOT_WRITTEN"]
 
 
 @pytest.mark.parametrize("code", ["TIMEOUT", "BRIDGE_LOST", "BRIDGE_UNAVAILABLE"])
@@ -310,6 +339,7 @@ def test_a_write_that_ends_without_an_answer_leaves_an_open_intent_and_closes_th
     assert rig.records()[1]["errorCode"] == code
     blocked = rig.runtime.guard.blocked()
     assert len(blocked) == 1 and blocked[0].group == env["journal"]["group"]
+    assert blocked[0].reason == code
 
     denied = rig.do("node.set_attributes", {"target": COMP, "values": {"pos_x": 1.0}})
     assert denied["ok"] is False and denied["errorCode"] == "POLICY_DENIED"
@@ -591,3 +621,42 @@ def test_the_write_is_sent_with_the_values_that_were_read(rig: Rig) -> None:
     set_blend(rig)
     write_call = next(c for c in rig.exec.calls if c.label == "node.set_attributes")
     assert "'blend_type': 'Flame'" in write_call.code  # the expected previous value, in the code
+
+
+# -- the shared wording and the shared "no answer" closing --------------------------------------
+
+_TAIL = "this server now refuses writes until journal.check has settled the intent"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "text"),
+    [
+        ({}, f"the outcome could not be journaled (E); the write's answer stands but {_TAIL}"),
+        (
+            {"answer": "the run's answer"},
+            f"the outcome could not be journaled (E); the run's answer stands but {_TAIL}",
+        ),
+        (
+            {"answer": "the answer"},
+            f"the outcome could not be journaled (E); the answer stands but {_TAIL}",
+        ),
+        ({"answer": None}, f"the outcome could not be journaled (E); {_TAIL}"),
+        (
+            {"answer": "the answer", "outcome": "the outcome of targets[2]"},
+            f"the outcome of targets[2] could not be journaled (E); the answer stands but {_TAIL}",
+        ),
+    ],
+)
+def test_the_not_journaled_note_keeps_each_sites_wording(kwargs: dict[str, Any], text: str) -> None:
+    assert outcome_not_journaled_note("E", **kwargs) == text
+
+
+def test_note_unresolved_shuts_the_guard_then_records_the_intent_as_unresolved(
+    rig: Rig,
+) -> None:
+    env = {"errorCode": "TIMEOUT", "error": "late"}
+    note_unresolved(rig.runtime, "i1", "g1", env, "node.rename", "TIMEOUT")
+    (blocked,) = rig.runtime.guard.blocked()
+    assert (blocked.group, blocked.reason) == ("g1", "TIMEOUT")
+    (record,) = rig.records()
+    assert record["type"] == "unresolved" and record["errorCode"] == "TIMEOUT"

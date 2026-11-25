@@ -56,7 +56,6 @@ def make_registry_with_ops() -> Registry:
             description="d",
             effect="reversible",
             to_python=lambda a: "x = 1",
-            undo_steps=lambda a, n: 1,
         )
     )
     registry.register(
@@ -75,7 +74,6 @@ def make_registry_with_ops() -> Registry:
             description="d",
             effect="reversible",
             to_python=lambda a: "x = 1",
-            undo_steps=lambda a, n: 1,
         )
     )
     return registry

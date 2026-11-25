@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from flame_mcp import selectors
-from flame_mcp.desktop_run import EXPECTED_ARG, PHASE_ARG, PHASE_READ
+from flame_mcp.desktop_run import EXPECTED_ARG, PHASE_READ
 from flame_mcp.ops._common import build_source, raise_on_error_src
 from flame_mcp.registry import Registry
 from flame_mcp.render_clip_run import (
@@ -18,7 +18,16 @@ from flame_mcp.render_clip_run import (
     run_render_clip,
 )
 from flame_mcp.render_run import DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S
-from flame_mcp.types import OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    PHASE_ARG,
+    OperationParam,
+    OperationSpec,
+    PhaseSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 _ACCEPTS: tuple[SelectorKind, ...] = ("wiretap", "path", "selection")
 
@@ -66,10 +75,6 @@ _DESCRIPTION = (
 )
 
 
-def _no_undo_steps(args: Mapping[str, Any], affected: int) -> int:
-    return 0
-
-
 def _to_python(args: Mapping[str, Any]) -> str:
     resolve = selectors.resolve_code(args["target"], "target")
     mode = args.get("render_mode", "All")
@@ -100,10 +105,22 @@ def _precheck(args: Mapping[str, Any], policy: Any) -> Refusal | None:
     return None
 
 
+_PLAN_USE_RENDER_CLIP = PlanUse(
+    PlanKind.KEEPS_OUTPUT,
+    refusal=(
+        "render.clip cannot be a plan step: a Foreground render occupies Flame for as long as it "
+        "runs (no MCP call gets through meanwhile) and the Timeline FX it renders cannot be "
+        "undone, so it has no place in a group that journal.revert is meant to put back; call it "
+        "on its own"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=OP_NAME,
+            plan_use=_PLAN_USE_RENDER_CLIP,
             category="render",
             description=_DESCRIPTION,
             effect="create",
@@ -165,7 +182,7 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_to_python,
-            undo_steps=_no_undo_steps,
+            phases=(PhaseSpec(PHASE_READ),),
             precheck=_precheck,
             wrap=run_render_clip,
             requires=(

@@ -13,7 +13,7 @@ from typing import Any, Final
 
 from flame_mcp import selectors, setup_edit
 from flame_mcp.ops._common import build_source, raise_on_error_src
-from flame_mcp.ops._segment_edit import no_undo_steps, segment_target_param
+from flame_mcp.ops._segment_edit import segment_target_param
 from flame_mcp.ops._setup_edit import work_root
 from flame_mcp.ops.node_writes import NODE_REQUIRES
 from flame_mcp.ops.segment_effects import EFFECT_REQUIRES
@@ -140,7 +140,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("segment",),
             to_python=_segment_to_python,
-            undo_steps=no_undo_steps,
             precheck=tags_precheck,
             requires=("PyTimelineFX.save_setup", *EFFECT_REQUIRES),
         )
@@ -166,7 +165,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=("node",),
             to_python=_node_to_python,
-            undo_steps=no_undo_steps,
             precheck=tags_precheck,
             requires=("PyNode.save_node_setup", *NODE_REQUIRES),
         )

@@ -338,7 +338,7 @@ def test_the_intent_names_the_op_and_the_sequence(rig: Rig) -> None:
     assert view.intent["op"] == OVERWRITE and view.intent["kind"] == "overwrite"
     assert view.intent["args"]["at"] == 20 and view.intent["target"] == wt(S1_WT)
     assert view.outcome is not None and view.outcome["ok"] is True
-    assert env["execution"]["undo"] == "checkpoint" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "checkpoint"
 
 
 def test_a_track_cut_makes_the_frame_the_first_one_of_the_right_part(rig: Rig) -> None:

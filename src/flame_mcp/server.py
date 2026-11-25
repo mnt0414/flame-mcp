@@ -21,29 +21,43 @@ import platform
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Final, get_args
+from typing import Any, Final
 
 import anyio
 import mcp_types as types
 from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 
+from flame_mcp import agent_context, still_proxy, transport
 from flame_mcp import compact as compact_mod
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import opschema, selectors, still_proxy, transport
 from flame_mcp import policy as policy_mod
-from flame_mcp import registry as registry_mod
+from flame_mcp.catalog import (
+    CATALOG_DETAIL_PARAM_DESCRIPTION,
+    CATALOG_DETAIL_PARAM_DESCRIPTION_COMPACT,
+    CATALOG_DETAILS,
+    CATALOG_OMITTED_NOTE,
+    CATALOG_TOOL_DESCRIPTION,
+    CATALOG_TOOL_DESCRIPTION_COMPACT,
+    MAX_CATALOG_OPS,
+    catalog_detail_note,
+    catalog_entry,
+    catalog_invalid_args,
+    catalog_listing_note,
+    suggest_unknown_operation,
+    unknown_operation_message,
+)
 from flame_mcp.compact import ResponseMode
 from flame_mcp.execution import V_HELPER
 from flame_mcp.journal import Journal
+from flame_mcp.loop_limits import DEFAULT_LOOP_LIMITS, LoopLimits
 from flame_mcp.policy import Policy, deny_category, deny_operation, deny_tool
-from flame_mcp.registry import RegisteredOperation, Registry
+from flame_mcp.registry import Registry
 from flame_mcp.runtime import Runtime, TestHooks
 from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import NO_DEFAULT, SelectorKind
 from flame_mcp_bridge.impl import BRIDGE_ABI
 
-SERVER_VERSION: Final[str] = "0.4.0"
+SERVER_VERSION: Final[str] = "0.5.0"
 TESTED_FLAME_VERSIONS: Final[tuple[str, ...]] = ("2025.2.4", "2026.2.3")
 
 TOOL_VERSION_INFO: Final[str] = "flame_version_info"
@@ -74,6 +88,9 @@ INSTRUCTIONS: Final[str] = "\n".join(
         "desktop.delete, desktop.reformat (in place), journal.revert force=true, "
         "journal.restore_checkpoint, batch.load_setup, batch.delete, eval.run), ask the user to "
         "confirm.",
+        "To run the same steps for each item of a list, use plan.for_each, not one call per item.",
+        "For a write loop, show the user the dry_run list and wait for the answer before you "
+        "approve.",
     ]
 )
 
@@ -195,86 +212,7 @@ def _tool_result(
     )
 
 
-CATALOG_LISTING_NOTE: Final[str] = (
-    "Details of one operation (arguments, sources, selector fields, full description): "
-    "flame_catalog(op=<name>). Selector syntax: flame_context's selectorVocabulary. "
-    "In params, a trailing * marks a required argument."
-)
-
-
-def _catalog_entry(
-    op: RegisteredOperation, policy: Policy, *, detailed: bool = False
-) -> dict[str, Any]:
-    """Returns one operation as flame_catalog lists it.
-
-    A LISTING (all operations, or a category) is
-    compact -- name, category, effect, undo, a one-sentence summary, argument names (`*` =
-    required) and the accepted selector kind names -- so the whole catalog stays far below the
-    response budget as operations are added. `detailed` (flame_catalog(op=...)) is the full
-    description: argument types, sources for thread / pacing, selector fields and example. The
-    selector vocabulary is also in flame_context's `selectorVocabulary`, once.
-    """
-    entry: dict[str, Any]
-    if not detailed:
-        entry = {
-            "name": op.name,
-            "category": op.category,
-            "effect": op.effect,
-            "undo": op.undo,
-            "summary": opschema.first_sentence(op.description),
-            "params": opschema.compact_params(op.params),
-            "accepts": list(op.accepts),
-        }
-    else:
-        entry = {
-            "name": op.name,
-            "category": op.category,
-            "description": op.description,
-            "params": {
-                "summary": opschema.summarize_params(op.params),
-                "details": [
-                    {
-                        "name": param.name,
-                        "type": param.type,
-                        "description": param.description,
-                        "required": param.required,
-                        "nullable": param.nullable,
-                        "default": None if param.default is NO_DEFAULT else param.default,
-                        "integer": param.integer,
-                        "minimum": param.minimum,
-                        "itemType": param.item_type,
-                        "enum": None if param.enum is None else list(param.enum),
-                    }
-                    for param in op.params
-                ],
-            },
-            "effect": op.effect,
-            "effectLabel": policy_mod.effect_label(op.effect),
-            "undo": op.undo,
-            "undoLabel": policy_mod.undo_label(op.undo),
-            "thread": op.thread,
-            "threadSource": op.sources.get("thread"),
-            "pacing": op.pacing,
-            "pacingSource": op.sources.get("pacing"),
-            "accepts": [selectors.describe_kind(kind) for kind in op.accepts],
-            "defaultLimit": op.default_limit,
-            "maxLimit": op.max_limit,
-        }
-    return entry
-
-
-def _suggest_unknown_operation(registry: Registry, op_name: str) -> dict[str, Any]:
-    names = [op.name for op in registry.list_ops()]
-    suggestion = opschema.suggest_name(op_name, names)
-    message = f"no operation named '{op_name}' is registered"
-    if suggestion is not None:
-        message += f" (did you mean '{suggestion}'?)"
-    return envelope_mod.from_pre_bridge_error(
-        error=message,
-        error_code="UNKNOWN_OPERATION",
-        op=None,
-        duration_ms=0,
-    )
+CATALOG_RESULT_BUDGET_BYTES: Final[int] = 50_000
 
 
 def _flame_do_input_schema(registry: Registry, policy: Policy) -> dict[str, Any]:
@@ -299,7 +237,12 @@ def _flame_do_input_schema(registry: Registry, policy: Policy) -> dict[str, Any]
     }
 
 
-def _tool_definitions(registry: Registry, policy: Policy) -> list[types.Tool]:
+def _tool_definitions(
+    registry: Registry,
+    policy: Policy,
+    response_mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
+) -> list[types.Tool]:
+    is_compact = response_mode == "compact"
     for name, blocked in _TOOL_BLOCKED_IN_READONLY.items():
         # Structural checkpoint (the tool-registration place of the three-places rule):
         # it denies nothing for these 4 tools, but registration runs every name
@@ -318,11 +261,7 @@ def _tool_definitions(registry: Registry, policy: Policy) -> list[types.Tool]:
         types.Tool(
             name=TOOL_CATALOG,
             description=(
-                "List the operations visible under the current policy, compactly: name, category, "
-                "effect, undo, one-sentence summary, argument names (* = required) and accepted "
-                "selector kinds. Pass `category` to list one category, or `op` for one "
-                "operation's full description (argument types, thread / pacing, selector fields "
-                "and example, full text). Selector syntax: flame_context's selectorVocabulary."
+                CATALOG_TOOL_DESCRIPTION_COMPACT if is_compact else CATALOG_TOOL_DESCRIPTION
             ),
             input_schema={
                 "type": "object",
@@ -332,8 +271,27 @@ def _tool_definitions(registry: Registry, policy: Policy) -> list[types.Tool]:
                         "description": "Restrict the listing to one category.",
                     },
                     "op": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": MAX_CATALOG_OPS,
+                            },
+                        ],
+                        "description": (
+                            "Describe one operation by name, or up to 10 operations as a list."
+                        ),
+                    },
+                    "detail": {
                         "type": "string",
-                        "description": "Describe exactly one operation by name.",
+                        "enum": list(CATALOG_DETAILS),
+                        "description": (
+                            CATALOG_DETAIL_PARAM_DESCRIPTION_COMPACT
+                            if is_compact
+                            else CATALOG_DETAIL_PARAM_DESCRIPTION
+                        ),
                     },
                 },
                 "additionalProperties": False,
@@ -356,255 +314,6 @@ def _tool_definitions(registry: Registry, policy: Policy) -> list[types.Tool]:
             annotations=_READ_ONLY_ANNOTATIONS,
         ),
     ]
-
-
-PITFALLS: Final[tuple[Mapping[str, str], ...]] = (
-    {
-        "text": "A Batch setup does not contain the Timeline FX of the clips in the group's reels: "
-        "loading the setup again (journal.revert, journal.restore_checkpoint) can bring a clip "
-        "back without them. Every clip whose Timeline FX were changed or rendered while it was "
-        "in the group came back without them; a clip that was only copied in can lose them too. "
-        "result.timelineFxLost lists the clips that lost theirs; "
-        "add the original clip from the Desktop again (batch.add_clips).",
-    },
-    {
-        "text": "Do not save or load the setup of a Timeline FX (save_setup / load_setup) in the "
-        "same Flame call as a smart_replace_media of its segment. Measured with a Timewarp: "
-        "after that, every clip put on a sequence made later in the session got an extra Image "
-        "effect (seen on Flame 2025.2.4 and 2026.2.3), and Flame 2025.2.4 later "
-        "hung or crashed in save_setup. The same steps as separate calls (plan.run steps are "
-        "separate calls) changed nothing on either version. A replace also shifts the "
-        "Timewarp's timing by the length of the head, so save its setup before and load it "
-        "after, each as its own call (segment.effect_save_setup, segment.effect_load_setup).",
-    },
-    {
-        "text": "smart_replace (segment.replace mode=media_and_fx) drops the segment's effects "
-        "when the replacing media has none of its own (a Resize that Flame added by itself "
-        "because of a bit depth difference stays: measured on Flame 2026.2.3). To keep them "
-        "use mode=media (smart_replace_media).",
-    },
-    {
-        "text": "A sequence whose bit depth differs from its media gets a Resize on those segments "
-        "from Flame, automatically. On Flame 2026.2.3, Flame refused to delete that Resize; on "
-        "every version segment.delete_effect refuses it up front, for safety. "
-        "timeline.create_sequence takes bit_depth (8, 10, 12, 16 or 32) so a "
-        "sequence can be made with the bit depth of its media; left out, the project's default "
-        "applies and it differs per project.",
-    },
-    {
-        "text": "replace on an Unlinked Video segment (from an EDL) matches by offset from the "
-        "clip start, not by source timecode: replace, then slip by the difference to line up "
-        "TC. On a linked 8K DPX segment (Flame 2025.2.4) it matched by source timecode, and "
-        "refused with 'Invalid source_clip' a clip whose range does not contain the segment's "
-        "source range (a 1-frame clip is always accepted); see segment.replace.",
-    },
-    {
-        "text": "PyTime(int) is relative (the sequence start is frame 1). "
-        "An absolute position is PyTime(frame, fps) or PyTime(timecode, fps).",
-    },
-    {
-        "text": "A PyAttribute.set_value write may not be put on Ctrl+Z history (seen on the name "
-        "of a reel on the Desktop and on a Batch node attribute: Ctrl+Z removed an earlier, "
-        "unrelated operation). Do not undo it with Ctrl+Z. Read it back; revert with "
-        "journal.revert.",
-    },
-    {
-        "text": "create_batch_group moves the current Batch group. Deleting the current Batch "
-        "group moves current to an unpredictable other group.",
-    },
-    {
-        "text": "Deleting a Batch schematic reel that holds clips also deletes the Clip nodes that "
-        "reference it. desktop.delete refuses a reel (Desktop or Batch) that holds a clip or a "
-        "sequence for the same reason; it deletes only an empty schematic reel of a Batch group, "
-        "and never the last one of a group.",
-    },
-    {
-        "text": "desktop.delete refuses a Batch group. batch.delete deletes one after saving its "
-        "setup (result.setupPath); load it into a new Batch group with batch.load_setup to get "
-        "the nodes back (not shelf reels, iterations or empty reels). It refuses the current or "
-        "an open group (allow_current), a group whose reels or iterations hold anything "
-        "(allow_content_loss) and a name that differs from expect_name. journal.revert cannot "
-        "put a deleted group back.",
-    },
-    {
-        "text": "desktop.sync_record_tc writes only the clips it can judge: a row is synced, "
-        "in_sync or skipped with a reason (several segments, a Gap before the media, a "
-        "frame-rate difference, a DPX source, a source with no Source TC). journal.revert writes "
-        "the earlier Record TC back.",
-    },
-    {
-        "text": "render.export of a sequence reads the colour space of every segment first "
-        "(timeline.colour_spaces). A sequence that is mixed, or whose colour spaces could not all "
-        "be read, is refused with PRECONDITION_UNMET; skip_colour_check=true exports anyway.",
-    },
-    {
-        "text": "shared_source_segments() does not return copies inside a library "
-        "(from the desktop it returns desktop copies only).",
-    },
-    {
-        "text": "Deleting the displayed sequence can leave the Timeline empty "
-        "(flame.timeline.clip is None); in other runs it went back to a sequence shown "
-        "before it within 3 s.",
-    },
-    {
-        "text": "In at least one project, a sequence copy moved the Timeline to the new copy. "
-        "This server reads what the Timeline shows before and after every sequence copy it "
-        "makes (checkpoints, desktop.copy, desktop.duplicate) and opens what was shown before "
-        "again when it changed (result.display).",
-    },
-    {
-        "text": "trim_head / trim_tail / slip return False even when they worked. "
-        "Judge by reading the segment back.",
-    },
-    {
-        "text": "cut outside the sequence and replace with a shorter clip raise nothing "
-        "and change nothing.",
-    },
-    {
-        "text": "An audio segment is listed only through seq.audio_tracks[].channels[].segments "
-        "(PyAudioTrack has no .segments). timeline.list_segments with media='audio' lists them; "
-        "no op of this server selects one: the segment selector reads the video tracks only.",
-    },
-    {
-        "text": "PySegment.smart_replace_media on an audio segment crashed Flame (signal 11; "
-        "Flame 2025.2.4). To replace audio, use timeline.overwrite with a clip that has audio.",
-    },
-    {
-        "text": "PySegment.trim_tail on an audio segment turned the audio into a Gap, with ripple "
-        "True and with ripple False (Flame 2025.2.4). To shorten a sequence, cut the audio and "
-        "Gap tracks at the end frame and extract the tail pieces: timeline.shorten does that.",
-    },
-    {
-        "text": "timeline.overwrite of a clip that has audio replaced the audio of the sequence "
-        "even where the video segment already held the same source and did not change (Flame "
-        "2025.2.4). The fingerprint behind SILENT_NOOP and journal.changed does not see audio; "
-        "timeline.overwrite, insert, cut, delete_segments, move_track and shorten read the audio "
-        "tracks on their own and report them in result.audio, and a call that changed only the "
-        "audio is not a SILENT_NOOP.",
-    },
-    {
-        "text": "PySequence.extract_selection_to_media_panel (what timeline.delete_segments with "
-        "ripple and timeline.shorten call) sets the length of the sequence to the end of the "
-        "longest content of ANY video track or audio channel (a Gap is not content) and makes the "
-        "Gap at the end of every track follow it, also on tracks that were not selected (Flame "
-        "2025.2.4). Deleting the last content of the longest track can therefore make "
-        "the whole sequence shorter and shorten the Gap at the end of the other tracks and of the "
-        "audio; a track that ends in content at the new end has no Gap. The content of the other "
-        "tracks does not move.",
-    },
-    {
-        "text": "No method that moves or reorders a track was found on PySequence, PyVersion, "
-        "PyTrack or PyAudioTrack (Flame 2025.2.4, measured by listing them). To move a video "
-        "track use timeline.move_track, which rebuilds it. No method to move or reorder audio "
-        "tracks was found either. Moving a video track "
-        "of a sequence with sound (measured with 2 to 4 video tracks and one audio track of 2 "
-        "channels), also the track the audio clip was laid on, left the audio rows as they were "
-        "(Flame 2025.2.4).",
-    },
-    {
-        "text": "Flame can crash on a 2-byte character. Every string sent to it (names, paths, "
-        "eval.run code) must be ASCII; anything else is refused with INVALID_ARGS before "
-        "it is sent.",
-    },
-)
-
-
-def _static_context(registry: Registry) -> dict[str, Any]:
-    return {
-        "undoContract": (
-            "Revert with journal.revert(group): the group is in the response's `journal`. Do not "
-            "press Ctrl+Z. Every writing op reports undoSteps=0 -- this server does not use "
-            "Flame's Undo -- and Flame's Undo has two faults here. A set_value "
-            "write may not be put on its history (seen on the name of a reel on the Desktop "
-            "and on a Batch node attribute: Ctrl+Z removed an earlier, unrelated operation "
-            "instead), so never take a write back with Ctrl+Z; use journal.revert. And the "
-            "journal does not know about a Ctrl+Z: after one, a later journal.revert can come "
-            "back CONFLICT or alreadyGone. "
-            "Writes of attribute values are journaled: the envelope's `journal` ({group, id}) "
-            "names the record, journal.list / journal.show read it, and journal.revert(group) "
-            "puts the previous values back -- only while each still holds what the write left. "
-            "A write whose value changed between the server's read and its write is refused "
-            "with errorCode CONFLICT (nothing written); the response's `revert` field is a "
-            "ready-to-call op + args. "
-            "Batch writes that run behind an automatic checkpoint (a destructive eval.run, "
-            "batch.load_setup, batch.create_reel / add_clips / organize) hand back `journal` = "
-            "{group, id, checkpoint, revert}: journal.revert(group) restores the checkpoint "
-            "while the group's fingerprint (nodes, wiring and the inner nodes of Action / "
-            "Image / GMask Tracer nodes) is still the one the call left; what a restore does "
-            "not bring back is in each op's description. batch.create_shelf_reel and "
-            "batch.iterate cannot be reverted (shelf reels and iterations are outside a setup). "
-            "desktop.create, desktop.copy, mediahub.import, desktop.duplicate, desktop.move, "
-            "segment.copy_to_media_panel and segment.match hand back `journal` = {group, id, "
-            "revert}: journal.revert(group) deletes what they made, only while it is still as "
-            "made (a create: still empty; a copy, an import, a duplicate or a clip taken out of "
-            "a segment: the same name, duration and content), else CONFLICT and nothing is "
-            "deleted; for desktop.move it moves the things back (they get new uids again). "
-            "library.create has the same journal and revert: it deletes the library only while "
-            "it is empty. desktop.arrange is one journal group of one desktop.copy / "
-            "desktop.move intent per item, and journal.revert(group) puts the items back "
-            "newest first. desktop.reorder is one journal group of one desktop.move, and "
-            "journal.revert(group) moves the entries back into the old order (new uids again). "
-            "desktop.copy of a Batch group (into a library, or back from a "
-            "library onto the Desktop) deletes the copy only while it is as made (in a "
-            "library its name and reels; on the Desktop also its nodes, connections and node "
-            "attribute values), and before it deletes a group on the Desktop it saves the "
-            "group's setup as a checkpoint (result.savedSetups: path and how to bring it "
-            "back). A closed library reads as empty, so any call whose selectors (a wiretap "
-            "id, the first name of a path) or recorded entries name one opens it first and "
-            "closes it again afterwards (result.librariesOpened and a note); a library that "
-            "cannot be opened, or whose state cannot be read, stops the call "
-            "(PRECONDITION_UNMET) before anything is done. "
-            "Library contents are never deleted or moved out by this server: desktop.delete "
-            "refuses a clip or sequence inside a library and desktop.move refuses a source "
-            "inside one (desktop.copy takes something out of a library); desktop.rename and "
-            "desktop.set_attributes (and segment.set_attributes) refuse a library and what is "
-            "inside one (PRECONDITION_UNMET, nothing written or journaled); only the revert of "
-            "its own write and journal.purge_checkpoints remove anything there. A write to a "
-            "sequence's segments (segment.trim, slip, replace, "
-            "create_effect, delete_effect, set_effect, effect_load_setup, edit_effect_setup, "
-            "timeline.delete_segments, timeline.move_track and timeline.shorten) runs behind a "
-            "checkpoint of the whole sequence (timeline.checkpoint: a copy in the stash "
-            "library flame_mcp_checkpoints) and hands back `journal` = {group, id, checkpoint, "
-            "stash, display, revert}: journal.revert(group) restores the copy while the "
-            "sequence still has the fingerprint the call left; the restored sequence has a new "
-            "uid and "
-            "wiretap id and sits at the end of its reel (result.restored.selector). A plan.run "
-            "that holds such a write is one checkpointed write on one sequence: one copy, one "
-            "journal.revert for the whole plan; a plan.run that holds a Batch write behind a "
-            "checkpoint (node.create, node.connect, batch.create_reel ...) is the same on one "
-            "Batch group (batch.iterate and batch.create_shelf_reel cannot be a step). "
-            "desktop.delete copies what it deletes "
-            "into the same stash first and journal.revert(group) copies it back (new uid, end "
-            "of the "
-            "reel). desktop.reformat stashes each clip it reformats in place the same way, and "
-            "journal.revert(group) restores the stashed copy (new uid, end of the reel; with "
-            "duplicate=true it deletes the copy instead). "
-            "journal.purge_checkpoints deletes stashed copies the journal records "
-            "(dry_run by default; a real run needs the token of the dry run just before); a "
-            "purged copy cannot be restored. "
-            "segment.effect_save_setup only writes setup files (undo none: delete them by hand). "
-            "segment.create_connection, remove_connection and sync_connections each write an "
-            "intent to the journal but have no revert (journal.revert refuses them, and a "
-            "checkpoint of the target's sequence does not cover connected segments in other "
-            "sequences); result.inverse is a presumed inverse call. They are judged by a "
-            "read-back: no change is SILENT_NOOP, a change the wrong way is FLAME_API_ERROR. After "
-            "TIMEOUT or BRIDGE_LOST the server refuses writes until journal.check has read "
-            "segment.connections again (create and remove: landed / not_landed / diverged; "
-            "sync: always diverged, compare the segments by hand). "
-            "segment.replace on a segment that has connected segments replaces theirs too, "
-            "and journal.revert does not put those back (result.notices says how many)."
-        ),
-        "threadContract": (
-            "Every Flame API call happens on Flame's own main thread via "
-            "schedule_idle_event, reached only through the bridge; this server never "
-            "imports or calls the Flame API itself."
-        ),
-        "selectorVocabulary": [selectors.describe_kind(kind) for kind in get_args(SelectorKind)],
-        "defaultLimit": registry_mod.DEFAULT_LIMIT,
-        "maxLimit": registry_mod.MAX_LIMIT,
-        "categories": list(registry.list_categories()),
-        "pitfalls": [dict(pitfall) for pitfall in PITFALLS],
-    }
 
 
 def _flame_version_info_sync(runtime: Runtime) -> dict[str, Any]:
@@ -657,18 +366,106 @@ def _flame_version_info_sync(runtime: Runtime) -> dict[str, Any]:
     return env
 
 
+def _catalog_by_names(
+    registry: Registry,
+    policy: Policy,
+    names: list[str],
+    detail: str,
+    started: float,
+) -> dict[str, Any]:
+    entries: list[tuple[str, dict[str, Any]]] = []
+    unavailable: list[dict[str, Any]] = []
+    for name in dict.fromkeys(names):
+        op = registry.get(name)
+        if op is None:
+            message, suggestion = unknown_operation_message(registry, name)
+            row: dict[str, Any] = {
+                "name": name,
+                "errorCode": "UNKNOWN_OPERATION",
+                "error": message,
+            }
+            if suggestion is not None:
+                row["suggestion"] = suggestion
+            unavailable.append(row)
+            continue
+        denial = deny_operation(op, policy)
+        if denial is not None:
+            row = {"name": name, "errorCode": "POLICY_DENIED", "error": denial.message}
+            if denial.hint is not None:
+                row["hint"] = denial.hint
+            unavailable.append(row)
+            continue
+        entries.append((name, catalog_entry(op, detailed=True, detail=detail)))
+    if not entries:
+        message = "none of the requested operations is available: " + "; ".join(
+            row["error"] for row in unavailable
+        )
+        if all(row["errorCode"] == "POLICY_DENIED" for row in unavailable):
+            return envelope_mod.from_pre_bridge_error(
+                error=message,
+                error_code="POLICY_DENIED",
+                op=None,
+                duration_ms=elapsed_ms(started),
+                hint=unavailable[0].get("hint"),
+            )
+        return catalog_invalid_args(message, started)
+    result: dict[str, Any] = {
+        "categories": list(registry.list_categories()),
+        "detail": detail,
+        "note": catalog_detail_note(detail),
+        "operations": [],
+    }
+    if unavailable:
+        result["unavailable"] = unavailable
+    for index, (_, entry) in enumerate(entries):
+        result["operations"].append(entry)
+        if index > 0 and envelope_mod.byte_len(result) > CATALOG_RESULT_BUDGET_BYTES:
+            result["operations"].pop()
+            result["omitted"] = [name for name, _ in entries[index:]]
+            result["omittedNote"] = CATALOG_OMITTED_NOTE
+            break
+    return envelope_mod.build_envelope(ok=True, result=result, duration_ms=elapsed_ms(started))
+
+
 def _flame_catalog_sync(
     registry: Registry,
     policy: Policy,
     category: str | None,
-    op_name: str | None,
+    op_name: Any,
+    detail: Any = None,
+    response_mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
 ) -> dict[str, Any]:
     started = time.monotonic()
+
+    if detail is None:
+        detail = "args" if response_mode == "compact" and op_name is not None else "full"
+    if detail not in CATALOG_DETAILS:
+        return catalog_invalid_args(
+            f"'detail' must be one of {list(CATALOG_DETAILS)}, got {detail!r}", started
+        )
+    if detail == "args" and op_name is None:
+        return catalog_invalid_args(
+            "detail='args' needs 'op'; the listing is already compact", started
+        )
+
+    if isinstance(op_name, list):
+        if not 1 <= len(op_name) <= MAX_CATALOG_OPS or not all(
+            isinstance(name, str) for name in op_name
+        ):
+            return catalog_invalid_args(
+                f"'op' as a list must hold 1 to {MAX_CATALOG_OPS} operation names (strings)",
+                started,
+            )
+        return _catalog_by_names(registry, policy, op_name, detail, started)
+    if op_name is not None and not isinstance(op_name, str):
+        return catalog_invalid_args(
+            "'op' must be an operation name or a list of operation names", started
+        )
 
     if op_name is not None:
         op = registry.get(op_name)
         if op is None:
-            env = _suggest_unknown_operation(registry, op_name)
+            env = suggest_unknown_operation(registry, op_name)
             env["durationMs"] = elapsed_ms(started)
             return env
         denial = deny_operation(op, policy)
@@ -682,7 +479,9 @@ def _flame_catalog_sync(
             )
         by_name_result: dict[str, Any] = {
             "categories": list(registry.list_categories()),
-            "operation": _catalog_entry(op, policy, detailed=True),
+            "detail": detail,
+            "note": catalog_detail_note(detail),
+            "operation": catalog_entry(op, detailed=True, detail=detail),
         }
         return envelope_mod.build_envelope(
             ok=True, result=by_name_result, duration_ms=elapsed_ms(started)
@@ -702,9 +501,9 @@ def _flame_catalog_sync(
             op for op in registry.list_ops(category) if deny_operation(op, policy) is None
         ]
         by_category_result: dict[str, Any] = {
-            "note": CATALOG_LISTING_NOTE,
+            "note": catalog_listing_note(response_mode),
             "categories": list(registry.list_categories()),
-            "operations": [_catalog_entry(op, policy) for op in category_ops],
+            "operations": [catalog_entry(op) for op in category_ops],
         }
         return envelope_mod.build_envelope(
             ok=True, result=by_category_result, duration_ms=elapsed_ms(started)
@@ -712,9 +511,9 @@ def _flame_catalog_sync(
 
     visible = policy_mod.visible_ops(registry, policy)
     all_result: dict[str, Any] = {
-        "note": CATALOG_LISTING_NOTE,
+        "note": catalog_listing_note(response_mode),
         "categories": list(registry.list_categories()),
-        "operations": [_catalog_entry(op, policy) for op in visible],
+        "operations": [catalog_entry(op) for op in visible],
     }
     return envelope_mod.build_envelope(ok=True, result=all_result, duration_ms=elapsed_ms(started))
 
@@ -738,7 +537,7 @@ def _flame_context_sync(
     run_dir: Path | None,
     mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
 ) -> dict[str, Any]:
-    static = _static_context(registry)
+    static = agent_context.static_context(registry)
     if mode == "compact":
         static["responseFormat"] = compact_mod.RESPONSE_FORMAT
     br = transport.exec(
@@ -796,6 +595,7 @@ def create_server(
     hooks: TestHooks | None = None,
     permissions: dict[str, Any] | None = None,
     response_mode: ResponseMode = compact_mod.DEFAULT_RESPONSE_MODE,
+    loop_limits: LoopLimits = DEFAULT_LOOP_LIMITS,
 ) -> Server[Any]:
     runtime = Runtime(
         registry=registry,
@@ -804,12 +604,14 @@ def create_server(
         run_dir=run_dir,
         hooks=hooks if hooks is not None else TestHooks(),
         permissions=permissions,
+        response_mode=response_mode,
+        loop_limits=loop_limits,
     )
 
     async def on_list_tools(
         _ctx: Any, _params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=_tool_definitions(registry, policy))
+        return types.ListToolsResult(tools=_tool_definitions(registry, policy, response_mode))
 
     async def on_call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         name = params.name
@@ -819,7 +621,13 @@ def create_server(
             return _tool_result(env, response_mode)
         if name == TOOL_CATALOG:
             env = await anyio.to_thread.run_sync(
-                _flame_catalog_sync, registry, policy, args.get("category"), args.get("op")
+                _flame_catalog_sync,
+                registry,
+                policy,
+                args.get("category"),
+                args.get("op"),
+                args.get("detail"),
+                response_mode,
             )
             return _tool_result(env, response_mode)
         if name == TOOL_DO:

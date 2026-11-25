@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
-from typing import assert_never, get_args
+from typing import Final, assert_never, get_args
 
 from flame_mcp.types import ErrorCode
+
+PARTIAL_PREFIX: Final[str] = "partial:"
+"""What a Flame-side message starts with when the call changed part of what it was asked to (the
+prelude writes it; the op descriptions quote it)."""
+
+
+def is_partial_message(message: str | None) -> bool:
+    return (message or "").startswith(PARTIAL_PREFIX)
+
+
+def without_partial_prefix(message: str) -> str:
+    return message.removeprefix(f"{PARTIAL_PREFIX} ")
 
 
 def as_error_code(code: str | None) -> ErrorCode:

@@ -58,13 +58,21 @@ from typing import TYPE_CHECKING, Any, Final
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
 from flame_mcp.desktop_media_run import MOVE_OP
-from flame_mcp.desktop_run import COPY_OP, MAX_SOURCES, PHASE_ARG, PHASE_READ, pre_read_failure
+from flame_mcp.desktop_run import (
+    COPY_OP,
+    MAX_SOURCES,
+    PHASE_READ,
+    entry_rows,
+    open_group,
+    pre_read_failure,
+    read_destination,
+)
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import new_id, now_iso
+from flame_mcp.journal import JournalLink, new_id
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
-from flame_mcp.types import ErrorCode
+from flame_mcp.types import PHASE_ARG
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import Runtime
@@ -141,38 +149,12 @@ class _Run:
     failed_env: dict[str, Any] | None = None
 
 
-def _refusal(
-    op: RegisteredOperation,
-    code: ErrorCode,
-    message: str,
-    started: float,
-    *,
-    result: Any = None,
-    hint: str | None = None,
-) -> dict[str, Any]:
-    return envelope_mod.build_envelope(
-        ok=False,
-        result=result,
-        error=message,
-        error_code=code,
-        execution=envelope_mod.execution_meta(op),
-        duration_ms=elapsed_ms(started),
-        hint_override=hint,
-    )
-
-
 def _label_error(failure: dict[str, Any], label: str) -> dict[str, Any]:
     """`failure` (from `pre_read_failure`) with the item it is about in front of its reason."""
     error = str(failure.get("error"))
     lead = "nothing was written: "
     failure["error"] = lead + label + ": " + error[len(lead) :] if error.startswith(lead) else error
     return failure
-
-
-def _read_destination(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any]
-) -> dict[str, Any]:
-    return execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
 
 
 def _pin_items(
@@ -188,7 +170,7 @@ def _pin_items(
     for index, item in enumerate(items):
         child = rt.registry.get(CHILD_OPS[item["action"]])
         if child is None:  # both are registered by register_all
-            return rows, _refusal(
+            return rows, envelope_mod.refusal(
                 op, "UNKNOWN_OPERATION", f"'{CHILD_OPS[item['action']]}' is not registered", started
             )
         pre = execution.run_op(
@@ -202,7 +184,7 @@ def _pin_items(
         listed = pre["result"].get("sources") or []
         found = listed[0] if listed and isinstance(listed[0], dict) else {}
         if found.get("type") not in _ENTRY_TYPES:
-            return rows, _refusal(
+            return rows, envelope_mod.refusal(
                 op,
                 "INVALID_ARGS",
                 f"nothing was written: {label}: the source is a {found.get('type')}, not a "
@@ -236,7 +218,7 @@ def _reuse_refusal(
         )
         if again is None:
             continue
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "INVALID_ARGS",
             f"nothing was written: items[{again.index}] ({again.action}) uses the source that "
@@ -256,7 +238,7 @@ def _position_refusal(
     started: float,
 ) -> dict[str, Any] | None:
     if position > len(before):
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "INVALID_ARGS",
             f"nothing was written: position {position} is past the end of the destination, "
@@ -267,7 +249,7 @@ def _position_refusal(
     if len(pins) != len(before) or any(
         not isinstance(pin, dict) or not isinstance(pin.get("selector"), dict) for pin in pins
     ):
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "PRECONDITION_UNMET",
             "nothing was written: an entry of the destination has no wiretap id, so it could not "
@@ -277,7 +259,7 @@ def _position_refusal(
         )
     behind = len(before) - position
     if behind > MAX_SHIFTED:
-        return _refusal(
+        return envelope_mod.refusal(
             op,
             "INVALID_ARGS",
             f"nothing was written: position {position} leaves {behind} entr(ies) behind it to "
@@ -297,7 +279,7 @@ def _position_move_refusal(
     held = {entry.get("uid") for entry in before}
     for row in rows:
         if row.action == "move" and row.row.get("uid") in held:
-            return _refusal(
+            return envelope_mod.refusal(
                 op,
                 "INVALID_ARGS",
                 f"nothing was written: items[{row.index}] (move) takes an entry out of the "
@@ -362,14 +344,16 @@ def _pin_shift(
     entry behind position must still be in the destination."""
     pre = _read_shift(rt, tail, stable)
     if pre is None:
-        return None, _refusal(op, "UNKNOWN_OPERATION", f"'{MOVE_OP}' is not registered", started)
+        return None, envelope_mod.refusal(
+            op, "UNKNOWN_OPERATION", f"'{MOVE_OP}' is not registered", started
+        )
     label = "the entries behind position (move)"
     if pre.get("ok") is not True or not isinstance(pre.get("result"), dict):
         return None, _label_error(pre_read_failure(op, pre, "written"), label)
     listed = pre["result"].get("sources") or []
     problem = _shift_parent_problem(listed, tail, dest_uid)
     if problem is not None:
-        return None, _refusal(
+        return None, envelope_mod.refusal(
             op,
             "CONFLICT",
             f"nothing was written: {label}: {problem}; the destination changed after it was read",
@@ -486,7 +470,7 @@ def _call_step(
 ) -> dict[str, Any] | None:
     """One child op in the call's group: its envelope when it succeeded, else None with the
     failure kept in `run`."""
-    env = rt.call(CHILD_OPS[action], args, group=run.group)
+    env = rt.call(CHILD_OPS[action], args, link=JournalLink(run.group))
     journal = env.get("journal") or {}
     if journal.get("id"):
         run.intents.append(str(journal["id"]))
@@ -547,10 +531,6 @@ def _journal_ref(run: _Run) -> dict[str, Any] | None:
         "ids": list(run.intents),
         "revert": ({"op": "journal.revert", "args": {"group": run.group}} if run.applied else None),
     }
-
-
-def _rows_of(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"name": e.get("name"), "uid": e.get("uid")} for e in entries]
 
 
 def _body(
@@ -626,13 +606,13 @@ def _expected(before: list[dict[str, Any]], run: _Run) -> list[dict[str, Any]]:
     items = [a for a in run.applied if not a.get("shift")]
     shift = next((a for a in run.applied if a.get("shift")), None)
     moved_out = {a["source"]["uid"] for a in items if a["action"] == "move"}
-    kept = [row for row in _rows_of(before) if row["uid"] not in moved_out]
-    made = _rows_of([a["made"] or {} for a in items])
+    kept = [row for row in entry_rows(before) if row["uid"] not in moved_out]
+    made = entry_rows([a["made"] or {} for a in items])
     if shift is None:
         return [*kept, *made]
     behind = {s["source"]["uid"] for s in shift["shifted"]}
     head = [row for row in kept if row["uid"] not in behind]
-    return [*head, *made, *_rows_of([s["made"] or {} for s in shift["shifted"]])]
+    return [*head, *made, *entry_rows([s["made"] or {} for s in shift["shifted"]])]
 
 
 def _verify(
@@ -646,7 +626,7 @@ def _verify(
 ) -> dict[str, Any] | None:
     """The destination read again against the order the items should have left: None when it
     matches, else the failure envelope (the steps stay applied and journaled)."""
-    after_env = _read_destination(rt, op, op_args)
+    after_env = read_destination(rt, op, op_args)
     expected = _expected(before, run)
     if after_env.get("ok") is not True or not isinstance(after_env.get("result"), dict):
         body["orderMatches"] = None
@@ -668,7 +648,7 @@ def _verify(
             ),
             run,
         )
-    listing = _rows_of(after_env["result"].get("entries") or [])
+    listing = entry_rows(after_env["result"].get("entries") or [])
     body["order"] = listing
     body["orderMatches"] = [r["uid"] for r in listing] == [e["uid"] for e in expected]
     if body["orderMatches"]:
@@ -693,110 +673,73 @@ def _verify(
     )
 
 
-def _open_group(
-    rt: Runtime,
-    op: RegisteredOperation,
-    rows: list[_Row],
-    shift: _Shift | None,
-    group: str,
-    started: float,
-) -> dict[str, Any] | None:
-    try:
-        rt.journal.append(
-            {
-                "type": "group",
-                "group": group,
-                "ts": now_iso(),
-                "kind": ARRANGE_GROUP_KIND,
-                "label": None,
-                "steps": [*(r.action for r in rows), *(["move"] if shift else [])],
-            }
-        )
-    except OSError as exc:
-        return _refusal(
-            op,
-            "POLICY_DENIED",
-            f"nothing was written: the journal cannot be written ({exc}), and this server does "
-            "not write to the project without a record",
-            started,
-            result={"ran": False},
-            hint=f"Make {rt.journal.directory} writable, then retry.",
-        )
-    return None
-
-
 def run_arrange(
     rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
 ) -> dict[str, Any]:
     """The `wrap` of `desktop.arrange`."""
     started = time.monotonic()
     items: list[dict[str, Any]] = list(op_args["items"])
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        dest_env = _read_destination(rt, op, op_args)
-        if dest_env.get("ok") is not True or not isinstance(dest_env.get("result"), dict):
-            return pre_read_failure(op, dest_env, "written")
-        destination: dict[str, Any] = dest_env["result"].get("destination") or {}
-        stable = destination.get("selector")
-        if not isinstance(stable, dict):
-            return _refusal(
-                op,
-                "PRECONDITION_UNMET",
-                "nothing was written: the destination has no wiretap id, so it cannot be found "
-                "again",
-                started,
-                result={"ran": False},
-            )
-        before: list[dict[str, Any]] = list(dest_env["result"].get("entries") or [])
-        position: int | None = op_args.get("position")
-        pins: list[Any] = list(dest_env["result"].get("pins") or [])
-        refusal = (
-            None
-            if position is None
-            else _position_refusal(op, int(position), before, pins, started)
+    dest_env = read_destination(rt, op, op_args)
+    if dest_env.get("ok") is not True or not isinstance(dest_env.get("result"), dict):
+        return pre_read_failure(op, dest_env, "written")
+    destination: dict[str, Any] = dest_env["result"].get("destination") or {}
+    stable = destination.get("selector")
+    if not isinstance(stable, dict):
+        return envelope_mod.refusal(
+            op,
+            "PRECONDITION_UNMET",
+            "nothing was written: the destination has no wiretap id, so it cannot be found again",
+            started,
+            result={"ran": False},
+        )
+    before: list[dict[str, Any]] = list(dest_env["result"].get("entries") or [])
+    position: int | None = op_args.get("position")
+    pins: list[Any] = list(dest_env["result"].get("pins") or [])
+    refusal = (
+        None if position is None else _position_refusal(op, int(position), before, pins, started)
+    )
+    if refusal is not None:
+        return refusal
+
+    rows, refusal = _pin_items(rt, op, items, stable, started)
+    refusal = refusal or _reuse_refusal(op, rows, started)
+    if refusal is None and position is not None and position < len(before):
+        refusal = _position_move_refusal(op, rows, before, started)
+    if refusal is not None:
+        return refusal
+    shift: _Shift | None = None
+    if position is not None and position < len(before):
+        shift, refusal = _pin_shift(
+            rt, op, pins[position:], stable, destination.get("uid"), len(items), started
         )
         if refusal is not None:
             return refusal
 
-        rows, refusal = _pin_items(rt, op, items, stable, started)
-        refusal = refusal or _reuse_refusal(op, rows, started)
-        if refusal is None and position is not None and position < len(before):
-            refusal = _position_move_refusal(op, rows, before, started)
-        if refusal is not None:
-            return refusal
-        shift: _Shift | None = None
-        if position is not None and position < len(before):
-            shift, refusal = _pin_shift(
-                rt, op, pins[position:], stable, destination.get("uid"), len(items), started
-            )
-            if refusal is not None:
-                return refusal
-
-        run = _Run(group=group if group is not None else new_id("g"))
-        unwritable = _open_group(rt, op, rows, shift, run.group, started)
-        if unwritable is not None:
-            return unwritable
-        _run_steps(rt, rows, shift, stable, run)
-        body = _body(destination, len(items), before, run, position, shift)
-        if run.failed is not None:
-            return _stopped(op, body, run, started, len(items) + (1 if shift else 0))
-        mismatch = _verify(rt, op, op_args, body, before, run, started)
-        if mismatch is not None:
-            return mismatch
-        env = envelope_mod.build_envelope(
-            ok=True,
-            result=body,
-            affected=len(run.applied),
-            journal=_journal_ref(run),
-            execution=envelope_mod.execution_meta(op),
-            duration_ms=elapsed_ms(started),
-        )
-        return _with_degraded(env, run)
+    run = _Run(group=group if group is not None else new_id("g"))
+    unwritable = open_group(
+        rt,
+        op,
+        run.group,
+        ARRANGE_GROUP_KIND,
+        started,
+        steps=[*(r.action for r in rows), *(["move"] if shift else [])],
+        hint=f"Make {rt.journal.directory} writable, then retry.",
+    )
+    if unwritable is not None:
+        return unwritable
+    _run_steps(rt, rows, shift, stable, run)
+    body = _body(destination, len(items), before, run, position, shift)
+    if run.failed is not None:
+        return _stopped(op, body, run, started, len(items) + (1 if shift else 0))
+    mismatch = _verify(rt, op, op_args, body, before, run, started)
+    if mismatch is not None:
+        return mismatch
+    env = envelope_mod.build_envelope(
+        ok=True,
+        result=body,
+        affected=len(run.applied),
+        journal=_journal_ref(run),
+        execution=envelope_mod.execution_meta(op),
+        duration_ms=elapsed_ms(started),
+    )
+    return _with_degraded(env, run)

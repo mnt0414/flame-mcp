@@ -14,13 +14,11 @@ from journal_test_helpers import BG1, Rig
 from p32b_helpers import DELETE, PURGE, S2, delete, make_p32b_rig
 from reformat_helpers import OP as REFORMAT_OP
 from reformat_helpers import make_reformat_rig, reformat
+from rig_fixtures import rig_fixture
 from test_purge_p32b import old_checkpoint
 from timeline_p32a_helpers import S1, a_seg, stash_entries, trim
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_p32b_rig)
 
 
 LIFT_HINT = "journal.check (without a group)"

@@ -41,11 +41,9 @@ from media_p31b_helpers import (
     write_codes,
     wt,
 )
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 # The fake itself is checked: a fake more tolerant than Flame would hide real failures.
@@ -116,7 +114,7 @@ def test_import_one_path_makes_a_clip_and_says_what_it_made(rig: Rig, tmp_path: 
     assert result["destinationEntriesBefore"] == ["c1"]
     assert result["destinationEntriesAfter"] == ["c1", "a"]
     assert names(rig.handles["reel_group"].reels[0]) == ["c1", "a"]
-    assert env["affected"] == 1 and env["undoSteps"] == 0 and "notes" not in result
+    assert env["affected"] == 1 and "notes" not in result
     assert env["execution"]["effect"] == "create"
     assert env["journal"]["revert"] == {
         "op": "journal.revert",

@@ -35,7 +35,8 @@ from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution, setup_compare, setup_edit, setup_work
-from flame_mcp.journal import Journal, new_id, now_iso
+from flame_mcp.journal import Journal, JournalLink, new_id, now_iso
+from flame_mcp.journal_records import CheckpointRecord, IntentRecord, OutcomeRecord
 from flame_mcp.private_fs import make_private_dirs
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
@@ -134,7 +135,8 @@ def run_checkpoint(
     rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any], *, group: str | None = None
 ) -> dict[str, Any]:
     """The `wrap` handler of `batch.checkpoint`: run the save in Flame, then journal the
-    checkpoint record (the file alone would be a setup nothing can find again)."""
+    checkpoint record (the file alone would be a setup nothing can find again). Runs under the
+    `write_lock` that `Runtime.execute` holds."""
     started = time.monotonic()
     checkpoint_id = new_id("c")
     flame_args = {
@@ -142,58 +144,57 @@ def run_checkpoint(
         DIR_ARG: str(checkpoint_dir(rt.journal)),
         BASE_ARG: f"{FILE_PREFIX}{checkpoint_id}",
     }
-    with rt.write_lock:
-        env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
-        if env.get("ok") is not True:
-            shut_if_unanswered(rt.guard, env, op.name, group)
-            return env
-        raw = env.get("result")
-        result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-        result.pop("error", None)
-        record: dict[str, Any] = {
-            "type": "checkpoint",
-            "id": checkpoint_id,
-            "group": group,
-            "ts": now_iso(),
-            "batch": result.get("batch"),
-            "label": op_args.get("label"),
-            "path": result.get("path"),
-            "size": result.get("size"),
-            "fingerprint": result.get("fingerprint"),
-            "fingerprintSections": result.get("fingerprintSections"),
-            "nodeCount": result.get("nodeCount"),
-            "connectionCount": result.get("connectionCount"),
-            "unreadableNodes": result.get("unreadableNodes"),
-            "reels": result.get("reels"),
-            "reelsError": result.get("reelsError"),
-            "clipFx": result.pop("clipFx", None),
-            "clipFxError": result.get("clipFxError"),
-            "fingerprintFull": result.get("fingerprintFull"),
-            "fingerprintFullSections": result.get("fingerprintFullSections"),
-            "sectionData": result.pop("sectionData", None),
-        }
-        result["checkpoint"] = checkpoint_id
-        result["label"] = op_args.get("label")
-        try:
-            rt.journal.append(record)
-        except OSError as exc:
-            return envelope_mod.build_envelope(
-                ok=False,
-                result=result,
-                error=(
-                    f"the setup was saved at {result.get('path')} but the checkpoint could not "
-                    f"be recorded in the journal ({exc}), so it cannot be restored by id"
-                ),
-                error_code="POLICY_DENIED",
-                execution=envelope_mod.execution_meta(op),
-                duration_ms=elapsed_ms(started),
-                hint_override=(
-                    f"Make {rt.journal.directory} writable, then take the checkpoint again."
-                ),
-            )
-        env["result"] = result
-        env["journal"] = {"group": group, "id": checkpoint_id, "kind": "checkpoint"}
+    env = execution.run_op(op, flame_args, run_dir=rt.run_dir, timeout_s=CHECKPOINT_TIMEOUT_S)
+    if env.get("ok") is not True:
+        shut_if_unanswered(rt.guard, env, op.name, group)
         return env
+    raw = env.get("result")
+    result: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    result.pop("error", None)
+    record: CheckpointRecord = {
+        "type": "checkpoint",
+        "id": checkpoint_id,
+        "group": group,
+        "ts": now_iso(),
+        "batch": result.get("batch"),
+        "label": op_args.get("label"),
+        "path": result.get("path"),
+        "size": result.get("size"),
+        "fingerprint": result.get("fingerprint"),
+        "fingerprintSections": result.get("fingerprintSections"),
+        "nodeCount": result.get("nodeCount"),
+        "connectionCount": result.get("connectionCount"),
+        "unreadableNodes": result.get("unreadableNodes"),
+        "reels": result.get("reels"),
+        "reelsError": result.get("reelsError"),
+        "clipFx": result.pop("clipFx", None),
+        "clipFxError": result.get("clipFxError"),
+        "fingerprintFull": result.get("fingerprintFull"),
+        "fingerprintFullSections": result.get("fingerprintFullSections"),
+        "sectionData": result.pop("sectionData", None),
+    }
+    result["checkpoint"] = checkpoint_id
+    result["label"] = op_args.get("label")
+    try:
+        rt.journal.append(record)
+    except OSError as exc:
+        return envelope_mod.build_envelope(
+            ok=False,
+            result=result,
+            error=(
+                f"the setup was saved at {result.get('path')} but the checkpoint could not "
+                f"be recorded in the journal ({exc}), so it cannot be restored by id"
+            ),
+            error_code="POLICY_DENIED",
+            execution=envelope_mod.execution_meta(op),
+            duration_ms=elapsed_ms(started),
+            hint_override=(
+                f"Make {rt.journal.directory} writable, then take the checkpoint again."
+            ),
+        )
+    env["result"] = result
+    env["journal"] = {"group": group, "id": checkpoint_id, "kind": "checkpoint"}
+    return env
 
 
 def take_checkpoint(
@@ -205,7 +206,9 @@ def take_checkpoint(
     kind: CheckpointKind = BATCH_KIND,
 ) -> dict[str, Any]:
     """`batch.checkpoint` (or the kind's own) through the normal do path; the envelope."""
-    return ctx.do(kind.checkpoint_op, {"target": dict(target), "label": label}, group=group)
+    return ctx.do(
+        kind.checkpoint_op, {"target": dict(target), "label": label}, link=JournalLink(group)
+    )
 
 
 def read_fingerprint(
@@ -243,33 +246,37 @@ def stable_subject(
     return (batch_target(uid), uid) if isinstance(uid, str) else None
 
 
-def intent_fields(kind: CheckpointKind, pre: Mapping[str, Any], uid: Any) -> dict[str, Any]:
+def add_intent_fields(
+    intent: IntentRecord, kind: CheckpointKind, pre: Mapping[str, Any], uid: Any
+) -> None:
     """What an intent of a checkpointed write records about the checkpoint beyond the common
     keys. A Batch intent records the checkpoint's path and node count."""
     if kind is TIMELINE_KIND:
-        return {
-            "targetKind": kind.name,
-            "targetUid": uid,
-            "targetIdent": pre.get("source"),
-            "stash": pre.get("stash"),
-            "segmentCountBefore": pre.get("segmentCount"),
-        }
-    return {
-        "checkpointPath": pre.get("path"),
-        "nodeCountBefore": pre.get("nodeCount"),
-    }
+        intent["targetKind"] = kind.name
+        intent["targetUid"] = uid
+        intent["targetIdent"] = pre.get("source")
+        intent["stash"] = pre.get("stash")
+        intent["segmentCountBefore"] = pre.get("segmentCount")
+    else:
+        intent["checkpointPath"] = pre.get("path")
+        intent["nodeCountBefore"] = pre.get("nodeCount")
 
 
-def outcome_fields(kind: CheckpointKind, after_env: Mapping[str, Any]) -> dict[str, Any]:
+def add_outcome_fields(
+    outcome: OutcomeRecord, kind: CheckpointKind, after_env: Mapping[str, Any]
+) -> None:
     """What the outcome of a checkpointed write records beyond the common keys: for a sequence /
     clip, who it is after the run (the uid a later revert looks for)."""
     if kind is not TIMELINE_KIND:
-        return {}
+        return
     result = after_env.get("result") if after_env.get("ok") is True else None
     ident = result.get("target") if isinstance(result, dict) else None
     if not isinstance(ident, dict):
-        return {"targetUid": None, "targetIdent": None}
-    return {"targetUid": ident.get("uid"), "targetIdent": ident}
+        outcome["targetUid"] = None
+        outcome["targetIdent"] = None
+    else:
+        outcome["targetUid"] = ident.get("uid")
+        outcome["targetIdent"] = ident
 
 
 def fingerprint_of(env: Mapping[str, Any]) -> str | None:

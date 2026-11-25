@@ -13,7 +13,15 @@ from flame_mcp.journaled_write import FOR_WRITE_ARG
 from flame_mcp.ops._common import build_source
 from flame_mcp.registry import Registry
 from flame_mcp.tc_sync_run import SET_OP, SYNC_OP, run_sync
-from flame_mcp.types import JournalSpec, OperationParam, OperationSpec, Refusal, SelectorKind
+from flame_mcp.types import (
+    JournalSpec,
+    OperationParam,
+    OperationSpec,
+    PlanKind,
+    PlanUse,
+    Refusal,
+    SelectorKind,
+)
 
 GET_OP: Final[str] = "desktop.get_record_tc"
 TC_KEYS: Final[tuple[str, ...]] = ("start_time_frame", "current_time_frame")
@@ -123,6 +131,16 @@ def _keys(args: Mapping[str, Any]) -> list[str]:
     return [k for k in TC_KEYS if args.get(k) is not None]
 
 
+_PLAN_USE_DESKTOP_SYNC_RECORD_TC = PlanUse(
+    PlanKind.ROLLBACK,
+    refusal=(
+        "desktop.sync_record_tc cannot be a plan step: it journals one `desktop.set_record_tc` "
+        "intent per clip into a group of its own and reports a row per clip; call it on its own "
+        "(desktop.set_record_tc is the step to use in a plan)"
+    ),
+)
+
+
 def register(registry: Registry) -> None:
     requires = (
         "PyClip.start_time",
@@ -144,6 +162,7 @@ def register(registry: Registry) -> None:
     registry.register(
         OperationSpec(
             name=SYNC_OP,
+            plan_use=_PLAN_USE_DESKTOP_SYNC_RECORD_TC,
             category="desktop",
             description=_SYNC_DESCRIPTION,
             effect="reversible",
@@ -173,7 +192,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=_ACCEPTS,
             to_python=_sync_to_python,
-            undo_steps=lambda args, affected: 0,
             precheck=_sync_precheck,
             wrap=run_sync,
             sample_args={"targets": [{"kind": "wiretap", "id": "s"}]},
@@ -199,7 +217,6 @@ def register(registry: Registry) -> None:
             ),
             accepts=_SINGLE,
             to_python=_set_to_python,
-            undo_steps=lambda args, affected: 0,
             journal=JournalSpec(
                 read_op=GET_OP,
                 keys=_keys,

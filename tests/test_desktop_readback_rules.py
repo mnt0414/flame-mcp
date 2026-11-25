@@ -32,6 +32,7 @@ from media_p31b_helpers import (
     wt,
 )
 from p32b_helpers import S2, S3, delete, make_p32b_rig
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import reel_names
 
 DISPLAY_FIX = "def _tl_display_fix(shown_before, was_displayed, new_obj):"
@@ -68,9 +69,7 @@ def reel3_clip(rig: Rig, name: str) -> dict[str, Any]:
     return wt(add_clip(rig.handles["reel3"], name))
 
 
-@pytest.fixture
-def media_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+media_rig = rig_fixture(make_media_rig)
 
 
 # -- desktop.move ---------------------------------------------------------------------------------
@@ -246,9 +245,7 @@ def test_a_revert_that_puts_back_nothing_stays_silent_noop(media_rig: Rig) -> No
 # -- desktop.delete -------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def delete_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+delete_rig = rig_fixture(make_p32b_rig)
 
 
 def test_a_delete_whose_display_read_back_fails_keeps_what_was_deleted_and_can_be_reverted(

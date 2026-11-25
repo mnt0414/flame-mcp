@@ -22,6 +22,7 @@ from fake_media_tree import PySegment, share_sources
 from flame_mcp.policy import Policy
 from journal_test_helpers import Rig
 from p33_helpers import REPLACE, add_media_clip, clip_sel, seg_a, track0, untouched_world
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     S2,
@@ -37,16 +38,13 @@ from timeline_p32a_helpers import (
     wt,
 )
 
+rig = rig_fixture(make_timeline_rig)
+
 CONNECTIONS = "segment.connections"
 CREATE = "segment.create_connection"
 REMOVE = "segment.remove_connection"
 SYNC = "segment.sync_connections"
 WRITES = (CREATE, REMOVE, SYNC)
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def s2_seg(rig: Rig) -> PySegment:

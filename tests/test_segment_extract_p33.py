@@ -30,6 +30,7 @@ from p33_helpers import (
     sel_at,
     untouched_world,
 )
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import (
     S1,
     fingerprint_of_target,
@@ -41,13 +42,10 @@ from timeline_p32a_helpers import (
     wt,
 )
 
+rig = rig_fixture(make_timeline_rig)
+
 LIB_REEL_WT = "/projects/p/ws/P1O/R1"
 DEST = wt(REEL_WT)
-
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_timeline_rig(monkeypatch, tmp_path)
 
 
 def take(
@@ -285,7 +283,7 @@ def test_the_write_is_journaled_as_an_extract_with_the_clip_that_was_made(rig: R
     assert created is not None and created["uid"] == env["result"]["created"]["uid"]
     assert created["parent"]["name"] == "Reel 1" and created["sourceUid"] == uid(rig.handles["s1"])
     assert created["state"]["name"] == "A"
-    assert env["execution"]["undo"] == "value" and env["undoSteps"] == 0
+    assert env["execution"]["undo"] == "value"
     assert any("journal.revert" in n for n in env["result"]["notes"])
 
 

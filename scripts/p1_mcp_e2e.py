@@ -28,7 +28,7 @@ Steps:
      PyTime-shaped fields -- recordIn/recordOut/sourceIn/sourceOut/
      recordDuration -- must come back as {"timecode": str, "frame": int},
      never a quoted string) / flame_context
-     (c_flame_context: undoContract mentions revert+undoSteps, libraries
+     (c_flame_context: undoContract mentions revert, libraries
      includes the library step b just created, currentTab is a string,
      context is a rider dict)
      Further checks: c_list_children_offset (2nd page via offset, no overlap
@@ -42,7 +42,7 @@ Steps:
      a_catalog_selector_fields / c_selector_vocabulary_fields (fields +
      example are published), d_revert_op_is_desktop_rename
   d. write: a rename inside a library is refused (PRECONDITION_UNMET, name unchanged);
-     rename a Desktop sequence (path selector, root desktop); confirm undoSteps==0 and a
+     rename a Desktop sequence (path selector, root desktop); confirm a
      `revert` op+args came back (a set_value() rename is
      never pushed onto Flame's native Undo history, so `execute_shortcut
      ('Undo')` must not be used -- it would silently revert an unrelated
@@ -940,8 +940,8 @@ async def step_c_timeline(
 async def step_c_flame_context(
     session: ClientSession, lib: dict[str, Any], results: dict[str, Any]
 ) -> None:
-    """The 4th tool. Static knowledge (undoContract must mention both
-    `revert` and `undoSteps`) plus the live
+    """The 4th tool. Static knowledge (undoContract must mention
+    `revert`) plus the live
     snapshot (`libraries` includes the library step b just created,
     `currentTab` a string) and the same rider shape flame_do carries."""
     context_result = await session.call_tool("flame_context", {})
@@ -956,7 +956,6 @@ async def step_c_flame_context(
             context_env.get("ok") is True
             and isinstance(undo_contract, str)
             and "revert" in undo_contract
-            and "undoSteps" in undo_contract
             and isinstance(libraries, list)
             and lib["libName"] in libraries
             and isinstance(value.get("currentTab"), str)
@@ -1068,9 +1067,8 @@ async def step_d_rename_and_revert(
         (
             rename_env.get("ok") is True
             and rename_value.get("after") == "P1O_renamed"
-            # Ctrl+Z does not undo it, so undoSteps must always be 0 --
-            # without the revert (a re-call through wiretap) there is no way back.
-            and rename_env.get("undoSteps") == 0
+            # Ctrl+Z does not undo it: without the revert (a re-call through wiretap)
+            # there is no way back.
             and revert is not None
         ),
         env=rename_env,
@@ -1119,7 +1117,6 @@ async def step_d_rename_and_revert(
         (
             rename_wt_env.get("ok") is True
             and rename_wt_value.get("after") == "R1_renamed"
-            and rename_wt_env.get("undoSteps") == 0
             and revert_wt is not None
         ),
         env=rename_wt_env,

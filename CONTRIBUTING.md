@@ -82,7 +82,7 @@ New functionality comes with tests.
 - Don't send a non-ASCII character to Flame. This includes the Python files that are sent to Flame, which must be ASCII only.
 - Don't call the Flame API from any thread except the main thread. This includes `schedule_idle_event`.
 - Don't use a loop or a comprehension in the code that a write operation generates.
-- Don't use Flame's Undo, including `execute_shortcut`. A write must keep `undoSteps` at 0.
+- Don't use Flame's Undo, including `execute_shortcut`. Undo is `journal.revert` only.
 - Don't retry a write automatically after `TIMEOUT` or `BRIDGE_LOST`, because the result is unknown.
 - Don't add code that deletes or moves anything inside a library.
 - Don't write anything but JSON-RPC to stdout.

@@ -16,7 +16,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import execution
-from flame_mcp.desktop_run import PHASE_ARG
 from flame_mcp.export_run import (
     NOTHING_WRITTEN,
     Written,
@@ -27,13 +26,12 @@ from flame_mcp.export_run import (
 )
 from flame_mcp.journal import (
     STATE_DIVERGED,
-    STATE_FAILED,
     STATE_LANDED,
     STATE_NOT_LANDED,
     STATE_PARTIAL,
     IntentView,
 )
-from flame_mcp.render_check import _append_check, _unknown_entry, fetch_answer
+from flame_mcp.render_check import _append_check, _unknown_entry, fetch_answer, verdict_after_run
 from flame_mcp.render_files import EXPORT_COUNT_DEPTH, EXPORT_COUNT_LIMIT
 from flame_mcp.still_run import (
     OP_NAME,
@@ -42,6 +40,7 @@ from flame_mcp.still_run import (
     cleanup_params,
     judge_still,
 )
+from flame_mcp.types import PHASE_ARG
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -131,7 +130,8 @@ def _finish(
     verdict: str,
     found: Written,
     basis: str,
-    **extra: Any,
+    still_outcome: dict[str, Any] | None = None,
+    flame: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stop = _clean_up(ctx, view, entry)
     if stop is not None:
@@ -139,7 +139,9 @@ def _finish(
     per_key = {"files": verdict}
     current = _current(found)
     entry.update(verdict=verdict, basis=basis, perKey=per_key, current=current)
-    _append_check(ctx, view, verdict, per_key, current, basis=basis, **extra)
+    _append_check(
+        ctx, view, verdict, per_key, current, basis=basis, still_outcome=still_outcome, flame=flame
+    )
     return entry
 
 
@@ -164,16 +166,11 @@ def _check_with_result(
         written=found.count,
         unsure=unsure,
     )
-    if gone:
-        verdict = STATE_DIVERGED
-    elif judged.ok:
-        verdict = STATE_LANDED
-    elif found.count > 0:
-        verdict = STATE_PARTIAL
-    elif judged.code == "SILENT_NOOP":
-        verdict = STATE_NOT_LANDED
-    else:
-        verdict = STATE_FAILED
+    verdict = (
+        STATE_DIVERGED
+        if gone
+        else verdict_after_run(ok=judged.ok, code=judged.code, wrote_part=found.count > 0)
+    )
     outcome = {
         "ok": judged.ok,
         "errorCode": judged.code,
@@ -190,7 +187,7 @@ def _check_with_result(
         notes.append(unsure)
     if notes:
         entry["detail"] = ". ".join(notes)
-    return _finish(ctx, view, entry, verdict, found, "handle", stillOutcome=outcome, flame=outcome)
+    return _finish(ctx, view, entry, verdict, found, "handle", still_outcome=outcome, flame=outcome)
 
 
 def _check_by_disk(

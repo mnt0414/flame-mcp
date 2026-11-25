@@ -29,19 +29,21 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
 from flame_mcp import execution
 from flame_mcp.callargs import apply_param_defaults
-from flame_mcp.journal import attribute_values_equal, new_id, now_iso
+from flame_mcp.journal import NO_LINK, JournalLink, attribute_values_equal, new_id, now_iso
+from flame_mcp.journal_records import IntentRecord, OutcomeRecord, UnresolvedRecord
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.registry import RegisteredOperation
 from flame_mcp.transport import elapsed_ms
 from flame_mcp.types import ErrorCode
 
 if TYPE_CHECKING:
-    from flame_mcp.runtime import Runtime
+    from flame_mcp.runtime import Runtime, ServerContext
 
 UNKNOWN_END_CODES: Final[frozenset[str]] = frozenset(
     {"TIMEOUT", "BRIDGE_LOST", "BRIDGE_UNAVAILABLE"}
@@ -49,6 +51,9 @@ UNKNOWN_END_CODES: Final[frozenset[str]] = frozenset(
 """Errors after which whether the write landed is not known (the connection was lost, or it
 never answered). Everything else -- including CONFLICT and Flame's own exceptions -- is an
 answer, and gets an outcome record."""
+
+OUTCOME_NOT_WRITTEN: Final[str] = "JOURNAL_OUTCOME_NOT_WRITTEN"
+"""The guard's reason when the outcome of a write could not be journaled."""
 
 RESTORING_ARG: Final[str] = "_restoring"
 """Reserved args key set only when the write is a journal.revert: it puts back a recorded value,
@@ -178,7 +183,7 @@ def _completed_after(before: Mapping[str, Any], values: Mapping[str, Any]) -> di
 
 def _outcome_record(
     env: Mapping[str, Any], intent_id: str, group: str, keys: list[str]
-) -> dict[str, Any]:
+) -> OutcomeRecord:
     ok = bool(env.get("ok"))
     raw_result = env.get("result")
     result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
@@ -210,21 +215,217 @@ def _outcome_record(
     }
 
 
+@dataclass(frozen=True)
+class _Call:
+    """One call of `run_journaled_write`: its arguments and what the op's spec made of them."""
+
+    op: RegisteredOperation
+    op_args: dict[str, Any]
+    keys: list[str]
+    values: dict[str, Any]
+    link: JournalLink
+    precondition: Mapping[str, Any] | None
+    started: float
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """What the pre-read and the checks before the intent settled."""
+
+    stable: dict[str, Any]
+    before: dict[str, Any]
+    write_args: dict[str, Any]
+
+
+def _precondition_conflict(
+    op: RegisteredOperation,
+    before: Mapping[str, Any],
+    precondition: Mapping[str, Any],
+    started: float,
+) -> dict[str, Any] | None:
+    conflicts = {
+        key: {"expected": expected, "current": before.get(key)}
+        for key, expected in precondition.items()
+        if not attribute_values_equal(key, before.get(key), expected)
+    }
+    if not conflicts:
+        return None
+    detail = "; ".join(
+        f"{k}: expected {c['expected']!r}, current {c['current']!r}" for k, c in conflicts.items()
+    )
+    return _fail(
+        op,
+        "CONFLICT",
+        f"nothing was written: the current value is not the one expected ({detail})",
+        started,
+        result={"applied": [], "failed": {}, "conflicts": conflicts},
+    )
+
+
+def _refuse_stable_address(
+    op: RegisteredOperation, write_args: dict[str, Any], started: float
+) -> dict[str, Any] | None:
+    """The failure envelope when `op` does not accept the stable address of the target."""
+    validation = validate_op_args(op, write_args)
+    if validation.ok:
+        return None
+    issues = "; ".join(f"{i.path}: {i.message}" for i in validation.issues)
+    return _fail(
+        op,
+        "INVALID_ARGS",
+        f"nothing was written: the stable target address is not accepted by '{op.name}' ({issues})",
+        started,
+    )
+
+
+def _prepare_write(
+    rt: Runtime, call: _Call, read_op: RegisteredOperation
+) -> _Prepared | dict[str, Any]:
+    """The pre-read and every check that comes before the intent: the prepared write, or the
+    failure envelope (nothing was written)."""
+    op, keys, started = call.op, call.keys, call.started
+    spec = op.journal
+    assert spec is not None
+    read_args: dict[str, Any] = {"target": call.op_args["target"], "keys": keys}
+    if call.link.reverts is None:
+        read_args[FOR_WRITE_ARG] = True
+    apply_param_defaults(read_op, read_args)
+    pre = execution.run_op(read_op, read_args, run_dir=rt.run_dir)
+    if not pre["ok"]:
+        failure = dict(pre)
+        failure["execution"] = envelope_mod.execution_meta(op)
+        failure["error"] = f"pre-read failed, nothing was written: {pre.get('error')}"
+        return failure
+    before, rejected = _read_values(pre, keys)
+    if rejected:  # what the op's own preflight would have said: nothing written, INVALID_ARGS
+        detail = "; ".join(f"{key}: {reason}" for key, reason in rejected.items())
+        return _fail(
+            op,
+            "INVALID_ARGS",
+            f"nothing was written: {len(rejected)} attribute(s) rejected ({detail})",
+            started,
+            result={"applied": [], "failed": rejected, "before": {}, "after": {}},
+            partial={"applied": 0, "failed": len(rejected)},
+        )
+    stable = pre["result"].get("stable")
+    if not isinstance(stable, dict):
+        return _fail(
+            op,
+            "PRECONDITION_UNMET",
+            "nothing was written: the target has no stable address (no wiretap id / uid; "
+            "for a node that shares its name with another node of the group, a pos that "
+            "reads as two integers), so a journal record could not find it again",
+            started,
+        )
+    if call.precondition is not None:
+        conflict = _precondition_conflict(op, before, call.precondition, started)
+        if conflict is not None:
+            return conflict
+
+    write_args = spec.write_args(stable, call.values)
+    refusal = _refuse_stable_address(op, write_args, started)
+    if refusal is not None:
+        return refusal
+    return _Prepared(stable, before, write_args)
+
+
+def _append_intent(
+    rt: Runtime, call: _Call, prepared: _Prepared
+) -> tuple[str, str] | dict[str, Any]:
+    """Journals the intent (flushed before the write is sent): `(group_id, intent_id)`, or the
+    failure envelope when the intent cannot be recorded."""
+    op, op_args, link, values, started = call.op, call.op_args, call.link, call.values, call.started
+    spec = op.journal
+    assert spec is not None
+    group_id = link.group if link.group is not None else new_id("g")
+    intent_id = new_id("i")
+    target_after, address_problem = _address_after(prepared.stable, values)
+    if address_problem is not None:
+        return _fail(op, "PRECONDITION_UNMET", f"nothing was written: {address_problem}", started)
+    intent: IntentRecord = {
+        "type": "intent",
+        "id": intent_id,
+        "group": group_id,
+        "ts": now_iso(),
+        "op": op.name,
+        "args": op_args,
+        "target": prepared.stable,
+        "targetAfter": target_after,
+        "readOp": spec.read_op,
+        "before": prepared.before,
+        "after": _completed_after(prepared.before, values),
+    }
+    link.stamp(intent)
+    try:
+        rt.journal.append(intent)
+    except OSError as exc:
+        return _fail(
+            op,
+            "POLICY_DENIED",
+            f"nothing was written: the journal cannot be written ({exc}), and this "
+            "server does not write to the project without an intent on record",
+            started,
+            hint=f"Make {rt.journal.directory} writable, then retry.",
+        )
+    return group_id, intent_id
+
+
+def _send_write(
+    rt: Runtime,
+    op: RegisteredOperation,
+    prepared: _Prepared,
+    link: JournalLink,
+    keys: list[str],
+    group_id: str,
+    intent_id: str,
+) -> dict[str, Any]:
+    """The compare-and-swap write, then the outcome record (or, when no answer came, the open
+    intent and the shut guard)."""
+    rt.hooks.pause_after_preread()
+
+    exec_args = dict(prepared.write_args)
+    exec_args[EXPECTED_ARG] = prepared.before
+    if link.reverts is not None:
+        exec_args[RESTORING_ARG] = True
+    apply_param_defaults(op, exec_args)
+    env = execution.run_op(
+        op, exec_args, run_dir=rt.run_dir, timeout_s=rt.hooks.take_write_timeout()
+    )
+    rt.hooks.exit_after_write_answer()
+
+    # The outcome is recorded unless no answer came: then the intent stays open and the
+    # write guard is shut.
+    code_now = env.get("errorCode")
+    if code_now in UNKNOWN_END_CODES:
+        note_unresolved(rt, intent_id, group_id, env, op.name, str(code_now))
+        hint = str(env.get("hint") or "")
+        env["hint"] = (
+            f"{hint} It is not known whether the write landed: this server now refuses every "
+            f"write until journal.check (group={group_id!r}) has read Flame again."
+        ).strip()
+    else:
+        err = close_outcome(
+            rt, _outcome_record(env, intent_id, group_id, keys), intent_id, group_id, op.name
+        )
+        if err is not None:
+            env["degraded"] = [*env.get("degraded", []), outcome_not_journaled_note(err)]
+    env["journal"] = {"group": group_id, "id": intent_id}
+    return env
+
+
 def run_journaled_write(
     rt: Runtime,
     op: RegisteredOperation,
     op_args: dict[str, Any],
     *,
-    group: str | None = None,
-    reverts: str | None = None,
-    reverts_intent: str | None = None,
+    link: JournalLink = NO_LINK,
     precondition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run `op` (which carries a JournalSpec) as described in the module docstring.
 
-    `group` groups several calls (`plan.run`: one group for the whole plan); None starts a new
-    group. `reverts` marks the group as the revert of another (`reverts_intent`: of that
-    group's one intent). `precondition` ({key: value}) makes the call refuse with
+    `link.group` groups several calls (`plan.run`: one group for the whole plan); None starts a
+    new group. `link.reverts` marks the group as the revert of another (`link.reverts_intent`: of
+    that group's one intent). `precondition` ({key: value}) makes the call refuse with
     CONFLICT, before anything is journaled or written, unless the pre-read values equal it --
     `journal.revert` uses it to put a value back only while it still is what the write left."""
     spec = op.journal
@@ -239,164 +440,63 @@ def run_journaled_write(
     if not keys:  # an empty pre-read key list would mean "every attribute"
         return _fail(op, "INVALID_ARGS", "values must be a non-empty object", started)
 
-    with rt.write_lock:
-        denial = rt.guard.denial()  # a write that queued behind the one that just went unknown
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-
-        read_args: dict[str, Any] = {"target": op_args["target"], "keys": keys}
-        if reverts is None:
-            read_args[FOR_WRITE_ARG] = True
-        apply_param_defaults(read_op, read_args)
-        pre = execution.run_op(read_op, read_args, run_dir=rt.run_dir)
-        if not pre["ok"]:
-            failure = dict(pre)
-            failure["execution"] = envelope_mod.execution_meta(op)
-            failure["error"] = f"pre-read failed, nothing was written: {pre.get('error')}"
-            return failure
-        before, rejected = _read_values(pre, keys)
-        if rejected:  # what the op's own preflight would have said: nothing written, INVALID_ARGS
-            detail = "; ".join(f"{key}: {reason}" for key, reason in rejected.items())
-            return _fail(
-                op,
-                "INVALID_ARGS",
-                f"nothing was written: {len(rejected)} attribute(s) rejected ({detail})",
-                started,
-                result={"applied": [], "failed": rejected, "before": {}, "after": {}},
-                partial={"applied": 0, "failed": len(rejected)},
-            )
-        stable = pre["result"].get("stable")
-        if not isinstance(stable, dict):
-            return _fail(
-                op,
-                "PRECONDITION_UNMET",
-                "nothing was written: the target has no stable address (no wiretap id / uid; "
-                "for a node that shares its name with another node of the group, a pos that "
-                "reads as two integers), so a journal record could not find it again",
-                started,
-            )
-        if precondition is not None:
-            conflicts = {
-                key: {"expected": expected, "current": before.get(key)}
-                for key, expected in precondition.items()
-                if not attribute_values_equal(key, before.get(key), expected)
-            }
-            if conflicts:
-                detail = "; ".join(
-                    f"{k}: expected {c['expected']!r}, current {c['current']!r}"
-                    for k, c in conflicts.items()
-                )
-                return _fail(
-                    op,
-                    "CONFLICT",
-                    f"nothing was written: the current value is not the one expected ({detail})",
-                    started,
-                    result={"applied": [], "failed": {}, "conflicts": conflicts},
-                )
-
-        write_args = spec.write_args(stable, values)
-        validation = validate_op_args(op, write_args)
-        if not validation.ok:  # the stable address must be one the op accepts
-            issues = "; ".join(f"{i.path}: {i.message}" for i in validation.issues)
-            return _fail(
-                op,
-                "INVALID_ARGS",
-                f"nothing was written: the stable target address is not accepted by "
-                f"'{op.name}' ({issues})",
-                started,
-            )
-
-        # The intent is flushed before the write is sent.
-        group_id = group if group is not None else new_id("g")
-        intent_id = new_id("i")
-        target_after, address_problem = _address_after(stable, values)
-        if address_problem is not None:
-            return _fail(
-                op, "PRECONDITION_UNMET", f"nothing was written: {address_problem}", started
-            )
-        intent: dict[str, Any] = {
-            "type": "intent",
-            "id": intent_id,
-            "group": group_id,
-            "ts": now_iso(),
-            "op": op.name,
-            "args": op_args,
-            "target": stable,
-            "targetAfter": target_after,
-            "readOp": spec.read_op,
-            "before": before,
-            "after": _completed_after(before, values),
-        }
-        if reverts is not None:
-            intent["reverts"] = reverts
-        if reverts_intent is not None:
-            intent["revertsIntent"] = reverts_intent
-        try:
-            rt.journal.append(intent)
-        except OSError as exc:
-            return _fail(
-                op,
-                "POLICY_DENIED",
-                f"nothing was written: the journal cannot be written ({exc}), and this "
-                "server does not write to the project without an intent on record",
-                started,
-                hint=f"Make {rt.journal.directory} writable, then retry.",
-            )
-
-        rt.hooks.pause_after_preread()
-
-        exec_args = dict(write_args)
-        exec_args[EXPECTED_ARG] = before
-        if reverts is not None:
-            exec_args[RESTORING_ARG] = True
-        apply_param_defaults(op, exec_args)
-        env = execution.run_op(
-            op, exec_args, run_dir=rt.run_dir, timeout_s=rt.hooks.take_write_timeout()
-        )
-        rt.hooks.exit_after_write_answer()
-
-        # The outcome is recorded unless no answer came: then the intent stays open and the
-        # write guard is shut.
-        code_now = env.get("errorCode")
-        if code_now in UNKNOWN_END_CODES:
-            rt.guard.block(intent_id, group_id, op.name, str(code_now))
-            _note_unresolved(rt, intent_id, group_id, env)
-            hint = str(env.get("hint") or "")
-            env["hint"] = (
-                f"{hint} It is not known whether the write landed: this server now refuses every "
-                f"write until journal.check (group={group_id!r}) has read Flame again."
-            ).strip()
-        else:
-            try:
-                rt.journal.append(_outcome_record(env, intent_id, group_id, keys))
-            except OSError as exc:
-                rt.guard.block(intent_id, group_id, op.name, "JOURNAL_OUTCOME_NOT_WRITTEN")
-                env["degraded"] = [
-                    *env.get("degraded", []),
-                    f"the outcome could not be journaled ({exc}); the write's answer stands but "
-                    "this server now refuses writes until journal.check has settled the intent",
-                ]
-        env["journal"] = {"group": group_id, "id": intent_id}
-        return env
+    call = _Call(op, op_args, keys, values, link, precondition, started)
+    prepared = _prepare_write(rt, call, read_op)
+    if isinstance(prepared, dict):
+        return prepared
+    ids = _append_intent(rt, call, prepared)
+    if isinstance(ids, dict):
+        return ids
+    return _send_write(rt, op, prepared, link, keys, *ids)
 
 
-def _note_unresolved(rt: Runtime, intent_id: str, group: str, env: Mapping[str, Any]) -> None:
+def outcome_not_journaled_note(
+    err: object,
+    answer: str | None = "the write's answer",
+    outcome: str = "the outcome",
+) -> str:
+    """The `degraded` / `journalError` text for an outcome that could not be journaled. `answer`
+    names what stands (None: nothing is said about it); `outcome` names what was not written."""
+    stands = f"{answer} stands but " if answer else ""
+    return (
+        f"{outcome} could not be journaled ({err}); {stands}this server now refuses writes "
+        "until journal.check has settled the intent"
+    )
+
+
+def note_unresolved(
+    ctx: ServerContext,
+    intent_id: str,
+    group: str,
+    env: Mapping[str, Any],
+    op_name: str,
+    reason: str,
+) -> None:
+    """Ends an intent that got no answer (`UNKNOWN_END_CODES`): shuts the guard with `reason`,
+    then records the intent as unresolved."""
+    ctx.guard.block(intent_id, group, op_name, reason)
     try:
-        rt.journal.append(
-            {
-                "type": "unresolved",
-                "id": intent_id,
-                "group": group,
-                "ts": now_iso(),
-                "errorCode": env.get("errorCode"),
-                "error": env.get("error"),
-            }
-        )
+        unresolved: UnresolvedRecord = {
+            "type": "unresolved",
+            "id": intent_id,
+            "group": group,
+            "ts": now_iso(),
+            "errorCode": env.get("errorCode"),
+            "error": env.get("error"),
+        }
+        ctx.journal.append(unresolved)
     except OSError:
         pass  # the intent alone already says "in doubt"; the guard is what matters
+
+
+def close_outcome(
+    ctx: ServerContext, record: OutcomeRecord, intent_id: str, group: str, op_name: str
+) -> OSError | None:
+    """Appends the outcome record. When the journal cannot be written the guard is shut (the
+    intent stays open) and the error is returned, so the caller can say so in its answer."""
+    try:
+        ctx.journal.append(record)
+    except OSError as exc:
+        ctx.guard.block(intent_id, group, op_name, OUTCOME_NOT_WRITTEN)
+        return exc
+    return None

@@ -11,21 +11,22 @@ from typing import Any
 
 import pytest
 
-from flame_mcp import envelope
-from flame_mcp.ops import plan as plan_mod
+from flame_mcp import compact, envelope, plan_step
+from flame_mcp.journal import JournalLink
 from flame_mcp.policy import Policy
 from flame_mcp.types import Category, OperationParam, OperationSpec
 from journal_test_helpers import BG1, COMP, REEL_WIRETAP, Rig, make_rig
 from p32b_helpers import PLAN, S1, make_p32b_rig
 from p33_helpers import REPLACE, add_media_clip, clip_sel
+from plan_brief_helpers import brief_of, declared_brief_paths
+from plan_use_helpers import OWN_GROUP_OPS, REFUSED_IN_PLAN
+from rig_fixtures import rig_fixture
 from timeline_p32a_helpers import fingerprint_of_target, seg_sel
 
 EXPO = {"kind": "node", "batch": BG1, "name": "exposure1"}
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def set_step(target: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
@@ -92,16 +93,16 @@ def test_the_plan_group_is_recorded_before_the_first_intent(rig: Rig) -> None:
     assert shown["records"][0]["type"] == "group"
 
 
-def test_envelope_shape_partial_affected_and_undo_steps(rig: Rig) -> None:
+def test_envelope_shape_partial_and_affected(rig: Rig) -> None:
     env = run_plan(rig, three_writes())
     assert env["partial"] == {"done": 3, "failed": 0, "notRun": 0}
-    assert env["affected"] == 3 and env["undoSteps"] == 0
+    assert env["affected"] == 3
     assert env["execution"]["thread"] == "server" and env["execution"]["op"] == "plan.run"
     assert env["result"]["stoppedAt"] is None and env["result"]["failClosed"] is None
     assert [s["ok"] for s in env["result"]["steps"]] == [True, True, True]
 
 
-def test_affected_and_undo_steps_are_sums_over_the_steps(
+def test_affected_is_the_sum_over_the_steps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     rig = make_rig(monkeypatch, tmp_path)
@@ -119,11 +120,10 @@ def test_affected_and_undo_steps_are_sums_over_the_steps(
         OperationSpec(
             name="testcat.native_write",
             category="testcat",
-            description="a write Flame's own Ctrl+Z tracks (2 steps)",
+            description="a write that affects 2 items",
             effect="create",
             params=(OperationParam(name="value", type="string", description="v", required=True),),
             to_python=lambda args: f"flame._thing = {args['value']!r}\n_affected = 2",
-            undo_steps=lambda args, affected: affected,
         )
     )
     steps = [
@@ -133,7 +133,8 @@ def test_affected_and_undo_steps_are_sums_over_the_steps(
     ]
     env = run_plan(rig, steps)
     assert env["ok"] is True, env
-    assert (env["affected"], env["undoSteps"]) == (5, 4)  # 2 + 2 + 1 keys; 2 + 2 + 0 undo steps
+    assert env["affected"] == 5  # 2 + 2 + 1 keys
+    assert "undoSteps" not in env
     assert rig.flame._thing == "b"
 
 
@@ -146,9 +147,9 @@ def test_a_plan_that_only_reads_has_no_group(rig: Rig) -> None:
 
 
 def test_a_plan_of_exactly_the_maximum_size_runs(rig: Rig) -> None:
-    steps = [{"op": "batch.list"}] * plan_mod.MAX_PLAN_STEPS
+    steps = [{"op": "batch.list"}] * plan_step.MAX_PLAN_STEPS
     env = run_plan(rig, steps)
-    assert env["ok"] is True and env["partial"]["done"] == plan_mod.MAX_PLAN_STEPS
+    assert env["ok"] is True and env["partial"]["done"] == plan_step.MAX_PLAN_STEPS
 
 
 def test_one_invalid_step_means_nothing_runs(rig: Rig) -> None:
@@ -219,16 +220,16 @@ def test_a_plan_may_not_be_empty_or_too_long_or_have_a_bad_on_error(rig: Rig) ->
     assert empty["errorCode"] == "INVALID_ARGS" and "at least one step" in str(
         empty["result"]["planProblems"]
     )
-    too_long = run_plan(rig, [{"op": "batch.list"}] * (plan_mod.MAX_PLAN_STEPS + 1))
+    too_long = run_plan(rig, [{"op": "batch.list"}] * (plan_step.MAX_PLAN_STEPS + 1))
     assert too_long["errorCode"] == "INVALID_ARGS"
-    assert f"at most {plan_mod.MAX_PLAN_STEPS} steps" in too_long["result"]["planProblems"][0]
+    assert f"at most {plan_step.MAX_PLAN_STEPS} steps" in too_long["result"]["planProblems"][0]
     bad = run_plan(rig, [{"op": "batch.list"}], on_error="shrug")
     assert bad["errorCode"] == "INVALID_ARGS" and "on_error" in bad["result"]["planProblems"][0]
     assert rig.exec.calls == []
 
 
 def test_the_step_limit_is_50() -> None:
-    assert plan_mod.MAX_PLAN_STEPS == 50
+    assert plan_step.MAX_PLAN_STEPS == 50
 
 
 def test_continue_with_a_write_is_refused_and_nothing_runs(rig: Rig) -> None:
@@ -406,7 +407,7 @@ def test_a_lost_answer_stops_a_plan_even_with_the_check_pending_in_the_group(rig
 def test_a_step_result_too_big_for_the_answer_is_left_out_and_listed(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(plan_mod, "PLAN_STEP_RESULT_BYTES", 300)
+    monkeypatch.setattr(plan_step, "PLAN_STEP_RESULT_BYTES", 300)
     env = run_plan(
         rig,
         [
@@ -424,7 +425,7 @@ def test_a_step_result_too_big_for_the_answer_is_left_out_and_listed(
 def test_step_results_beyond_the_total_budget_are_left_out(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(plan_mod, "PLAN_TOTAL_RESULT_BYTES", 700)
+    monkeypatch.setattr(plan_step, "PLAN_TOTAL_RESULT_BYTES", 700)
     env = run_plan(rig, [{"op": "node.list", "args": {"target": BG1}}] * 4)
     omitted = env["result"]["resultsOmitted"]
     assert omitted and omitted == list(range(4 - len(omitted), 4))  # the late ones, not the early
@@ -546,10 +547,10 @@ def test_a_change_after_the_last_of_several_writes_to_a_key_still_conflicts(rig:
 def test_a_broken_chain_of_writes_to_one_key_conflicts_and_says_why(rig: Rig) -> None:
     group = "g_chain_test"
     args = {"target": COMP, "values": {"pos_x": 5.0}}
-    assert rig.runtime.call("node.set_attributes", args, group=group)["ok"] is True
+    assert rig.runtime.call("node.set_attributes", args, link=JournalLink(group))["ok"] is True
     rig.handles["comp"].pos_x._value = 50.0  # between the two writes, outside the journal
     args = {"target": COMP, "values": {"pos_x": 7.0}}
-    assert rig.runtime.call("node.set_attributes", args, group=group)["ok"] is True
+    assert rig.runtime.call("node.set_attributes", args, link=JournalLink(group))["ok"] is True
     rig.exec.calls.clear()
     back = rig.do("journal.revert", {"group": group})
     assert back["errorCode"] == "CONFLICT" and back["ok"] is False
@@ -565,10 +566,10 @@ def test_a_broken_chain_of_writes_to_one_key_conflicts_and_says_why(rig: Rig) ->
 def test_every_key_compared_with_the_next_write_says_so_in_its_reason(rig: Rig) -> None:
     group = "g_reason_test"
     first = {"target": COMP, "values": {"pos_x": 5.0, "pos_y": 3.0}}
-    assert rig.runtime.call("node.set_attributes", first, group=group)["ok"] is True
+    assert rig.runtime.call("node.set_attributes", first, link=JournalLink(group))["ok"] is True
     rig.handles["comp"].pos_x._value = 50.0  # pos_y is left as the first write set it
     second = {"target": COMP, "values": {"pos_x": 7.0, "pos_y": 4.0}}
-    assert rig.runtime.call("node.set_attributes", second, group=group)["ok"] is True
+    assert rig.runtime.call("node.set_attributes", second, link=JournalLink(group))["ok"] is True
     rig.exec.calls.clear()
     back = rig.do("journal.revert", {"group": group})
     assert back["errorCode"] == "CONFLICT" and rig.write_labels() == []
@@ -581,7 +582,9 @@ def test_every_key_compared_with_the_next_write_says_so_in_its_reason(rig: Rig) 
 
 
 def node_write(rig: Rig, group: str, target: dict[str, Any], **values: Any) -> dict[str, Any]:
-    env = rig.runtime.call("node.set_attributes", {"target": target, "values": values}, group=group)
+    env = rig.runtime.call(
+        "node.set_attributes", {"target": target, "values": values}, link=JournalLink(group)
+    )
     assert env["ok"] is True, env
     return env
 
@@ -830,9 +833,9 @@ def test_the_journal_being_unwritable_refuses_a_plan_that_writes(
 
 # result_detail: 'full' | 'summary' | 'auto' (write steps > 10 means summary)
 
-FULL_STEP_KEYS = {"index", "op", "ok", "errorCode", "error", "result", "journal"}
-SUMMARY_STEP_KEYS = {"index", "op", "ok", "errorCode", "brief"}
-FAILED_SUMMARY_STEP_KEYS = {"index", "op", "ok", "errorCode", "error", "result"}
+FULL_STEP_KEYS = {"index", "id", "op", "ok", "errorCode", "error", "result", "journal"}
+SUMMARY_STEP_KEYS = {"index", "id", "op", "ok", "errorCode", "brief"}
+FAILED_SUMMARY_STEP_KEYS = {"index", "id", "op", "ok", "errorCode", "error", "result"}
 SUMMARY_LIMIT_BYTES = 5_000
 
 
@@ -939,7 +942,6 @@ def test_a_read_step_and_an_op_outside_the_brief_table_have_no_brief(rig: Rig) -
             effect="create",
             params=(OperationParam(name="value", type="string", description="v", required=True),),
             to_python=lambda args: f"flame._thing = {args['value']!r}\n_affected = 1",
-            undo_steps=lambda args, affected: 0,
         )
     )
     steps = [
@@ -955,10 +957,10 @@ def test_a_read_step_and_an_op_outside_the_brief_table_have_no_brief(rig: Rig) -
 
 
 def test_a_step_without_the_fields_the_table_names_has_no_brief() -> None:
-    assert plan_mod._brief("segment.replace", None) is None
-    assert plan_mod._brief("segment.replace", {"position": None}) is None
-    assert plan_mod._brief("node.set_attributes", {"applied": []}) == {"applied": []}
-    assert plan_mod._brief("no.such_op", {"applied": ["x"]}) is None
+    assert brief_of("segment.replace", None) is None
+    assert brief_of("segment.replace", {"position": None}) is None
+    assert brief_of("node.set_attributes", {"applied": []}) == {"applied": []}
+    assert brief_of("no.such_op", {"applied": ["x"]}) is None
 
 
 def test_a_brief_keeps_the_scalars_of_a_position_and_drops_its_selectors() -> None:
@@ -970,31 +972,31 @@ def test_a_brief_keeps_the_scalars_of_a_position_and_drops_its_selectors() -> No
         "selector": {"kind": "segment", "record_in": 120},
         "selectorByIndex": {"kind": "segment", "index": 3},
     }
-    assert plan_mod._brief("segment.trim", {"position": position}) == {
+    assert brief_of("segment.trim", {"position": position}) == {
         "position": {"version": 0, "track": 1, "index": 3, "recordIn": 120}
     }
 
 
 def test_ops_a_plan_refuses_as_steps_are_not_in_the_brief_table() -> None:
-    assert not set(plan_mod.BRIEF_PATHS) & set(plan_mod.REFUSED_IN_PLAN)
-    assert not set(plan_mod.BRIEF_PATHS) & plan_mod.OWN_GROUP_OPS
-    assert all("." not in path for paths in plan_mod.BRIEF_PATHS.values() for path in paths)
+    assert not set(declared_brief_paths()) & set(REFUSED_IN_PLAN)
+    assert not set(declared_brief_paths()) & OWN_GROUP_OPS
+    assert all("." not in path for paths in declared_brief_paths().values() for path in paths)
 
 
 def test_a_created_node_has_a_brief_with_its_name_and_type() -> None:
     node = {"name": "b1", "pyType": "PyNode", "type": "Blur", "pos": [0, 0], "sameNameCount": 1}
     expected = {"node": {"name": "b1", "pyType": "PyNode", "type": "Blur", "sameNameCount": 1}}
     for op in ("node.create", "node.duplicate"):
-        assert plan_mod._brief(op, {"node": node, "addedNames": ["b1"]}) == expected
-    assert plan_mod._brief("node.create", {"node": None}) is None
+        assert brief_of(op, {"node": node, "addedNames": ["b1"]}) == expected
+    assert brief_of("node.create", {"node": None}) is None
 
 
 def test_a_long_list_in_a_brief_is_cut_and_the_rest_counted() -> None:
-    limit = plan_mod.BRIEF_LIST_LIMIT
+    limit = plan_step.BRIEF_LIST_LIMIT
     keys = [f"k{i}" for i in range(limit + 5)]
-    brief = plan_mod._brief("node.set_attributes", {"applied": keys})
+    brief = brief_of("node.set_attributes", {"applied": keys})
     assert brief == {"applied": keys[:limit], "appliedOmitted": 5}
-    exact = plan_mod._brief("node.set_attributes", {"applied": keys[:limit]})
+    exact = brief_of("node.set_attributes", {"applied": keys[:limit]})
     assert exact == {"applied": keys[:limit]}
 
 
@@ -1017,7 +1019,7 @@ def test_a_failed_step_keeps_its_error_cut_at_600_characters_and_its_result(
 def test_a_failed_summary_step_result_over_the_step_budget_is_left_out_and_listed(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(plan_mod, "PLAN_STEP_RESULT_BYTES", 100)
+    monkeypatch.setattr(plan_step, "PLAN_STEP_RESULT_BYTES", 100)
     steps = [set_step(COMP, {"pos_x": 5.0}), set_step(COMP, {"blend_type": "Z" * 2000})]
     env = run_plan(rig, steps, result_detail="summary")
     second = env["result"]["steps"][1]
@@ -1072,9 +1074,7 @@ def test_summary_with_continue_reports_every_read_step(rig: Rig) -> None:
     assert env["partial"] == {"done": 2, "failed": 1, "notRun": 0}
 
 
-@pytest.fixture
-def timeline_rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_p32b_rig(monkeypatch, tmp_path)
+timeline_rig = rig_fixture(make_p32b_rig)
 
 
 LONG_CLIP_NAME = "ULIKE_250521_30s_CUT{:02d}_v03_graded_final_for_conform"
@@ -1158,3 +1158,435 @@ def test_a_failed_summarised_timeline_plan_keeps_the_revert_hint(timeline_rig: R
     assert f"journal.revert(group={group!r})" in env["hint"]
     assert "timeline" in env["result"] and "resolved" not in env["result"]["timeline"]
     assert set(env["result"]["steps"][1]) >= {"index", "op", "ok", "errorCode", "error"}
+
+
+# compact responses: 'auto' decides per step (reads full, successful writes brief, failures full)
+
+READ_STEP = {"op": "node.get_attributes", "args": {"target": COMP, "keys": ["pos_x"]}}
+MIXED_NOTE_FRAGMENT = "result_detail='full'"
+READ_IN_SUMMARY_KEYS = SUMMARY_STEP_KEYS - {"brief"}
+
+
+def compact_rig(rig: Rig) -> Rig:
+    rig.runtime.response_mode = "compact"
+    return rig
+
+
+def test_the_runtime_answers_in_full_mode_unless_told_otherwise(rig: Rig) -> None:
+    assert rig.runtime.response_mode == "full"
+
+
+def test_auto_stays_per_plan_when_responses_are_not_compact(rig: Rig) -> None:
+    env = run_plan(rig, [READ_STEP, *three_writes()])
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["detail"] == "full" and "resultsNote" not in result
+    assert [set(s) for s in result["steps"]] == [FULL_STEP_KEYS] * 4
+    big = run_plan(rig, [READ_STEP, *many_writes(11)])
+    assert big["result"]["detail"] == "summary" and "resultsNote" not in big["result"]
+    assert set(big["result"]["steps"][0]) == READ_IN_SUMMARY_KEYS
+    assert set(big["result"]["steps"][1]) == SUMMARY_STEP_KEYS
+
+
+def test_compact_auto_keeps_reads_whole_and_writes_to_a_brief(rig: Rig) -> None:
+    env = run_plan(compact_rig(rig), [READ_STEP, *three_writes()])
+    assert env["ok"] is True, env
+    result = env["result"]
+    assert result["detail"] == "mixed"
+    read, *writes = result["steps"]
+    assert set(read) == FULL_STEP_KEYS and read["result"] is not None
+    assert [set(s) for s in writes] == [SUMMARY_STEP_KEYS] * 3
+    assert [s["brief"] for s in writes] == [
+        {"applied": ["pos_x"]},
+        {"applied": ["exposure_red"]},
+        {"applied": ["name"]},
+    ]
+    assert MIXED_NOTE_FRAGMENT in result["resultsNote"]
+    assert (comp_pos(rig), expo_red(rig), reel_name(rig)) == (5, 1.5, "R1b")
+
+
+def test_compact_auto_puts_the_note_once_not_per_step(rig: Rig) -> None:
+    env = run_plan(compact_rig(rig), three_writes())
+    assert isinstance(env["result"]["resultsNote"], str)
+    assert not any("resultsNote" in s for s in env["result"]["steps"])
+
+
+def test_compact_auto_has_no_note_when_every_step_is_a_read(rig: Rig) -> None:
+    env = run_plan(compact_rig(rig), [READ_STEP] * 3)
+    assert env["ok"] is True, env
+    assert env["result"]["detail"] == "mixed" and "resultsNote" not in env["result"]
+    assert [set(s) for s in env["result"]["steps"]] == [FULL_STEP_KEYS] * 3
+
+
+def test_compact_auto_keeps_a_failed_write_whole(rig: Rig) -> None:
+    steps = [READ_STEP, set_step(COMP, {"pos_x": 5.0}), set_step(COMP, {"blend_type": "Z" * 2000})]
+    env = run_plan(compact_rig(rig), steps)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS"
+    read, done, failed = env["result"]["steps"]
+    assert set(read) == FULL_STEP_KEYS
+    assert set(done) == SUMMARY_STEP_KEYS
+    assert set(failed) == FULL_STEP_KEYS and failed["ok"] is False
+    assert len(failed["error"]) == 600
+    assert "resultsNote" in env["result"]
+
+
+def test_compact_auto_keeps_reads_in_a_plan_with_more_than_ten_writes(rig: Rig) -> None:
+    env = run_plan(compact_rig(rig), [READ_STEP, *many_writes(11), READ_STEP])
+    assert env["ok"] is True, env
+    steps = env["result"]["steps"]
+    assert env["result"]["detail"] == "mixed"
+    assert set(steps[0]) == set(steps[-1]) == FULL_STEP_KEYS
+    assert steps[0]["result"] is not None and steps[-1]["result"] is not None
+    assert [set(s) for s in steps[1:-1]] == [SUMMARY_STEP_KEYS] * 11
+
+
+def test_an_explicit_full_or_summary_is_the_same_when_compact(rig: Rig) -> None:
+    compact_rig(rig)
+    full = run_plan(rig, [READ_STEP, *three_writes()], result_detail="full")
+    assert full["result"]["detail"] == "full" and "resultsNote" not in full["result"]
+    assert [set(s) for s in full["result"]["steps"]] == [FULL_STEP_KEYS] * 4
+    summary = run_plan(rig, [READ_STEP, *many_writes(2)], result_detail="summary")
+    assert summary["result"]["detail"] == "summary" and "resultsNote" not in summary["result"]
+    assert set(summary["result"]["steps"][0]) == READ_IN_SUMMARY_KEYS
+    assert [set(s) for s in summary["result"]["steps"][1:]] == [SUMMARY_STEP_KEYS] * 2
+
+
+def test_compact_auto_still_cuts_a_big_read_result(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(plan_step, "PLAN_STEP_RESULT_BYTES", 10)
+    env = run_plan(compact_rig(rig), [READ_STEP, *many_writes(1)])
+    read = env["result"]["steps"][0]
+    assert read["result"]["omitted"] is True and env["result"]["resultsOmitted"] == [0]
+
+
+# brief keys of the write ops that had none (values copied from what the handlers return)
+
+_PLACED = {
+    "version": 0,
+    "track": 0,
+    "index": 2,
+    "recordIn": 30,
+    "selector": {"kind": "segment", "record_in": 30},
+    "selectorByIndex": {"kind": "segment", "index": 2},
+}
+_SAVE_FILE = "/tmp/x/setup.batch"
+BRIEF_CASES: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+    (
+        "timeline.checkpoint",
+        {"checkpoint": "c_1", "label": "x", "source": {"name": "S1"}},
+        {"checkpoint": "c_1"},
+    ),
+    ("batch.checkpoint", {"checkpoint": "c_2", "batch": {"name": "BG1"}}, {"checkpoint": "c_2"}),
+    (
+        "timeline.overwrite",
+        {"mode": "overwrite", "at": 30, "placed": _PLACED, "source": {"name": "len12"}},
+        {"at": 30, "placed": {"version": 0, "track": 0, "index": 2, "recordIn": 30}},
+    ),
+    (
+        "timeline.insert",
+        {"mode": "insert", "at": 20, "placed": _PLACED},
+        {"at": 20, "placed": {"version": 0, "track": 0, "index": 2, "recordIn": 30}},
+    ),
+    (
+        "timeline.cut",
+        {"scope": "track", "at": 20, "split": True, "willCut": [{"recordIn": 10}]},
+        {"scope": "track", "at": 20, "split": True},
+    ),
+    (
+        "timeline.cut",
+        {
+            "scope": "all",
+            "at": 20,
+            "split": [{"version": 0, "track": 0}],
+            "notSplit": [{"version": 0, "track": 1}],
+            "willCut": [{"version": 0, "track": 0, "recordIn": 10}],
+        },
+        {
+            "scope": "all",
+            "at": 20,
+            "split": [{"version": 0, "track": 0}],
+            "notSplit": [{"version": 0, "track": 1}],
+        },
+    ),
+    (
+        "timeline.delete_segments",
+        {"version": 0, "track": 1, "shifted": 24, "removed": [{"index": 2}], "ripple": True},
+        {"version": 0, "track": 1, "shifted": 24},
+    ),
+    (
+        "timeline.shorten",
+        {"duration": 360, "end": 360, "startFrame": 0, "tracks": [{"track": 0}]},
+        {"duration": 360, "end": 360},
+    ),
+    (
+        "timeline.create_version",
+        {"version": {"index": 1, "tracks": [{"track": 0}]}, "versionsAfter": [2, 1]},
+        {"version": {"index": 1}},
+    ),
+    (
+        "timeline.create_track",
+        {"track": {"index": 2, "summary": {"track": 2}}, "tracksAfter": 3},
+        {"track": {"index": 2}},
+    ),
+    (
+        "timeline.move_track",
+        {"moved": {"from": 2, "to": 0, "k": 3}, "stage": "delete", "changed": True},
+        {"moved": {"from": 2, "to": 0, "k": 3}},
+    ),
+    (
+        "segment.effect_save_setup",
+        {
+            "type": "Blur",
+            "requestedPath": "/tmp/x/bl",
+            "files": [{"path": "/tmp/x/bl.timeline_fx", "size": 512}],
+        },
+        {"files": [{"path": "/tmp/x/bl.timeline_fx", "size": 512}]},
+    ),
+    (
+        "batch.save_setup",
+        {"batch": {"name": "BG1"}, "path": _SAVE_FILE, "size": 3},
+        {"path": _SAVE_FILE},
+    ),
+    (
+        "node.save_setup",
+        {"node": {"name": "expo", "pyType": "PyNode", "pos": [0, 0]}, "path": "/tmp/x/e.node"},
+        {"node": {"name": "expo", "pyType": "PyNode"}, "path": "/tmp/x/e.node"},
+    ),
+    (
+        "node.connect",
+        {
+            "source": "blur1",
+            "sourceSocket": "Default",
+            "target": "comp1",
+            "targetSocket": "Default",
+        },
+        {
+            "source": "blur1",
+            "sourceSocket": "Default",
+            "target": "comp1",
+            "targetSocket": "Default",
+        },
+    ),
+    (
+        "node.disconnect",
+        {"node": "comp1", "socket": "Input_0", "disconnected": {"Input_0": ["blur1"]}},
+        {"node": "comp1", "socket": "Input_0"},
+    ),
+    (
+        "node.delete",
+        {"deleted": "blur1", "alsoRemoved": ["x"], "pyType": "PyNode"},
+        {"deleted": "blur1", "alsoRemoved": ["x"]},
+    ),
+    (
+        "node.load_setup",
+        {"node": "clip1", "path": "/tmp/x/c.node", "changed": {"bypass": {"before": 1}}},
+        {"node": "clip1", "path": "/tmp/x/c.node"},
+    ),
+    (
+        "action.create_node",
+        {"created": {"name": "path1", "pyType": "PyCoNode", "type": "3D Path"}, "added": [{}]},
+        {"created": {"name": "path1", "pyType": "PyCoNode", "type": "3D Path"}},
+    ),
+    (
+        "action.connect",
+        {"action": "action1", "child": "path1", "parent": "axis2", "linked": True},
+        {"action": "action1", "child": "path1", "parent": "axis2", "linked": True},
+    ),
+    (
+        "batch.create_reel",
+        {"kind": "schematic", "reel": {"name": "Mine", "type": "Schematic", "uid": "u1"}},
+        {"reel": {"name": "Mine", "type": "Schematic", "uid": "u1"}},
+    ),
+    (
+        "batch.add_clips",
+        {"reel": {"name": "R", "kind": "schematic"}, "applied": ["clip1", "clip2"], "requested": 2},
+        {"reel": {"name": "R", "kind": "schematic"}, "applied": ["clip1", "clip2"]},
+    ),
+    (
+        "batch.organize",
+        {"moved": 3, "nodeCount": 4, "movedNodes": ["comp1", "exposure1"]},
+        {"moved": 3, "movedNodes": ["comp1", "exposure1"]},
+    ),
+]
+
+
+@pytest.mark.parametrize(("op", "result", "expected"), BRIEF_CASES, ids=[c[0] for c in BRIEF_CASES])
+def test_a_write_op_with_a_brief_keeps_exactly_the_keys_fixed_for_it(
+    op: str, result: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    assert brief_of(op, result) == expected
+
+
+def test_every_op_in_the_brief_table_is_a_registered_write_a_plan_accepts(rig: Rig) -> None:
+    for name in declared_brief_paths():
+        op = rig.registry.get(name)
+        assert op is not None, name
+        if name != "batch.compare_setup":
+            assert op.effect != "read", name
+
+
+def test_the_ops_with_briefs_added_for_compact_plans_are_in_the_table() -> None:
+    assert {c[0] for c in BRIEF_CASES} <= set(declared_brief_paths())
+
+
+SELECTOR_MARKS = {"id", "uid", "parent", "batch", "record_in", "index", "expect_source_name"}
+
+
+def _selectors_in(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        found = [value] if "kind" in value and SELECTOR_MARKS & set(value) else []
+        return found + [f for v in value.values() for f in _selectors_in(v)]
+    if isinstance(value, list):
+        return [f for v in value for f in _selectors_in(v)]
+    return []
+
+
+def test_a_brief_never_carries_a_selector() -> None:
+    with_selectors = {"kind": "segment", "record_in": 1}
+    for op, result, _expected in BRIEF_CASES:
+        loaded = dict(result)
+        for key in declared_brief_paths()[op]:
+            value = loaded.get(key)
+            if isinstance(value, dict):
+                loaded[key] = {
+                    **value,
+                    "selector": with_selectors,
+                    "selectorByIndex": with_selectors,
+                }
+        brief = brief_of(op, loaded)
+        assert brief is not None and _selectors_in(brief) == [], op
+
+
+def test_a_compact_plan_of_batch_writes_reports_each_one_as_its_brief(rig: Rig) -> None:
+    steps = [
+        {"op": "node.connect", "args": {"source": EXPO, "target": COMP}},
+        {"op": "batch.create_reel", "args": {"target": BG1, "name": "Scratch"}},
+        {"op": "node.delete", "args": {"target": EXPO}},
+    ]
+    env = run_plan(compact_rig(rig), steps)
+    assert env["ok"] is True, env
+    briefs = [s["brief"] for s in env["result"]["steps"]]
+    assert briefs[0] == {
+        "source": "exposure1",
+        "sourceSocket": "Default",
+        "target": "comp1",
+        "targetSocket": "Default",
+    }
+    assert briefs[1]["reel"]["name"] == "Scratch" and briefs[1]["reel"]["uid"]
+    assert briefs[2] == {"deleted": "exposure1", "alsoRemoved": []}
+
+
+def test_a_compact_timeline_plan_drops_the_resolution_list_and_keeps_the_rest(
+    timeline_rig: Rig,
+) -> None:
+    before = fingerprint_of_target(timeline_rig, S1)
+    env = timeline_rig.do(PLAN, {"steps": replace_19(timeline_rig)[:3]})
+    assert env["result"]["detail"] == "full" and "resolved" in env["result"]["timeline"]
+    timeline_rig.runtime.response_mode = "compact"
+    env = timeline_rig.do(PLAN, {"steps": replace_19(timeline_rig)[:3]})
+    assert env["ok"] is True, env
+    timeline = env["result"]["timeline"]
+    assert env["result"]["detail"] == "mixed" and "resolved" not in timeline
+    assert {"fingerprintBefore", "fingerprintAfter", "changed", "note"} <= set(timeline)
+    assert timeline["fingerprintBefore"] != before or timeline["changed"] is True
+
+
+def test_a_failed_compact_timeline_plan_keeps_the_revert_hint(timeline_rig: Rig) -> None:
+    timeline_rig.runtime.response_mode = "compact"
+    steps = []
+    for offset in (2, 9):  # the second slip asks for more handle than the segment has
+        target = seg_sel(S1, 0, record_in=10)
+        steps.append({"op": "segment.slip", "args": {"target": target, "offset": offset}})
+    env = timeline_rig.do(PLAN, {"steps": steps})
+    assert env["ok"] is False and env["errorCode"] == "PRECONDITION_UNMET"
+    group = env["result"]["group"]
+    assert f"journal.revert(group={group!r})" in env["hint"]
+    assert "resolved" not in env["result"]["timeline"]
+    assert env["result"]["detail"] == "mixed"
+
+
+def test_a_compact_batch_plan_drops_the_resolution_list(rig: Rig) -> None:
+    steps = [{"op": "node.connect", "args": {"source": EXPO, "target": COMP}}]
+    full = run_plan(rig, steps)
+    assert "resolved" in full["result"]["batch"]
+    rig.do("node.disconnect", {"target": COMP, "socket": "Input_0"})
+    env = run_plan(compact_rig(rig), steps)
+    assert env["ok"] is True, env
+    batch = env["result"]["batch"]
+    assert "resolved" not in batch
+    assert {"fingerprintBefore", "fingerprintAfter", "changed", "note"} <= set(batch)
+
+
+def test_compact_auto_with_continue_mixes_reads_good_writes_and_failures(rig: Rig) -> None:
+    missing = {
+        "op": "node.get_attributes",
+        "args": {"target": {**COMP, "name": "nope"}, "keys": ["pos_x"]},
+    }
+    steps = [READ_STEP, missing, READ_STEP]
+    env = run_plan(compact_rig(rig), steps, on_error="continue")
+    assert env["ok"] is True, env
+    ok1, bad, ok2 = env["result"]["steps"]
+    assert set(ok1) == set(ok2) == FULL_STEP_KEYS and ok1["result"] is not None
+    assert bad["ok"] is False and set(bad) == FULL_STEP_KEYS
+    assert "resultsNote" not in env["result"]
+
+
+def test_compact_auto_mixed_write_failure_and_read_in_one_plan(rig: Rig) -> None:
+    steps = [
+        set_step(COMP, {"pos_x": 5.0}),
+        set_step(COMP, {"blend_type": "Z" * 2000}),
+        READ_STEP,
+    ]
+    env = run_plan(compact_rig(rig), steps)
+    assert env["ok"] is False and env["result"]["stoppedAt"] == 1
+    done, failed = env["result"]["steps"]
+    assert set(done) == SUMMARY_STEP_KEYS and set(failed) == FULL_STEP_KEYS
+    assert failed["journal"] is not None and failed["error"]
+    assert isinstance(env["result"]["resultsNote"], str)
+
+
+def test_a_mixed_answer_survives_compact_envelope(rig: Rig) -> None:
+    ok = run_plan(compact_rig(rig), [READ_STEP, *three_writes()])
+    bad = run_plan(
+        rig,
+        [READ_STEP, set_step(COMP, {"pos_x": 7.0}), set_step(COMP, {"blend_type": "Z" * 2000})],
+    )
+    for env in (ok, bad):
+        squeezed = compact.compact_envelope(env)
+        steps = squeezed["result"]["steps"]
+        if isinstance(steps, dict):
+            steps = [dict(zip(steps["columns"], row, strict=True)) for row in steps["rows"]]
+        assert [s["op"] for s in steps] == [s["op"] for s in env["result"]["steps"]]
+        assert squeezed["result"]["detail"] == "mixed"
+        assert [s["ok"] for s in steps] == [s["ok"] for s in env["result"]["steps"]]
+        written = [s for s in steps if s["op"] != "node.get_attributes" and s["ok"]]
+        assert written and all(
+            any(k.startswith("brief") and s[k] is not None for k in s) for s in written
+        )
+
+
+def test_a_plan_whose_group_record_cannot_be_journaled_runs_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(record: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rig.journal, "append", refuse)
+    env = run_plan(rig, three_writes())
+    assert env["ok"] is False and env["errorCode"] == "POLICY_DENIED", env
+    assert "the journal cannot be written (disk full)" in env["error"]
+    assert "writable" in env["hint"] and env["result"] == {"ran": False}
+    assert rig.exec.calls == []
+    assert reel_name(rig) == "Reel 1"
+
+
+def test_a_plan_with_a_policy_denied_step_and_a_bad_step_is_invalid_not_denied(
+    rig: Rig,
+) -> None:
+    rig.runtime.policy = Policy.from_env({"FLAME_MCP_READONLY": "1"})
+    steps = [{"op": "desktop.rename", "args": {"target": REEL_WIRETAP, "name": "R1b"}}, {"op": 5}]
+    env = run_plan(rig, steps)
+    assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS", env
+    denied = run_plan(rig, steps[:1])
+    assert denied["ok"] is False and denied["errorCode"] == "POLICY_DENIED", denied

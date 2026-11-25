@@ -187,7 +187,8 @@ class Sandbox:
             PHASE0B_SHELL_LOG=str(self.shell_log),
             PHASE0B_FLAME_BIN_PATTERN=f"{self.marker}\\.sh",
             PHASE0B_SAMPLE_CMD=str(self.bin_dir / "sample"),
-            PHASE0B_SENDDMP_PATTERN="no_such_senddmp_process",
+            # The bracket keeps `pgrep -f` from matching the command line of another test's pgrep.
+            PHASE0B_SENDDMP_PATTERN="[n]o_such_senddmp_process",
         )
         env.update(extra)
         return env

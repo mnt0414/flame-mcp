@@ -29,15 +29,14 @@ from flame_mcp import render_files, transport
 from flame_mcp.journal import Index, IntentView
 from flame_mcp.policy import Policy
 from flame_mcp.render_plan import preflight_problems
-from flame_mcp.transport import BridgeProtocolError, BridgeResult
+from flame_mcp.transport import BridgeProtocolError, BridgeResult, UnknownHandleError
 from journal_test_helpers import BG1, FakeBridge, Rig, bridge_result, make_rig
+from rig_fixtures import rig_fixture
 
 BG2 = {"kind": "batch", "name": "BG2"}
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def bg(rig: Rig, key: str = "bg1") -> PyBatch:
@@ -482,7 +481,7 @@ def test_a_render_writes_the_frames_and_reports_and_journals_them(rig: Rig, tmp_
     assert result["newClips"] == [
         {"kind": "shelf", "name": "Batch Renders", "clips": ["writefile1"]}
     ]
-    assert env["affected"] == 8 and env["undoSteps"] == 0
+    assert env["affected"] == 8
     assert env["execution"]["op"] == "render.batch" and env["execution"]["undo"] == "unsupported"
     assert env["journal"]["revert"] is None and env["journal"]["undo"] == "unsupported"
     assert env["partial"] == {"written": 8, "expected": 8}
@@ -1283,7 +1282,7 @@ def test_a_failed_clean_up_poll_is_a_degraded_note_and_nothing_else(
 
 def test_a_clean_up_poll_that_finds_no_such_handle_says_nothing(rig: Rig, tmp_path: Path) -> None:
     add_writer(rig, tmp_path, last=4)
-    rig.bridge.failure = BridgeProtocolError("unknown handle: x")
+    rig.bridge.failure = UnknownHandleError("unknown handle: x")
     env = render(rig)
     assert env["ok"] is True and env["degraded"] == []
     assert len(rig.bridge.calls) == 1
@@ -1312,11 +1311,18 @@ def test_an_old_bridge_gets_no_handle_and_the_intent_says_so(rig: Rig, tmp_path:
 
 def test_only_a_handle_marked_as_the_servers_own_counts_as_the_intents_client_handle() -> None:
     base = {"id": "i1", "group": "g1", "handle": CLIENT_HANDLE_FOR_VIEW}
-    assert IntentView(intent={**base, "handleSource": "client"}).client_handle == base["handle"]
-    assert IntentView(intent={**base, "handleSource": None}).client_handle is None
-    assert IntentView(intent={**base, "handleSource": "bridge"}).client_handle is None
-    assert IntentView(intent={"id": "i1", "group": "g1"}).client_handle is None
-    assert IntentView(intent={**base, "handleSource": "client", "handle": ""}).client_handle is None
+
+    def view(**extra: Any) -> IntentView:
+        record: Any = {**base, **extra}
+        return IntentView(intent=record)
+
+    assert view(handleSource="client").client_handle == base["handle"]
+    assert view(handleSource=None).client_handle is None
+    assert view(handleSource="bridge").client_handle is None
+    assert view().client_handle is None
+    bare: Any = {"id": "i1", "group": "g1"}
+    assert IntentView(intent=bare).client_handle is None
+    assert view(handleSource="client", handle="").client_handle is None
 
 
 def test_bridge_lost_after_the_render_ran_is_settled_by_the_intents_handle(
@@ -1497,7 +1503,6 @@ def test_the_declarations(rig: Rig) -> None:
     assert batch.thread == "main-async" and plan.thread == "main"
     assert batch.checkpoint is None and batch.journal is None and batch.wrap is not None
     assert batch.accepts == ("batch",) and plan.accepts == ("batch",)
-    assert batch.undo_steps({}, 1) == 0
     text = batch.description
     for needle in (
         "Flame is occupied",

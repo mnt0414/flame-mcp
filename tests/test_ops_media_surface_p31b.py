@@ -29,11 +29,9 @@ from media_p31b_helpers import (
     make_media_rig,
     mv,
 )
+from rig_fixtures import rig_fixture
 
-
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_media_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_media_rig)
 
 
 @pytest.mark.parametrize(
@@ -69,7 +67,7 @@ def test_declarations_match_what_the_ops_do() -> None:
         op = registry.get(name)
         assert op is not None
         assert (op.effect, op.thread, op.undo) == ("create", "main", "value")
-        assert op.undo_steps({}, 3) == 0 and op.wrap is desktop_media_run.run_media_write
+        assert op.wrap is desktop_media_run.run_media_write
         assert (op.precheck is not None) == (name != DUP)
         assert set(op.accepts) == {"wiretap", "path", "selection"}
         for word in ("journal.revert", "plan.run", "Native Ctrl+Z"):

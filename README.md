@@ -23,9 +23,10 @@ flame-mcp works best for organizing projects and for routine tasks that follow f
 | Organize | Create, duplicate, move, and rename reels, clips, and sequences. Delete clips and sequences. |
 | Edit | Trim, slip, replace, and delete segments (closing the gap or leaving it). Cut, insert, and overwrite. Move video tracks. Shorten a sequence. Read and set segment connections. Add and set up Timeline FX. |
 | Batch | Create, connect, and set up nodes. Save and load setups. Compare a setup with one saved earlier to find values changed by hand. Render. |
-| Multi-step plans | Run several operations as one procedure (`plan.run`). |
+| Multi-step plans | Run several operations as one procedure (`plan.run`). A step can use a value from an earlier step, such as a uid that an earlier step found. |
+| Loops | Run the same steps for each item of a list (`plan.for_each`). A loop that writes shows you its list first and runs only after you approve it, and one `journal.revert` puts the whole loop back. |
 
-There are 111 operations in 13 categories. For the full list, see [docs/ops.md](docs/ops.md).
+For the full list of operations, see [docs/ops.md](docs/ops.md).
 
 ## Before you start
 
@@ -200,7 +201,7 @@ flame-mcp creates its files on disk so that only the user who started Flame can 
 
 To undo a change, ask the assistant ("Undo the last change"). The assistant runs `journal.revert`, which uses the change record to put things back. If a change can't be undone one value at a time, `journal.revert` uses the setup files or the copies saved for undo. If the target changed after the assistant's change, `journal.revert` stops and doesn't overwrite it.
 
-Changes made in one `plan.run` are undone together.
+Changes made in one `plan.run` are undone together. A `plan.for_each` loop has one parent group, and `journal.revert` on it puts the items back, newest first. Output that can't be put back (for example, rendered files) stays. An `approve` for a loop works once, also across a restart of the server.
 
 > [!WARNING]
 > **After the assistant changes something, don't press Ctrl+Z.** Flame's undo history doesn't always record changes such as renames and attribute changes. If you press Ctrl+Z, Flame might undo an earlier, different action instead.
@@ -232,10 +233,14 @@ Usually, you don't need to configure anything. To change a setting, pass an envi
 | `FLAME_MCP_FFMPEG` | Search the PATH, then the `imageio_ffmpeg` package | The ffmpeg that `render.still` uses to make its PNG |
 | `FLAME_MCP_STILLS_DIR` | `~/Library/Application Support/flame-mcp/stills` | Where `render.still` puts its files |
 | `FLAME_MCP_PRESETS_DIR` | `/opt/Autodesk/presets` | The directory that holds Flame's export presets, one folder per Flame version; `render.still` reads its preset from there |
+| `FLAME_MCP_LOOP_MAX_ITEMS` | `50` | The most items one `plan.for_each` call may run. A longer list is refused before anything runs |
+| `FLAME_MCP_LOOP_MAX_STEPS` | `200` | The most steps (items times steps per item) one `plan.for_each` call may run |
+| `FLAME_MCP_LOOP_BUDGET_S` | `120` | The seconds one `plan.for_each` call may run. It is checked between two items: when the time is used up, the loop stops after the current item and reports the items left |
+| `FLAME_MCP_LOOP_UNATTENDED` | Off | `1`: a `plan.for_each` loop whose steps can all be put back runs in one call, without the `dry_run` and `approve` round. Steps that rewrite or delete what is there, and steps that make output that can't be put back, still need `approve`. See [Loops that write](docs/safety.md#loops-that-write) |
 
 - Include `read` in `FLAME_MCP_ALLOW_EFFECTS`. Without it, every read is refused too.
 - Without `journal` in `FLAME_MCP_ALLOW_CATEGORIES`, the assistant can't check its changes or undo them.
-- If a setting isn't valid (for example, `FLAME_MCP_READONLY=true`, or a list that has only commas), the server doesn't start, and it shows the reason.
+- If a setting isn't valid (for example, `FLAME_MCP_READONLY=true`, a list that has only commas, a `FLAME_MCP_LOOP_*` limit that isn't a positive whole number of at most 9 digits, or `FLAME_MCP_LOOP_UNATTENDED` that isn't `0` or `1`), the server doesn't start, and it shows the reason.
 
 ### Read-only mode
 
@@ -262,6 +267,7 @@ With `FLAME_MCP_RESPONSE=compact`, the server leaves out of each response what t
 - Inside `result`, members that are null aren't sent, and neither is a `wiretapId` that repeats the selector next to it.
 - A list of three or more objects of the same shape is sent as a table, `{columns, rows}`.
 - What the assistant passes back to undo or repeat a call (`revert`, `inverse`, `args`) keeps its full form.
+- `flame_catalog(op=...)` without `detail` answers with `'args'`, the argument shapes only. Pass `detail='full'` for the whole description; the result's `detail` says which form came back.
 
 The server explains this form to the assistant in its instructions and in `flame_context` (`responseFormat`).
 

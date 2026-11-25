@@ -19,7 +19,8 @@ JUDGED steps (`ok` decides the run) are the ones whose outcome is fixed by the d
 was measured earlier. OBSERVED steps (`kind: "observation"`, always ok) record what Flame did where
 nothing was known yet -- above all what `journal.revert` brings back and what it does not. They
 are collected in results["observations"] and printed as a table at the end; the undo declarations
-of the ops under test (batch.py: UNDO_UNCONFIRMED) are decided from them, not from this script.
+of the ops under test (the `undo` of each op in ops/batch.py) are decided from them, not
+from this script.
 
 Stages
   a  batch.info on a group that is not current: reels, shelf reels, iterations and the current
@@ -581,8 +582,7 @@ async def op_then_revert(
         fingerprintAllSectionsBackToBase=fp["afterRevertAll"] == fp["baseAll"],
         opEnvelopeJournalChanged=journal.get("changed"),
         revertEnvelope={
-            k: reverted.get(k)
-            for k in ("ok", "errorCode", "error", "hint", "affected", "undoSteps")
+            k: reverted.get(k) for k in ("ok", "errorCode", "error", "hint", "affected")
         },
         revertResult={
             k: _result_of(reverted).get(k)
@@ -890,7 +890,6 @@ async def stage_c(ctx: Ctx) -> None:
             "c_envelope_of_the_overwrite",
             journal=over.get("journal"),
             execution=over.get("execution"),
-            undoSteps=over.get("undoSteps"),
         )
 
         # the reverts: what happens to the iterations

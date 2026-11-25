@@ -9,15 +9,15 @@ from typing import Any
 import pytest
 
 from fake_media_tree import build_default_tree
-from flame_mcp import execution, list_fields
+from flame_mcp import execution
 from flame_mcp.callargs import apply_param_defaults
 from flame_mcp.envelope import build_envelope
 from flame_mcp.journal import Journal
-from flame_mcp.ops import register_all
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from flame_mcp.runtime import Runtime
+from list_fields_helpers import declared_list_fields
 from op_test_helpers import run_op
 from test_ops_desktop_list_all import build_world
 
@@ -31,15 +31,8 @@ BASE_ARGS: dict[str, dict[str, Any]] = {
 }
 
 
-@pytest.fixture(scope="module")
-def registry() -> Registry:
-    reg = Registry()
-    register_all(reg)
-    return reg
-
-
 def _item(op: str, i: int) -> dict[str, Any]:
-    return {key: f"{key}{i}" for key in list_fields.LIST_FIELDS[op].fields}
+    return {key: f"{key}{i}" for key in declared_list_fields()[op].fields}
 
 
 def _fake_result(op: str) -> dict[str, Any]:
@@ -78,7 +71,7 @@ def test_each_list_op_declares_an_optional_string_array_fields_param(
     (param,) = [p for p in op.params if p.name == "fields"]
     assert param.type == "array" and param.item_type == "string" and param.required is False
     assert param.description.isascii()
-    for name in list_fields.LIST_FIELDS[op_name].fields:
+    for name in declared_list_fields()[op_name].fields:
         assert name in param.description
 
 
@@ -89,9 +82,9 @@ def test_the_op_description_says_what_fields_does(registry: Registry, op_name: s
     assert "`fields`" in op.description
 
 
-def test_the_table_covers_exactly_the_four_ops() -> None:
-    assert set(list_fields.LIST_FIELDS) == set(OPS)
-    assert {spec.items_key for spec in list_fields.LIST_FIELDS.values()} == {"items"}
+def test_exactly_the_four_list_ops_declare_list_fields() -> None:
+    assert set(declared_list_fields()) == set(OPS)
+    assert {spec.items_key for spec in declared_list_fields().values()} == {"items"}
 
 
 # ---- the table matches what the ops emit -------------------------------------------------------
@@ -110,7 +103,7 @@ def test_list_children_items_use_only_listed_fields(registry: Registry) -> None:
         flame,
     )
     keys = _emitted_keys(result["value"]["items"])
-    allowed = set(list_fields.LIST_FIELDS["desktop.list_children"].fields)
+    allowed = set(declared_list_fields()["desktop.list_children"].fields)
     assert keys and keys <= allowed | {"error"}
     assert {"type", "name", "uid", "wiretapId", "width", "height", "bitDepth"} <= keys
 
@@ -119,7 +112,7 @@ def test_list_all_items_use_only_listed_fields(registry: Registry) -> None:
     flame, _h = build_world()
     result = run_op(registry, "desktop.list_all", {"limit": 500}, flame)
     keys = _emitted_keys(result["value"]["items"])
-    allowed = set(list_fields.LIST_FIELDS["desktop.list_all"].fields)
+    allowed = set(declared_list_fields()["desktop.list_all"].fields)
     assert keys <= allowed | {"error"}
     assert allowed <= keys
 
@@ -128,7 +121,7 @@ def test_find_items_use_only_listed_fields(registry: Registry) -> None:
     flame, _h = build_default_tree()
     result = run_op(registry, "desktop.find", {"name": "clip1", "limit": 50, "offset": 0}, flame)
     keys = _emitted_keys(result["value"]["items"])
-    allowed = set(list_fields.LIST_FIELDS["desktop.find"].fields)
+    allowed = set(declared_list_fields()["desktop.find"].fields)
     assert keys == allowed
 
 
@@ -143,7 +136,7 @@ def test_list_segments_items_use_only_listed_fields(registry: Registry) -> None:
     )
     assert result["opError"] is None
     keys = _emitted_keys(result["value"]["items"])
-    assert keys == set(list_fields.LIST_FIELDS["timeline.list_segments"].fields)
+    assert keys == set(declared_list_fields()["timeline.list_segments"].fields)
 
 
 # ---- selecting ---------------------------------------------------------------------------------
@@ -154,11 +147,11 @@ def test_only_the_chosen_members_stay_and_an_error_item_keeps_its_error(
     runtime: tuple[Runtime, RunLog], op_name: str
 ) -> None:
     rt, log = runtime
-    first = list_fields.LIST_FIELDS[op_name].fields[0]
+    first = declared_list_fields()[op_name].fields[0]
     env = rt.call(op_name, {**BASE_ARGS[op_name], "fields": [first, "type"]})
     assert env["ok"] is True and log.calls == [op_name]
     items = env["result"]["items"]
-    wanted = {first, "type"} & set(list_fields.LIST_FIELDS[op_name].fields)
+    wanted = {first, "type"} & set(declared_list_fields()[op_name].fields)
     assert items[0] == {key: f"{key}0" for key in wanted}
     assert set(items[2]) == wanted
     assert items[1]["error"] == "unreadable"
@@ -173,7 +166,7 @@ def test_items_keep_their_own_order_whatever_the_order_of_fields(
     runtime: tuple[Runtime, RunLog], op_name: str
 ) -> None:
     rt, _log = runtime
-    names = list_fields.LIST_FIELDS[op_name].fields
+    names = declared_list_fields()[op_name].fields
     env = rt.call(op_name, {**BASE_ARGS[op_name], "fields": [names[1], names[0], names[1]]})
     assert list(env["result"]["items"][0]) == [names[0], names[1]]
 
@@ -194,7 +187,7 @@ def test_an_unknown_field_is_invalid_args_before_anything_runs(
     runtime: tuple[Runtime, RunLog], op_name: str
 ) -> None:
     rt, log = runtime
-    first = list_fields.LIST_FIELDS[op_name].fields[0]
+    first = declared_list_fields()[op_name].fields[0]
     env = rt.call(op_name, {**BASE_ARGS[op_name], "fields": [first, "nmae"]})
     assert env["ok"] is False and env["errorCode"] == "INVALID_ARGS"
     assert "nmae" in env["error"] and first in env["error"]

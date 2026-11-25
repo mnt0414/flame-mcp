@@ -11,7 +11,6 @@ Through the real Runtime over the fake tree (`PyClip.fx_lost_on_load` stands for
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,14 +20,13 @@ from flame_mcp import timeline_fx_loss
 from flame_mcp.checkpoint_prelude import CLIP_FX_READ_BUDGET_S
 from flame_mcp.policy import Policy
 from journal_test_helpers import BG1, Rig, make_rig
+from rig_fixtures import rig_fixture
 from test_reel_fidelity import CLIP1_ID, CLIP2_ID, checkpoint, restore, strip_from_records
 
 ENABLED = Policy.from_env({"FLAME_MCP_ENABLE_EVAL": "1"})
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return make_rig(monkeypatch, tmp_path, policy=ENABLED)
+rig = rig_fixture(make_rig, policy=ENABLED)
 
 
 class UnreadableFxSegment(PySegment):

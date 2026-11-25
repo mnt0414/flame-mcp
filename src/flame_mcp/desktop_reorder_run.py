@@ -29,11 +29,16 @@ import time
 from typing import TYPE_CHECKING, Any, Final
 
 from flame_mcp import envelope as envelope_mod
-from flame_mcp import execution
 from flame_mcp.desktop_media_run import MOVE_OP
-from flame_mcp.desktop_run import MAX_SOURCES, PHASE_ARG, PHASE_READ, pre_read_failure
+from flame_mcp.desktop_run import (
+    MAX_SOURCES,
+    entry_rows,
+    open_group,
+    pre_read_failure,
+    read_destination,
+)
 from flame_mcp.errors import as_error_code
-from flame_mcp.journal import new_id, now_iso
+from flame_mcp.journal import JournalLink, new_id
 from flame_mcp.journaled_write import UNKNOWN_END_CODES
 from flame_mcp.reel_reorder import moves_to_reorder
 from flame_mcp.registry import RegisteredOperation
@@ -73,24 +78,13 @@ def _refusal(
     *,
     result: Any = None,
 ) -> dict[str, Any]:
-    return envelope_mod.build_envelope(
-        ok=False,
+    return envelope_mod.refusal(
+        op,
+        code,
+        "nothing was written: " + message,
+        started,
         result=result if result is not None else {"ran": False},
-        error="nothing was written: " + message,
-        error_code=code,
-        execution=envelope_mod.execution_meta(op),
-        duration_ms=elapsed_ms(started),
     )
-
-
-def _rows_of(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"name": e.get("name"), "uid": e.get("uid")} for e in entries]
-
-
-def _read_destination(
-    rt: Runtime, op: RegisteredOperation, op_args: dict[str, Any]
-) -> dict[str, Any]:
-    return execution.run_op(op, {**op_args, PHASE_ARG: PHASE_READ}, run_dir=rt.run_dir)
 
 
 def resolve_order(
@@ -158,32 +152,6 @@ def _uid_map(moved: list[Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _open_group(
-    rt: Runtime, op: RegisteredOperation, group: str, before: list[str], started: float
-) -> dict[str, Any] | None:
-    try:
-        rt.journal.append(
-            {
-                "type": "group",
-                "group": group,
-                "ts": now_iso(),
-                "kind": REORDER_GROUP_KIND,
-                "label": None,
-                "steps": ["move"],
-                "before": before,
-            }
-        )
-    except OSError as exc:
-        return _refusal(
-            op,
-            "POLICY_DENIED",
-            f"the journal cannot be written ({exc}), and this server does not write to the "
-            "project without a record",
-            started,
-        )
-    return None
-
-
 def _failed(
     op: RegisteredOperation,
     body: dict[str, Any],
@@ -237,71 +205,63 @@ def run_reorder(
 ) -> dict[str, Any]:
     """The `wrap` of `desktop.reorder`."""
     started = time.monotonic()
-    with rt.write_lock:
-        denial = rt.guard.denial()
-        if denial is not None:
-            return envelope_mod.from_pre_bridge_error(
-                error=denial.message,
-                error_code="POLICY_DENIED",
-                op=op,
-                duration_ms=elapsed_ms(started),
-                hint=denial.hint,
-            )
-        dest_env = _read_destination(rt, op, op_args)
-        if dest_env.get("ok") is not True or not isinstance(dest_env.get("result"), dict):
-            return pre_read_failure(op, dest_env, "written")
-        read, refusal = _check_read(dest_env, op, started)
-        if refusal is not None:
-            return refusal
-        entries: list[dict[str, Any]] = read["entries"]
-        current = [str(e["uid"]) for e in entries]
-        desired, problems = resolve_order(list(op_args["order"]), entries)
-        problem = _order_problem(problems)
-        if problem is not None:
-            return _refusal(
-                op,
-                "INVALID_ARGS",
-                f"order must name every entry of the reel once: {problem}",
-                started,
-                result={"ran": False, "entries": _rows_of(entries), **problems},
-            )
-        moves = moves_to_reorder(current, desired)
-        body: dict[str, Any] = {
-            "destination": read["destination"],
-            "requested": len(desired),
-            "before": _rows_of(entries),
-            "moved": 0,
-            "uidMap": [],
-        }
-        if not moves:
-            return envelope_mod.build_envelope(
-                ok=True,
-                result={**body, "after": _rows_of(entries), "orderMatches": True},
-                execution=envelope_mod.execution_meta(op),
-                duration_ms=elapsed_ms(started),
-            )
-        if len(moves) > MAX_REORDER_MOVES:
-            return _refusal(
-                op,
-                "INVALID_ARGS",
-                f"this order needs {len(moves)} entries moved to the end, and one desktop.move "
-                f"takes {MAX_REORDER_MOVES} at most",
-                started,
-                result={"ran": False, "toMove": len(moves)},
-            )
-        pins = {str(e["uid"]): e["selector"] for e in entries}
-        run_group = group if group is not None else new_id("g")
-        unwritable = _open_group(rt, op, run_group, current, started)
-        if unwritable is not None:
-            return unwritable
-        env = rt.call(
-            MOVE_OP,
-            {"sources": [pins[uid] for uid in moves], "destination": read["stable"]},
-            group=run_group,
+    dest_env = read_destination(rt, op, op_args)
+    if dest_env.get("ok") is not True or not isinstance(dest_env.get("result"), dict):
+        return pre_read_failure(op, dest_env, "written")
+    read, refusal = _check_read(dest_env, op, started)
+    if refusal is not None:
+        return refusal
+    entries: list[dict[str, Any]] = read["entries"]
+    current = [str(e["uid"]) for e in entries]
+    desired, problems = resolve_order(list(op_args["order"]), entries)
+    problem = _order_problem(problems)
+    if problem is not None:
+        return _refusal(
+            op,
+            "INVALID_ARGS",
+            f"order must name every entry of the reel once: {problem}",
+            started,
+            result={"ran": False, "entries": entry_rows(entries), **problems},
         )
-        if env.get("ok") is not True:
-            return _failed(op, body, env, run_group, started)
-        return _verified(rt, op, op_args, body, desired, env, run_group, started)
+    moves = moves_to_reorder(current, desired)
+    body: dict[str, Any] = {
+        "destination": read["destination"],
+        "requested": len(desired),
+        "before": entry_rows(entries),
+        "moved": 0,
+        "uidMap": [],
+    }
+    if not moves:
+        return envelope_mod.build_envelope(
+            ok=True,
+            result={**body, "after": entry_rows(entries), "orderMatches": True},
+            execution=envelope_mod.execution_meta(op),
+            duration_ms=elapsed_ms(started),
+        )
+    if len(moves) > MAX_REORDER_MOVES:
+        return _refusal(
+            op,
+            "INVALID_ARGS",
+            f"this order needs {len(moves)} entries moved to the end, and one desktop.move "
+            f"takes {MAX_REORDER_MOVES} at most",
+            started,
+            result={"ran": False, "toMove": len(moves)},
+        )
+    pins = {str(e["uid"]): e["selector"] for e in entries}
+    run_group = group if group is not None else new_id("g")
+    unwritable = open_group(
+        rt, op, run_group, REORDER_GROUP_KIND, started, steps=["move"], before=current
+    )
+    if unwritable is not None:
+        return unwritable
+    env = rt.call(
+        MOVE_OP,
+        {"sources": [pins[uid] for uid in moves], "destination": read["stable"]},
+        link=JournalLink(run_group),
+    )
+    if env.get("ok") is not True:
+        return _failed(op, body, env, run_group, started)
+    return _verified(rt, op, op_args, body, desired, env, run_group, started)
 
 
 def _verified(
@@ -322,7 +282,7 @@ def _verified(
     expected = [renamed.get(uid, uid) for uid in desired]
     body.update({"moved": len(uid_map), "uidMap": uid_map, "notes": [REORDER_NOTE]})
     degraded = [f"move: {note}" for note in move_env.get("degraded") or []]
-    after_env = _read_destination(rt, op, op_args)
+    after_env = read_destination(rt, op, op_args)
     common: dict[str, Any] = {
         "affected": len(uid_map),
         "journal": _journal_ref(group, ids, revertible=True),
@@ -342,7 +302,7 @@ def _verified(
             hint_override=READ_BACK_FAILED_HINT.format(group=group),
             **common,
         )
-    after = _rows_of(after_env["result"].get("entries") or [])
+    after = entry_rows(after_env["result"].get("entries") or [])
     body["after"] = after
     body["orderMatches"] = [r["uid"] for r in after] == expected
     if not body["orderMatches"]:

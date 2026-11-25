@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from conftest import make_registry
 from fake_media_tree import (
     FakeAttr,
     FakeFlame,
@@ -21,19 +22,13 @@ from fake_media_tree import (
     PyVersion,
     build_default_tree,
 )
-from flame_mcp.ops import register_all
 from flame_mcp.opschema import validate_op_args
 from flame_mcp.policy import Policy
 from flame_mcp.registry import Registry
 from journal_test_helpers import Rig, make_rig
 from op_test_helpers import run_op
+from rig_fixtures import rig_fixture
 from test_ops_attributes import make_batch_world
-
-
-def make_registry() -> Registry:
-    registry = Registry()
-    register_all(registry)
-    return registry
 
 
 def test_list_children_via_path_lists_reel_contents() -> None:
@@ -511,20 +506,17 @@ def test_rename_valid_args_accepted() -> None:
 
 
 @pytest.mark.parametrize("op_name", ["desktop.list_children", "desktop.selection"])
-def test_read_ops_have_zero_undo_steps(op_name: str) -> None:
+def test_read_ops_have_the_read_effect(op_name: str) -> None:
     registry = make_registry()
     op = _op(registry, op_name)
     assert op.effect == "read"
-    assert op.undo_steps({}, 3) == 0
 
 
-def test_rename_undo_steps_is_always_zero() -> None:
-    # Writes through set_value() are not recorded in Flame's undo history, so the op always
-    # reports 0 steps whatever the value of affected (Ctrl+Z does not undo them).
+def test_rename_is_undone_by_value() -> None:
+    # Writes through set_value() are not recorded in Flame's undo history (Ctrl+Z does not
+    # undo them), so the op is taken back by journal.revert.
     registry = make_registry()
     op = _op(registry, "desktop.rename")
-    assert op.undo_steps({}, 0) == 0
-    assert op.undo_steps({}, 1) == 0
     assert op.undo == "value"
 
 
@@ -656,16 +648,13 @@ def test_find_refuses_a_bad_combination_before_anything_reaches_flame(rig: Rig) 
     assert rig.exec.calls == []
 
 
-@pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Rig:
-    return make_rig(monkeypatch, tmp_path)
+rig = rig_fixture(make_rig)
 
 
 def test_find_through_the_runtime_returns_the_page(rig: Rig) -> None:
     env = rig.do("desktop.find", {"name": "clip1"})
     assert env["ok"] is True, env
     assert env["result"]["total"] == 1
-    assert env["undoSteps"] == 0
 
 
 def _info(flame: Any, target: dict[str, Any]) -> dict[str, Any]:

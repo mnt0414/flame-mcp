@@ -25,10 +25,8 @@ from flame_mcp.desktop_revert import (
     observe,
     observe_alive,
 )
-from flame_mcp.desktop_run import CREATED_ARG, EXPECTED_ARG, PHASE_ARG, PHASE_PROBE
+from flame_mcp.desktop_run import CREATED_ARG, EXPECTED_ARG, PHASE_PROBE
 from flame_mcp.journal import (
-    KIND_DESKTOP_REFORMAT,
-    KIND_DESKTOP_REVERT,
     STATE_DIVERGED,
     STATE_LANDED,
     STATE_NOT_LANDED,
@@ -36,6 +34,7 @@ from flame_mcp.journal import (
     IntentView,
 )
 from flame_mcp.timeline_restore import uid_chain
+from flame_mcp.types import PHASE_ARG
 
 if TYPE_CHECKING:
     from flame_mcp.runtime import ServerContext
@@ -50,16 +49,6 @@ FORMAT_KEYS: Final[tuple[str, ...]] = (
     "startFrame",
     "duration",
 )
-
-
-def is_reformat_intent(view: IntentView) -> bool:
-    """An intent of `desktop.reformat`, or the revert of one."""
-    if view.desktop_kind == KIND_DESKTOP_REFORMAT:
-        return True
-    return (
-        view.desktop_kind == KIND_DESKTOP_REVERT
-        and view.intent.get("revertOf") == KIND_DESKTOP_REFORMAT
-    )
 
 
 def same_format(found: Mapping[str, Any], wanted: Mapping[str, Any]) -> list[str]:
